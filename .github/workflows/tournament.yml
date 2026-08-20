@@ -3,16 +3,32 @@ name: Tournament
 # Manually-triggered cross-region tournament run.
 # See docs/plans/training-compute-scaling-plan.md in the private repo for context.
 #
+# 2026-08-20 update: added matrix parallelism -- the same tournament that used to run on ONE
+# ubuntu runner now splits across N runners (default 4, cap 20 per free-tier concurrency). Each
+# shard runs its slice of the ordered-pair job list under a weighted bin-packing allocator that
+# gives slow-region-involving pairs (Underneath / Weave / Paradwyn by default) their own shards
+# so no single shard is the wall-clock bottleneck. An aggregator job downloads every shard's
+# per-pair JSONL and produces the final leaderboard.
+#
 # Trigger from a dev session:
 #   gh workflow run tournament.yml \
 #     -R caldwarlord-sudo/mnd-training \
 #     -f regions="Cald,Naroom,Bograth" \
-#     -f gamesPerDirection=2 \
+#     -f gamesPerDirection=8 \
+#     -f shards=4 \
 #     -f workers=2 \
-#     -f timeoutSec=60
+#     -f timeoutSec=300 \
+#     -f betaMode=true
 #
-# Result files (tournament-results.txt, tournament-matches.jsonl, tournament-errors.jsonl)
-# come back as a workflow artifact -- pull with `gh run download <run-id>`.
+# When to raise `shards`:
+#   4  -- default; polite for iteration / quick-check runs (20% of the 20-slot ceiling).
+#   8  -- medium; overnight partial run on a subset of regions.
+#   20 -- max; full-field overnight validation runs. Uses the entire free-tier burst budget --
+#         reserve for the runs that actually need it.
+#
+# Result files (tournament-results.txt + per-shard tournament-matches-shard-N.jsonl) come back
+# as the aggregator job's artifact -- pull with `gh run download <run-id>`. Per-shard artifacts
+# are also uploaded individually in case a shard fails and you need to inspect it.
 
 on:
   workflow_dispatch:
@@ -24,9 +40,13 @@ on:
       gamesPerDirection:
         description: 'Games per ordered pair (total pair games = 2N)'
         required: false
-        default: '2'
+        default: '8'
+      shards:
+        description: 'Number of parallel matrix jobs (1-20). Default 4 for polite iteration; raise to 20 for overnight burst.'
+        required: false
+        default: '4'
       workers:
-        description: 'Parallel worker processes per runner (max 2 on standard runners)'
+        description: 'Worker processes per runner (max 2 on standard runners)'
         required: false
         default: '2'
       maxTurns:
@@ -36,18 +56,49 @@ on:
       timeoutSec:
         description: 'Per-game wall-clock cap (seconds)'
         required: false
-        default: '120'
+        default: '300'
       betaMode:
         description: 'Opponent-turn crossings (beta ON = shipping-app parity, ~2x cost)'
         required: false
         default: 'true'
         type: choice
         options: ['true', 'false']
+      slowRegions:
+        description: 'Regions whose jobs get 5x weight in shard bin-packing (empty = uniform)'
+        required: false
+        default: 'Underneath,Weave,Paradwyn'
 
 jobs:
-  tournament:
+  # Planner: emit the matrix JSON (list of shard indices). Kept as a distinct job so the
+  # `shards` input is validated once here rather than in every matrix job.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+      shard-count: ${{ steps.build-matrix.outputs.shard-count }}
+    steps:
+      - name: Validate + emit matrix
+        id: build-matrix
+        run: |
+          SHARDS="${{ inputs.shards }}"
+          if [ "$SHARDS" -lt 1 ] || [ "$SHARDS" -gt 20 ]; then
+            echo "shards must be between 1 and 20 (got $SHARDS)"
+            exit 1
+          fi
+          # Build a JSON array [0, 1, ..., SHARDS-1] for the matrix strategy.
+          MATRIX=$(seq 0 $((SHARDS - 1)) | jq -R -s -c 'split("\n") | map(select(length > 0) | tonumber)')
+          echo "matrix={\"shardIndex\":$MATRIX}" >> $GITHUB_OUTPUT
+          echo "shard-count=$SHARDS" >> $GITHUB_OUTPUT
+          echo "Planned $SHARDS shard job(s): $MATRIX"
+
+  # Shard: run one slice of the job list. Fan-out across N parallel runners.
+  shard:
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 350  # under GH's 360-min hard cap
+    strategy:
+      fail-fast: false  # one shard failing shouldn't cancel the rest -- we still want the artifacts
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
 
     steps:
       - name: Checkout
@@ -56,14 +107,14 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       # No `npm install` step -- the engine bundle inlines every runtime dep.
 
       - name: Prepare output directory
         run: mkdir -p results
 
-      - name: Run tournament
+      - name: Run shard ${{ matrix.shardIndex }} of ${{ needs.plan.outputs.shard-count }}
         env:
           OPPONENT_TURN_CROSSINGS: ${{ inputs.betaMode == 'true' && '1' || '0' }}
         run: |
@@ -71,32 +122,88 @@ jobs:
           if [ -n "${{ inputs.regions }}" ]; then
             REGIONS_FLAG="--regions ${{ inputs.regions }}"
           fi
+          SLOW_FLAG=""
+          if [ -n "${{ inputs.slowRegions }}" ]; then
+            SLOW_FLAG="--slowRegions ${{ inputs.slowRegions }}"
+          fi
 
           node engine/scripts/tournament.mjs \
             --workers ${{ inputs.workers }} \
             --gamesPerDirection ${{ inputs.gamesPerDirection }} \
             --maxTurns ${{ inputs.maxTurns }} \
             --gameTimeoutSec ${{ inputs.timeoutSec }} \
+            --shardIndex ${{ matrix.shardIndex }} \
+            --shardCount ${{ needs.plan.outputs.shard-count }} \
             --out "${{ github.workspace }}/results" \
-            $REGIONS_FLAG
+            $REGIONS_FLAG \
+            $SLOW_FLAG
 
-      - name: Show summary tail
+      - name: Show shard tail
         if: always()
         run: |
-          echo '--- tournament-results.txt (tail) ---'
-          tail -50 results/tournament-results.txt 2>/dev/null || echo '(no results file)'
+          echo '--- shard ${{ matrix.shardIndex }} matches JSONL (line count) ---'
+          wc -l results/tournament-matches-shard-*.jsonl 2>/dev/null || echo '(no jsonl)'
           echo
-          echo '--- tournament-errors.jsonl (head) ---'
-          head -20 results/tournament-errors.jsonl 2>/dev/null || echo '(no errors file)'
+          echo '--- shard errors (head) ---'
+          head -20 results/tournament-errors-shard-*.jsonl 2>/dev/null || echo '(no errors)'
           echo
           echo '--- artifact contents ---'
           ls -lh results/ || true
 
-      - name: Upload results
+      - name: Upload shard results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: tournament-results-${{ github.run_id }}
+          name: tournament-shard-${{ matrix.shardIndex }}-${{ github.run_id }}
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
+
+  # Aggregator: download every shard's artifact, merge per-pair JSONLs, produce final report.
+  aggregate:
+    needs: [plan, shard]
+    if: always()  # produce partial report even if some shards failed
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Download all shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tournament-shard-*-${{ github.run_id }}
+          path: shard-downloads
+          # merge-multiple:false (default) -- keep each shard in its own subdirectory. The
+          # aggregator's recursive walk finds their JSONLs without collisions.
+
+      - name: List downloaded shards
+        run: |
+          echo '--- downloaded artifacts ---'
+          find shard-downloads -type f | sort
+
+      - name: Run aggregator
+        run: |
+          mkdir -p results
+          node engine/scripts/tournament.mjs \
+            --aggregateShards shard-downloads \
+            --out "${{ github.workspace }}/results"
+
+      - name: Show final leaderboard
+        if: always()
+        run: |
+          echo '--- tournament-results.txt (full) ---'
+          cat results/tournament-results.txt 2>/dev/null || echo '(no results file)'
+
+      - name: Upload final aggregated results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tournament-final-${{ github.run_id }}
           path: results/
           retention-days: 30
           if-no-files-found: warn

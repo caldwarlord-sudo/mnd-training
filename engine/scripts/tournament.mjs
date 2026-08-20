@@ -26,7 +26,7 @@
 //   --out DIR                 Output directory. Default engine/.
 //   --decks DIR               Default deck directory. Default app/resources/default-decks.
 
-import { readFileSync, existsSync, unlinkSync, writeFileSync, appendFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, existsSync, unlinkSync, writeFileSync, appendFileSync, mkdirSync, readdirSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { fork } from 'node:child_process';
@@ -53,11 +53,46 @@ const GAME_TIMEOUT_SEC = Number(arg('gameTimeoutSec', 300));
 const WEIGHTS_PATH = resolve(arg('weights', join(REPO_ROOT, 'engine', 'data', 'bot-weights.json')));
 const OUT_DIR = resolve(arg('out', join(here, '..')));
 const DECKS_DIR = resolve(arg('decks', join(REPO_ROOT, 'app', 'resources', 'default-decks')));
+// Sharding (2026-08-20, GitHub Actions matrix parallelism -- see
+// docs/plans/training-compute-scaling-plan.md and mnd-training/.github/workflows/tournament.yml).
+// A "shard" is a subset of the job list. With SHARD_COUNT > 1, this script runs only jobs whose
+// index mod SHARD_COUNT equals SHARD_INDEX, and writes its per-pair JSONL to a shard-suffixed
+// filename so downloaded shard artifacts don't collide when the aggregator reads them.
+// AGGREGATE_SHARDS_DIR flips this script into aggregator mode: read every shard JSONL under the
+// given directory, reconstruct pairStats by summing, and produce the final report. No games run
+// in aggregator mode.
+const SHARD_INDEX = Number(arg('shardIndex', 0));
+const SHARD_COUNT = Number(arg('shardCount', 1));
+const AGGREGATE_SHARDS_DIR = arg('aggregateShards', null);
+if (SHARD_INDEX < 0 || SHARD_INDEX >= SHARD_COUNT) {
+  console.error(`Invalid shardIndex ${SHARD_INDEX} for shardCount ${SHARD_COUNT} (must be 0 <= index < count).`);
+  process.exit(1);
+}
+// Weighted sharding (2026-08-20, owner ask): naive `i % shardCount` gives the shard that pulls
+// slow-region jobs a long-tail wall-clock while other shards sit idle. Instead we tag each job
+// with a weight (heavy if either side's region is in the "slow" set) and greedy-bin-pack jobs
+// into shards longest-first so total weight per shard is roughly balanced. Deterministic:
+// same jobs + same shardCount + same slow-region set => same assignment.
+// Default slow regions come from last night's overnight run's per-pair timings -- Underneath,
+// Weave, and Paradwyn same-region mirrors and any cross-region pair touching them dominated.
+// Override with `--slowRegions "A,B,C"`; pass an empty string for uniform weight.
+const SLOW_REGIONS_ARG = arg('slowRegions', 'Underneath,Weave,Paradwyn');
+const SLOW_REGIONS = new Set(SLOW_REGIONS_ARG.split(',').map((s) => s.trim()).filter((s) => s));
+const HEAVY_WEIGHT = 5; // 5x is a rough eyeball from the round-robin timings; not load-bearing.
 
 const CARDS_PATH = join(REPO_ROOT, 'data-pipeline', 'output', 'cards_final.json');
 const RESULTS_PATH = join(OUT_DIR, 'tournament-results.txt');
-const MATCHES_JSONL_PATH = join(OUT_DIR, 'tournament-matches.jsonl');
-const ERRORS_JSONL_PATH = join(OUT_DIR, 'tournament-errors.jsonl');
+// In shard mode, each shard's JSONL is suffixed so multiple shard artifacts unpacked into the
+// same aggregator directory don't clobber each other. In non-shard mode (default), the unsuffixed
+// filename preserves backward compat with existing tooling.
+const MATCHES_JSONL_PATH = join(
+  OUT_DIR,
+  SHARD_COUNT > 1 ? `tournament-matches-shard-${SHARD_INDEX}.jsonl` : 'tournament-matches.jsonl',
+);
+const ERRORS_JSONL_PATH = join(
+  OUT_DIR,
+  SHARD_COUNT > 1 ? `tournament-errors-shard-${SHARD_INDEX}.jsonl` : 'tournament-errors.jsonl',
+);
 const STOP_FLAG = join(OUT_DIR, 'tournament-STOP.txt');
 
 const DECK_ID_TO_REGION = {
@@ -290,11 +325,20 @@ function totalHeadToHead(pairStats, regionA, regionB) {
   return { aWins, bWins, draws, games };
 }
 
-function writeResults(regions, pairStats, startedAt, elapsedMs, totalGames) {
+function writeResults(regions, pairStats, startedAt, elapsedMs, totalGames, aggregatedFromShards) {
   const lines = [];
   lines.push('=== Cross-region tournament results ===');
-  lines.push(`Started: ${new Date(startedAt).toISOString()}`);
-  lines.push(`Elapsed: ${(elapsedMs / 60000).toFixed(1)} minutes`);
+  // Header shape differs between a live run (Started + Elapsed timing tells you when the run
+  // happened and how long it took) and an aggregator run (which stitches shard JSONLs together;
+  // the shards ran on other machines with their own start/elapsed values, so the aggregator's
+  // own timestamps would be misleading -- see other-session review 2026-08-20). In aggregator
+  // mode we replace the timing lines with a "Aggregated from N shards" line + the current time.
+  if (aggregatedFromShards) {
+    lines.push(`Aggregated from ${aggregatedFromShards} shard artifact(s) at ${new Date().toISOString()}`);
+  } else {
+    lines.push(`Started: ${new Date(startedAt).toISOString()}`);
+    lines.push(`Elapsed: ${(elapsedMs / 60000).toFixed(1)} minutes`);
+  }
   lines.push(`Total games: ${totalGames}`);
   lines.push(`Games per direction: ${GAMES_PER_DIRECTION} (per unordered pair: ${GAMES_PER_DIRECTION * 2})`);
   lines.push(`Regions: ${regions.join(', ')} (${regions.length} total)`);
@@ -345,9 +389,93 @@ function appendPairJsonl(path, p1Region, p2Region, stats) {
   appendFileSync(path, JSON.stringify(row) + '\n', 'utf-8');
 }
 
+/** Aggregator mode helper (2026-08-20): reads every `tournament-matches*.jsonl` file under `dir`
+ *  (recursively -- artifact downloads unpack into per-artifact subdirectories), merges their rows
+ *  by (p1Region, p2Region), and returns a pairStats-shaped Map ready to feed to `writeResults`.
+ *  Each JSONL row is self-contained (see `appendPairJsonl` above), so aggregation is a straight
+ *  sum of counts and a weighted merge of the turn stats. */
+function findJsonlFilesRecursive(dir) {
+  const results = [];
+  for (const entry of readdirSync(dir)) {
+    const abs = join(dir, entry);
+    const s = statSync(abs);
+    if (s.isDirectory()) {
+      for (const f of findJsonlFilesRecursive(abs)) results.push(f);
+    } else if (/^tournament-matches(-shard-\d+)?\.jsonl$/.test(entry)) {
+      results.push(abs);
+    }
+  }
+  return results;
+}
+
+function aggregateShardJsonls(dir) {
+  const files = findJsonlFilesRecursive(dir);
+  if (files.length === 0) {
+    console.error(`aggregator: no tournament-matches JSONL files found under ${dir}`);
+    process.exit(1);
+  }
+  console.log(`Aggregator: reading ${files.length} shard JSONL file(s):`);
+  for (const f of files) console.log(`  ${f}`);
+  console.log('');
+
+  const pairStats = new Map();
+  const regionsSeen = new Set();
+  let rowsRead = 0;
+  for (const file of files) {
+    const lines = readFileSync(file, 'utf-8').split('\n').filter((l) => l.trim());
+    for (const line of lines) {
+      const row = JSON.parse(line);
+      rowsRead += 1;
+      regionsSeen.add(row.p1Region);
+      regionsSeen.add(row.p2Region);
+      if (!pairStats.has(row.p1Region)) pairStats.set(row.p1Region, new Map());
+      const byOpp = pairStats.get(row.p1Region);
+      let stats = byOpp.get(row.p2Region);
+      if (!stats) { stats = emptyPairStats(); byOpp.set(row.p2Region, stats); }
+      // Merge: shard rows are non-overlapping per (p1Region, p2Region) because the shard slice
+      // is on the flat job index; different shards touch different games of the same pair, so
+      // sums are the correct combination. Turn stats sum via games * meanTurns to preserve the
+      // weighted mean when writeResults recomputes it.
+      stats.games += row.games;
+      for (const [k, v] of Object.entries(row.outcomes)) {
+        stats.outcomes[k] = (stats.outcomes[k] ?? 0) + v;
+      }
+      stats.turnsSum += (row.meanTurns ?? 0) * row.games;
+      if ((row.maxTurns ?? 0) > stats.turnsMax) stats.turnsMax = row.maxTurns;
+    }
+  }
+  console.log(`Aggregator: merged ${rowsRead} pair rows covering ${regionsSeen.size} regions.`);
+  console.log('');
+  return { pairStats, regions: [...regionsSeen].sort(), shardFileCount: files.length };
+}
+
 // ============================================================================
 // Main loop
 // ============================================================================
+
+// Aggregator mode short-circuits the whole "spin up workers, run games" flow. Reads shard JSONLs
+// from the given directory, produces the final report, exits. Used by the aggregator job of the
+// GitHub Actions matrix workflow -- see mnd-training/.github/workflows/tournament.yml.
+if (AGGREGATE_SHARDS_DIR) {
+  const absDir = resolve(AGGREGATE_SHARDS_DIR);
+  if (!existsSync(absDir)) {
+    console.error(`--aggregateShards directory not found: ${absDir}`);
+    process.exit(1);
+  }
+  console.log('=== Cross-region tournament AGGREGATOR ===');
+  console.log(`Shard artifacts dir: ${absDir}`);
+  console.log(`Output dir:          ${OUT_DIR}`);
+  console.log('');
+  const { pairStats, regions, shardFileCount } = aggregateShardJsonls(absDir);
+  // Total games = sum of `stats.games` across all pairs.
+  let totalGames = 0;
+  for (const byOpp of pairStats.values()) for (const s of byOpp.values()) totalGames += s.games;
+  // `aggregatedFromShards` (last arg) flips writeResults' header to name this as an aggregation
+  // rather than printing a bogus "Elapsed: 0.0 minutes" line -- other-session review 2026-08-20.
+  writeResults(regions, pairStats, Date.now(), 0, totalGames, shardFileCount);
+  console.log(`Leaderboard + matchup matrix written to: ${RESULTS_PATH}`);
+  process.exit(0);
+}
 
 const _regions = selectedRegions();
 const weightsFile = loadWeightsFile(WEIGHTS_PATH);
@@ -428,6 +556,42 @@ for (let p1Idx = 0; p1Idx < _regions.length; p1Idx += 1) {
   }
 }
 console.log(`Total games to run: ${jobs.length}`);
+
+// Sharding: greedy bin-packing by job weight. Heavy jobs (either side's region in SLOW_REGIONS)
+// weigh HEAVY_WEIGHT, others 1. Sort jobs by weight descending, then assign each to the
+// currently-least-loaded shard -- gives roughly equal total weight per shard so no shard sits
+// as the bottleneck. Deterministic order (sort is stable on original index within same weight),
+// so shard N always gets the same jobs across runs with the same (regions, gamesPerDirection,
+// shardCount, slowRegions) inputs.
+if (SHARD_COUNT > 1) {
+  const originalCount = jobs.length;
+  const indexed = jobs.map((j, i) => ({
+    i,
+    weight: (SLOW_REGIONS.has(j.p1Region) || SLOW_REGIONS.has(j.p2Region)) ? HEAVY_WEIGHT : 1,
+  }));
+  // Stable sort: same weight => original index order, so the greedy allocator is deterministic.
+  indexed.sort((a, b) => b.weight - a.weight || a.i - b.i);
+  const shardLoads = new Array(SHARD_COUNT).fill(0);
+  const assignedShard = new Array(jobs.length);
+  for (const { i, weight } of indexed) {
+    let minShard = 0;
+    for (let s = 1; s < SHARD_COUNT; s += 1) {
+      if (shardLoads[s] < shardLoads[minShard]) minShard = s;
+    }
+    assignedShard[i] = minShard;
+    shardLoads[minShard] += weight;
+  }
+  // Log the allocation summary before filtering so operators can see the balance.
+  const jobsPerShard = new Array(SHARD_COUNT).fill(0);
+  for (const s of assignedShard) jobsPerShard[s] += 1;
+  console.log(`Shard weight balance: ${shardLoads.map((w, s) => `#${s}=${w} (${jobsPerShard[s]} games)`).join(', ')}`);
+  // Filter jobs down to just this shard's slice. Mutates the const array (const forbids
+  // reassignment, allows mutation).
+  for (let i = jobs.length - 1; i >= 0; i -= 1) {
+    if (assignedShard[i] !== SHARD_INDEX) jobs.splice(i, 1);
+  }
+  console.log(`Shard ${SHARD_INDEX}/${SHARD_COUNT}: running ${jobs.length} of ${originalCount} games (weight ${shardLoads[SHARD_INDEX]}).`);
+}
 console.log('');
 
 // Progress reporter -- log every ~50 completions or every ~90s (whichever first).
@@ -481,12 +645,21 @@ for (const [p1Region, byOpp] of pairStats.entries()) {
 }
 
 const elapsedMs = Date.now() - startedAt;
-writeResults(_regions, pairStats, startedAt, elapsedMs, jobs.length);
-
-console.log('');
-console.log(`=== Done. ${jobs.length} games in ${(elapsedMs / 60000).toFixed(1)} minutes. ===`);
-console.log(`Leaderboard + matchup matrix: ${RESULTS_PATH}`);
-console.log(`Per-pair JSONL:               ${MATCHES_JSONL_PATH}`);
+// In shard mode, skip writeResults -- the shard only has a slice of the pairs, so its
+// "leaderboard" would be misleading. The aggregator job downloads every shard's JSONL and
+// produces the final report via `--aggregateShards <dir>`.
+if (SHARD_COUNT > 1) {
+  console.log('');
+  console.log(`=== Shard ${SHARD_INDEX}/${SHARD_COUNT} done. ${jobs.length} games in ${(elapsedMs / 60000).toFixed(1)} minutes. ===`);
+  console.log(`Per-pair JSONL: ${MATCHES_JSONL_PATH}`);
+  console.log('(Full leaderboard produced by the aggregator job, not this shard.)');
+} else {
+  writeResults(_regions, pairStats, startedAt, elapsedMs, jobs.length);
+  console.log('');
+  console.log(`=== Done. ${jobs.length} games in ${(elapsedMs / 60000).toFixed(1)} minutes. ===`);
+  console.log(`Leaderboard + matchup matrix: ${RESULTS_PATH}`);
+  console.log(`Per-pair JSONL:               ${MATCHES_JSONL_PATH}`);
+}
 
 clearInterval(stopPoller);
 await pool.shutdown();
