@@ -1,0 +1,102 @@
+name: Tournament
+
+# Manually-triggered cross-region tournament run.
+# See docs/plans/training-compute-scaling-plan.md in the private repo for context.
+#
+# Trigger from a dev session:
+#   gh workflow run tournament.yml \
+#     -R caldwarlord-sudo/mnd-training \
+#     -f regions="Cald,Naroom,Bograth" \
+#     -f gamesPerDirection=2 \
+#     -f workers=2 \
+#     -f timeoutSec=60
+#
+# Result files (tournament-results.txt, tournament-matches.jsonl, tournament-errors.jsonl)
+# come back as a workflow artifact -- pull with `gh run download <run-id>`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      regions:
+        description: 'Comma-separated regions (blank = all 13)'
+        required: false
+        default: ''
+      gamesPerDirection:
+        description: 'Games per ordered pair (total pair games = 2N)'
+        required: false
+        default: '2'
+      workers:
+        description: 'Parallel worker processes per runner (max 2 on standard runners)'
+        required: false
+        default: '2'
+      maxTurns:
+        description: 'Per-game turn cap'
+        required: false
+        default: '200'
+      timeoutSec:
+        description: 'Per-game wall-clock cap (seconds)'
+        required: false
+        default: '120'
+      betaMode:
+        description: 'Opponent-turn crossings (beta ON = shipping-app parity, ~2x cost)'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+
+jobs:
+  tournament:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # under GH's 360-min hard cap
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # No `npm install` step -- the engine bundle inlines every runtime dep.
+
+      - name: Prepare output directory
+        run: mkdir -p results
+
+      - name: Run tournament
+        env:
+          OPPONENT_TURN_CROSSINGS: ${{ inputs.betaMode == 'true' && '1' || '0' }}
+        run: |
+          REGIONS_FLAG=""
+          if [ -n "${{ inputs.regions }}" ]; then
+            REGIONS_FLAG="--regions ${{ inputs.regions }}"
+          fi
+
+          node engine/scripts/tournament.mjs \
+            --workers ${{ inputs.workers }} \
+            --gamesPerDirection ${{ inputs.gamesPerDirection }} \
+            --maxTurns ${{ inputs.maxTurns }} \
+            --gameTimeoutSec ${{ inputs.timeoutSec }} \
+            --out "${{ github.workspace }}/results" \
+            $REGIONS_FLAG
+
+      - name: Show summary tail
+        if: always()
+        run: |
+          echo '--- tournament-results.txt (tail) ---'
+          tail -50 results/tournament-results.txt 2>/dev/null || echo '(no results file)'
+          echo
+          echo '--- tournament-errors.jsonl (head) ---'
+          head -20 results/tournament-errors.jsonl 2>/dev/null || echo '(no errors file)'
+          echo
+          echo '--- artifact contents ---'
+          ls -lh results/ || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tournament-results-${{ github.run_id }}
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
