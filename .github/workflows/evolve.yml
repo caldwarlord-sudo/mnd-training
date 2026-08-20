@@ -1,0 +1,220 @@
+name: Evolve
+
+# Manually-triggered ONE-GENERATION evolution run.
+# See docs/plans/training-compute-scaling-plan.md in the private repo for context.
+#
+# One workflow run = one generation. Session drives the multi-generation loop by triggering
+# this workflow back-to-back after downloading the aggregator artifact, reviewing results,
+# updating local bot-weights.json (via sync-training.mjs), and pushing back to this repo.
+#
+# Shape C hybrid fitness (owner-approved 2026-08-20):
+#   Per candidate weight vector in region R:
+#     - MIRROR_GAMES games vs R's baseline weights on R's own deck (sanity check)
+#     - CROSS_REGION_OPPONENTS x GAMES_PER_CROSS_OPPONENT games vs OTHER regions' baseline
+#       weights (candidate always pilots R's deck)
+#   Combined fitness = 0.25 * mirror_win_rate + 0.75 * cross_region_win_rate
+#   Cross-region opponents rotate per generation so weights don't overfit to specific opponents.
+#
+# Trigger from a dev session:
+#   gh workflow run evolve.yml -R caldwarlord-sudo/mnd-training \
+#     -f generation=5 \
+#     -f regions="Cald,Naroom,Bograth" \
+#     -f populationSize=8 \
+#     -f mirrorGames=6 \
+#     -f crossRegionOpponents=3 \
+#     -f gamesPerCrossOpponent=4 \
+#     -f workers=2 \
+#     -f timeoutSec=300 \
+#     -f betaMode=true
+#
+# Each region runs in its own matrix job (13 concurrent max = under the 20-slot cap).
+# Aggregator merges all region outputs into an updated bot-weights.json + generation summary,
+# returned as the `evolve-final-<runid>` artifact.
+#
+# Sequencing between generations:
+#   1. Session triggers gen N.
+#   2. Waits for run completion.
+#   3. Downloads evolve-final artifact.
+#   4. Reviews evolution-generation-N-summary.txt.
+#   5. If good: updates local bot-weights.json in private repo, runs sync-training.mjs,
+#      pushes bot-weights.json update to mnd-training. Triggers gen N+1.
+#   6. If suspicious: pauses to investigate before continuing.
+
+on:
+  workflow_dispatch:
+    inputs:
+      generation:
+        description: 'Generation number (1+). Purely for seed derivation + artifact naming.'
+        required: true
+        default: '1'
+      regions:
+        description: 'Comma-separated regions to evolve this run (blank = all 13 EVOLVING_REGIONS)'
+        required: false
+        default: ''
+      populationSize:
+        description: 'Candidates per region'
+        required: false
+        default: '8'
+      mirrorGames:
+        description: 'Games per candidate vs region baseline (mirror sanity check)'
+        required: false
+        default: '6'
+      crossRegionOpponents:
+        description: 'Other regions each candidate plays'
+        required: false
+        default: '3'
+      gamesPerCrossOpponent:
+        description: 'Games per candidate per cross-region opponent'
+        required: false
+        default: '4'
+      workers:
+        description: 'Parallel worker processes per region-job (max 2 on standard runners)'
+        required: false
+        default: '2'
+      maxTurns:
+        description: 'Per-game turn cap'
+        required: false
+        default: '200'
+      timeoutSec:
+        description: 'Per-game wall-clock cap (seconds)'
+        required: false
+        default: '300'
+      betaMode:
+        description: 'Opponent-turn crossings (beta ON = shipping-app parity, ~2x cost). Always ON for training.'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+      seed:
+        description: 'Base seed for population + game seeds'
+        required: false
+        default: '42'
+
+jobs:
+  # Planner: turn the `regions` input into a JSON array for the matrix strategy. Blank input
+  # expands to all 13 EVOLVING_REGIONS (hardcoded here to match the engine's list -- if
+  # EVOLVING_REGIONS changes in the engine, update this list too).
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+    steps:
+      - name: Build region matrix
+        id: build-matrix
+        run: |
+          if [ -n "${{ inputs.regions }}" ]; then
+            REGIONS_CSV="${{ inputs.regions }}"
+          else
+            REGIONS_CSV="Arderial,Bograth,Cald,Core,d'Resh,Kybar's Teeth,Nar,Naroom,Orothe,Paradwyn,Underneath,Universal,Weave"
+          fi
+          MATRIX=$(echo "$REGIONS_CSV" | jq -R -s -c 'split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')
+          echo "matrix={\"region\":$MATRIX}" >> $GITHUB_OUTPUT
+          echo "Planned regions: $MATRIX"
+
+  # Region: run one region's population fitness eval. 13 concurrent max under 20-slot cap.
+  region:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # under GH's 360-min hard cap
+    strategy:
+      fail-fast: false  # one region's failure shouldn't cancel the rest
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Prepare output directory
+        run: mkdir -p results
+
+      - name: Evolve region ${{ matrix.region }} generation ${{ inputs.generation }}
+        env:
+          OPPONENT_TURN_CROSSINGS: ${{ inputs.betaMode == 'true' && '1' || '0' }}
+        run: |
+          node engine/scripts/evolve-generation.mjs \
+            --region "${{ matrix.region }}" \
+            --generation ${{ inputs.generation }} \
+            --populationSize ${{ inputs.populationSize }} \
+            --mirrorGames ${{ inputs.mirrorGames }} \
+            --crossRegionOpponents ${{ inputs.crossRegionOpponents }} \
+            --gamesPerCrossOpponent ${{ inputs.gamesPerCrossOpponent }} \
+            --workers ${{ inputs.workers }} \
+            --maxTurns ${{ inputs.maxTurns }} \
+            --gameTimeoutSec ${{ inputs.timeoutSec }} \
+            --seed ${{ inputs.seed }} \
+            --out "${{ github.workspace }}/results"
+
+      - name: Show region output tail
+        if: always()
+        run: |
+          echo '--- output files ---'
+          ls -lh results/ || true
+          echo
+          echo '--- errors (head) ---'
+          head -20 results/evolve-region-*-errors.jsonl 2>/dev/null || echo '(no errors)'
+
+      - name: Upload region result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # Sanitize region name for artifact naming (matrix values with punctuation like
+          # "d'Resh" and "Kybar's Teeth" are legal but ugly in an artifact name).
+          name: evolve-region-${{ strategy.job-index }}-${{ github.run_id }}
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
+
+  # Aggregator: merge every region's evolve-region-*-gen-*.json into an updated bot-weights.json
+  # + a generation summary. Returns the final artifact.
+  aggregate:
+    needs: [plan, region]
+    if: always()  # produce partial merged result even if some region jobs failed
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Download all region artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: evolve-region-*-${{ github.run_id }}
+          path: region-downloads
+          # default merge-multiple:false -- each artifact keeps its own subdir. Aggregator's
+          # recursive walk finds every evolve-region-*-gen-*.json without collision.
+
+      - name: List downloaded region outputs
+        run: |
+          echo '--- downloaded artifacts ---'
+          find region-downloads -type f | sort
+
+      - name: Run aggregator
+        run: |
+          mkdir -p results
+          node engine/scripts/evolve-generation.mjs \
+            --aggregate region-downloads \
+            --out "${{ github.workspace }}/results"
+
+      - name: Show generation digest
+        if: always()
+        run: |
+          echo '--- evolution-generation-*-summary.txt ---'
+          cat results/evolution-generation-*-summary.txt 2>/dev/null || echo '(no summary txt)'
+
+      - name: Upload final aggregated results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evolve-final-${{ github.run_id }}
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
