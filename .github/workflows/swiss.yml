@@ -1,0 +1,149 @@
+name: Swiss
+
+# Manually-triggered Swiss-format multi-entrant tournament run.
+# See docs/plans/training-compute-scaling-plan.md in the private repo for context.
+#
+# UNLIKE tournament.yml and evolve.yml, this workflow does NOT matrix-fan-out.
+# The Swiss tournament script (engine/scripts/swiss-tournament.mjs) runs its rounds
+# sequentially (round N+1's pairings depend on round N's standings) and holds the whole
+# tournament state in one Node.js process. Splitting a round across matrix jobs would need a
+# real planner/round/aggregator refactor of that script -- deferred.
+#
+# For CI use, PICK A SMALL FIELD via the `regions` input. A full 49-entrant field with the
+# post-Swiss round-robin phase took ~11.5 hours locally on 8 workers; on a 2-worker GH runner
+# that's roughly ~40 hours -- way over the 6-hour job cap.
+#
+# Rough sizing:
+#   3 regions, no round-robin, 5 rounds:                 ~30-60 min
+#   3 regions, WITH round-robin, 5 rounds:               ~1-2 hours
+#   5 regions, WITH round-robin, 7 rounds:               ~3-5 hours (near cap)
+#   Full 13 regions + round-robin:                       DON'T -- run locally instead
+#
+# Trigger from a dev session (example: validation Swiss on 4 regions):
+#   gh workflow run swiss.yml -R caldwarlord-sudo/mnd-training \
+#     -f regions="Cald,Naroom,Core,Bograth" \
+#     -f rounds=5 \
+#     -f postRoundRobin=true \
+#     -f roundRobinGames=25 \
+#     -f workers=2 \
+#     -f timeoutSec=300 \
+#     -f betaMode=true
+
+on:
+  workflow_dispatch:
+    inputs:
+      regions:
+        description: 'Comma-separated regions (REQUIRED for CI -- blank = ALL 13, which will exceed the 6h cap. See sizing in workflow header.)'
+        required: false
+        default: 'Cald,Naroom,Core'
+      rounds:
+        description: 'Swiss rounds. Default 5 (down from local default 7 to fit in job cap).'
+        required: false
+        default: '5'
+      postRoundRobin:
+        description: 'Also run post-Swiss same-region round-robin phase (adds ~1-2h depending on field)'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+      roundRobinGames:
+        description: 'Games per pair in round-robin phase (only used if postRoundRobin=true)'
+        required: false
+        default: '25'
+      workers:
+        description: 'Parallel worker processes (max 2 on standard runners)'
+        required: false
+        default: '2'
+      maxTurns:
+        description: 'Per-game turn cap'
+        required: false
+        default: '200'
+      timeoutSec:
+        description: 'Per-game wall-clock cap (seconds)'
+        required: false
+        default: '300'
+      betaMode:
+        description: 'Opponent-turn crossings (beta ON = shipping-app parity, ~2x cost)'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+      extraEntrantsFile:
+        description: 'Optional path (relative to repo) to a JSON file listing extra entrants to inject (e.g. custom deck experiments). Blank = auto-loaded entrants only.'
+        required: false
+        default: ''
+
+jobs:
+  swiss:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # under GH's 360-min hard cap
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Prepare output directory
+        run: mkdir -p results
+
+      - name: Run Swiss tournament
+        env:
+          # swiss-tournament.mjs passes this env var through to its worker forks (see the
+          # WorkerPool constructor's `workerEnv = { ...process.env, MND_BOT_BETA_MODE: ... }`
+          # line in the script). We also set OPPONENT_TURN_CROSSINGS directly in case the
+          # script-level env is used anywhere.
+          OPPONENT_TURN_CROSSINGS: ${{ inputs.betaMode == 'true' && '1' || '0' }}
+          MND_BOT_BETA_MODE: ${{ inputs.betaMode == 'true' && '1' || '0' }}
+        run: |
+          REGIONS_FLAG=""
+          if [ -n "${{ inputs.regions }}" ]; then
+            REGIONS_FLAG="--regions ${{ inputs.regions }}"
+          fi
+          BETA_FLAG=""
+          if [ "${{ inputs.betaMode }}" != "true" ]; then
+            BETA_FLAG="--noBetaMode"
+          fi
+          RR_FLAG=""
+          if [ "${{ inputs.postRoundRobin }}" == "true" ]; then
+            RR_FLAG="--postRoundRobin --roundRobinGames ${{ inputs.roundRobinGames }}"
+          fi
+          EXTRA_FLAG=""
+          if [ -n "${{ inputs.extraEntrantsFile }}" ]; then
+            EXTRA_FLAG="--extraEntrantsFile ${{ inputs.extraEntrantsFile }}"
+          fi
+
+          node engine/scripts/swiss-tournament.mjs \
+            --workers ${{ inputs.workers }} \
+            --rounds ${{ inputs.rounds }} \
+            --maxTurns ${{ inputs.maxTurns }} \
+            --gameTimeoutSec ${{ inputs.timeoutSec }} \
+            --out "${{ github.workspace }}/results" \
+            $REGIONS_FLAG \
+            $BETA_FLAG \
+            $RR_FLAG \
+            $EXTRA_FLAG
+
+      - name: Show results tail
+        if: always()
+        run: |
+          echo '--- swiss-tournament-results.txt (tail) ---'
+          tail -80 results/swiss-tournament-results.txt 2>/dev/null || echo '(no results file)'
+          echo
+          echo '--- swiss-tournament-errors.jsonl (head) ---'
+          head -20 results/swiss-tournament-errors.jsonl 2>/dev/null || echo '(no errors file)'
+          echo
+          echo '--- artifact contents ---'
+          ls -lh results/ || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swiss-results-${{ github.run_id }}
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
