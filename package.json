@@ -1,0 +1,10 @@
+{
+  "name": "mnd-training",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Bot training harness for Magi-Nation Duel. Auto-populated from a private source repo via sync-training.mjs.",
+  "scripts": {
+    "smoke": "node scripts/smoke.mjs"
+  }
+}
