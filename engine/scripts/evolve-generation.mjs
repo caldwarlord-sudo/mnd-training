@@ -72,6 +72,23 @@ function arg(name, fallback) {
 const REGION = arg('region', null);
 const GENERATION = Number(arg('generation', 0));
 const POPULATION_SIZE = Number(arg('populationSize', 8));
+// Population sub-sharding (2026-08-21). Lets a region's population be split across N parallel
+// matrix jobs so a "needy" region can consume more concurrent runner slots. Both shards derive
+// the SAME full population deterministically (same seed, same size), then each shard evaluates
+// only its own slice: shard I of N runs candidates whose global index i satisfies i % N == I.
+// Aggregator merges the shard outputs and picks a single champion across the union. Default
+// values (shardIndex=0, shardCount=1) keep the original single-job behavior byte-identical for
+// runs that don't opt in.
+const POPULATION_SHARD_INDEX = Number(arg('populationShardIndex', 0));
+const POPULATION_SHARD_COUNT = Number(arg('populationShardCount', 1));
+if (POPULATION_SHARD_INDEX < 0 || POPULATION_SHARD_INDEX >= POPULATION_SHARD_COUNT) {
+  console.error(`Invalid populationShardIndex ${POPULATION_SHARD_INDEX} for populationShardCount ${POPULATION_SHARD_COUNT}`);
+  process.exit(1);
+}
+if (POPULATION_SHARD_COUNT > POPULATION_SIZE) {
+  console.error(`populationShardCount ${POPULATION_SHARD_COUNT} exceeds populationSize ${POPULATION_SIZE}`);
+  process.exit(1);
+}
 const MIRROR_GAMES = Number(arg('mirrorGames', 6));
 const CROSS_REGION_OPPONENTS = Number(arg('crossRegionOpponents', 3));
 const GAMES_PER_CROSS_OPPONENT = Number(arg('gamesPerCrossOpponent', 4));
@@ -283,7 +300,7 @@ function findRegionOutputs(dir) {
     const s = statSync(abs);
     if (s.isDirectory()) {
       for (const f of findRegionOutputs(abs)) results.push(f);
-    } else if (/^evolve-region-.+-gen-\d+\.json$/.test(entry)) {
+    } else if (/^evolve-region-.+-shard-\d+-gen-\d+\.json$/.test(entry)) {
       results.push(abs);
     }
   }
@@ -313,29 +330,68 @@ if (AGGREGATE_DIR) {
   const baseline = existsSync(WEIGHTS_PATH) ? loadWeightsFile(WEIGHTS_PATH) : { baseline: { ...BASELINE_WEIGHTS }, regions: {} };
   const summary = { generation: null, regions: [], startedAt: null, finishedAt: new Date().toISOString() };
 
+  // Group shard files by (region, generation). Multiple shards per region are common now
+  // (populationShardCount > 1). Aggregation within a region concatenates every shard's
+  // population, then picks the highest-fitness candidate across the union as the region-wide
+  // champion. Single-shard regions still work: they just have one file per region.
+  const byRegionGen = new Map(); // "region|gen" -> Array<shardData>
   for (const file of files) {
     const data = JSON.parse(readFileSync(file, 'utf-8'));
     if (summary.generation === null) summary.generation = data.generation;
     else if (summary.generation !== data.generation) {
-      console.error(`Aggregator: region files disagree on generation (${summary.generation} vs ${data.generation}). Refusing to merge.`);
+      console.error(`Aggregator: shard files disagree on generation (${summary.generation} vs ${data.generation}). Refusing to merge.`);
       process.exit(1);
     }
-    baseline.regions[data.region] = data.champion.weights;
+    const key = `${data.region}|${data.generation}`;
+    if (!byRegionGen.has(key)) byRegionGen.set(key, []);
+    byRegionGen.get(key).push(data);
+  }
+
+  for (const [key, shards] of byRegionGen.entries()) {
+    const region = shards[0].region;
+    // Sanity: every shard should agree on populationShardCount + populationSize.
+    const expectedShardCount = shards[0].populationShardCount ?? 1;
+    if (shards.length !== expectedShardCount) {
+      console.error(`Aggregator: region "${region}" gen ${shards[0].generation} expected ${expectedShardCount} shard(s), found ${shards.length}. Merging what's here (partial).`);
+    }
+    // Union every shard's population, then pick the overall champion.
+    const allCandidates = [];
+    for (const s of shards) allCandidates.push(...s.population);
+    // Detect the (rare) case where two shards evaluated the same candidate index -- shouldn't
+    // happen given deterministic round-robin distribution, but a config drift would surface it.
+    const seenIdx = new Set();
+    for (const c of allCandidates) {
+      if (seenIdx.has(c.idx)) {
+        console.error(`Aggregator: region "${region}" has duplicate candidate idx ${c.idx} across shards. Likely a config mismatch.`);
+      }
+      seenIdx.add(c.idx);
+    }
+    // Tiebreak: higher cross-region rate wins (matches ship priority in single-region runs).
+    allCandidates.sort((a, b) => b.fitness - a.fitness || b.crossRegionWinRate - a.crossRegionWinRate);
+    const champion = allCandidates[0];
+    baseline.regions[region] = champion.weights;
+
+    // Region summary: aggregate across shards. `regionElapsedSec` becomes the MAX across shards
+    // (they ran in parallel, so total wall-clock is the longest one).
+    const maxElapsed = Math.max(...shards.map((s) => s.regionElapsedSec ?? 0));
+    // crossRegionOpponents should be the same across shards (deterministic per (gen, region)).
+    const crossRegionOpponents = shards[0].crossRegionOpponents ?? [];
     summary.regions.push({
-      region: data.region,
-      championFitness: data.champion.fitness,
-      championMirrorWinRate: data.champion.mirrorWinRate,
-      championCrossRegionWinRate: data.champion.crossRegionWinRate,
-      populationSize: data.population.length,
-      candidates: data.population.map((c) => ({
+      region,
+      championFitness: champion.fitness,
+      championMirrorWinRate: champion.mirrorWinRate,
+      championCrossRegionWinRate: champion.crossRegionWinRate,
+      populationSize: allCandidates.length,
+      populationShardCount: expectedShardCount,
+      candidates: allCandidates.map((c) => ({
         idx: c.idx,
         fitness: c.fitness,
         mirrorWinRate: c.mirrorWinRate,
         crossRegionWinRate: c.crossRegionWinRate,
         origin: c.origin,
       })),
-      crossRegionOpponents: data.crossRegionOpponents,
-      regionElapsedSec: data.regionElapsedSec,
+      crossRegionOpponents,
+      regionElapsedSec: maxElapsed,
     });
   }
 
@@ -357,7 +413,8 @@ if (AGGREGATE_DIR) {
     const m = (r.championMirrorWinRate * 100).toFixed(1).padStart(5);
     const c = (r.championCrossRegionWinRate * 100).toFixed(1).padStart(5);
     const f = r.championFitness.toFixed(3);
-    lines.push(`  ${r.region.padEnd(18)} mirror ${m}%  cross ${c}%  fitness ${f}   (${r.populationSize} candidates, opponents: ${r.crossRegionOpponents.join(', ')})`);
+    const shardSuffix = r.populationShardCount > 1 ? ` [across ${r.populationShardCount} shards]` : '';
+    lines.push(`  ${r.region.padEnd(18)} mirror ${m}%  cross ${c}%  fitness ${f}   (${r.populationSize} candidates${shardSuffix}, opponents: ${r.crossRegionOpponents.join(', ')})`);
   }
   const digestPath = join(OUT_DIR, `evolution-generation-${summary.generation}-summary.txt`);
   writeFileSync(digestPath, lines.join('\n') + '\n', 'utf-8');
@@ -394,8 +451,12 @@ const regionBaselineWeights = { ...BASELINE_WEIGHTS };
 const seedChampionWeights = resolveWeightsForRegion(weightsFile, REGION);
 
 // Output filenames (single region, single generation).
-const OUTPUT_JSON_PATH = join(OUT_DIR, `evolve-region-${REGION.replace(/[^A-Za-z0-9]/g, '_')}-gen-${GENERATION}.json`);
-const ERRORS_JSONL_PATH = join(OUT_DIR, `evolve-region-${REGION.replace(/[^A-Za-z0-9]/g, '_')}-gen-${GENERATION}-errors.jsonl`);
+// Filename suffix always includes shard index. Un-sharded runs (populationShardCount=1) still
+// get `-shard-0` so the aggregator's file-discovery regex is uniform across single-shard and
+// multi-shard regions.
+const _regionSafe = REGION.replace(/[^A-Za-z0-9]/g, '_');
+const OUTPUT_JSON_PATH = join(OUT_DIR, `evolve-region-${_regionSafe}-shard-${POPULATION_SHARD_INDEX}-gen-${GENERATION}.json`);
+const ERRORS_JSONL_PATH = join(OUT_DIR, `evolve-region-${_regionSafe}-shard-${POPULATION_SHARD_INDEX}-gen-${GENERATION}-errors.jsonl`);
 
 console.log('=== evolve-generation (single region, single gen) ===');
 console.log(`Region:                       ${REGION}`);
@@ -454,9 +515,21 @@ for (let i = 1; i < POPULATION_SIZE; i += 1) {
 // Build the job list
 // ============================================================================
 
+// Determine which population indexes THIS shard is responsible for. Round-robin distribution
+// (i % shardCount == shardIndex) rather than contiguous slice so that a slow-to-eval candidate
+// clustered late in the population doesn't systematically hit one shard's wall-clock only.
+const myCandIndexes = [];
+for (let i = 0; i < POPULATION_SIZE; i += 1) {
+  if (i % POPULATION_SHARD_COUNT === POPULATION_SHARD_INDEX) myCandIndexes.push(i);
+}
+if (POPULATION_SHARD_COUNT > 1) {
+  console.log(`Sub-shard mode: this shard runs candidates [${myCandIndexes.join(', ')}] of ${POPULATION_SIZE} total.`);
+  console.log('');
+}
+
 const jobs = [];
 // Mirror games: each candidate plays MIRROR_GAMES vs region's baseline weights on region's deck.
-for (let candIdx = 0; candIdx < POPULATION_SIZE; candIdx += 1) {
+for (const candIdx of myCandIndexes) {
   const cand = population[candIdx];
   for (let g = 0; g < MIRROR_GAMES; g += 1) {
     jobs.push({
@@ -476,7 +549,7 @@ for (let candIdx = 0; candIdx < POPULATION_SIZE; candIdx += 1) {
 }
 // Cross-region games: each candidate plays GAMES_PER_CROSS_OPPONENT vs each opponent's baseline.
 // Candidate always pilots the REGION's deck; opponent pilots opponent's deck with baseline weights.
-for (let candIdx = 0; candIdx < POPULATION_SIZE; candIdx += 1) {
+for (const candIdx of myCandIndexes) {
   const cand = population[candIdx];
   for (let oppIdx = 0; oppIdx < crossRegionOpponents.length; oppIdx += 1) {
     const oppRegion = crossRegionOpponents[oppIdx];
@@ -553,8 +626,10 @@ for (let i = 0; i < jobs.length; i += 1) {
   else { e.crossWins += points; e.crossGames += 1; }
 }
 
+// Score only THIS shard's candidates. The aggregator merges scored-candidates lists across
+// shards and picks a single overall champion per region.
 const scoredCandidates = [];
-for (let i = 0; i < POPULATION_SIZE; i += 1) {
+for (const i of myCandIndexes) {
   const cand = population[i];
   const e = perCandidate.get(i) ?? { mirrorWins: 0, mirrorGames: 1, crossWins: 0, crossGames: 1 };
   const mirrorRate = e.mirrorGames > 0 ? e.mirrorWins / e.mirrorGames : 0.5;
@@ -596,9 +671,16 @@ for (const c of scoredCandidates) {
 const output = {
   region: REGION,
   generation: GENERATION,
+  // Shard identity: aggregator uses these to merge sub-shard outputs into one per-region
+  // champion. For non-sharded runs, populationShardCount=1 and index=0.
+  populationShardIndex: POPULATION_SHARD_INDEX,
+  populationShardCount: POPULATION_SHARD_COUNT,
+  candidateIndexesEvaluated: myCandIndexes,
   regionElapsedSec: Math.round(elapsedMs / 1000),
   crossRegionOpponents,
   seedChampionOrigin: 'bot-weights.json (or baseline if no evolved champion yet)',
+  // In sub-shard mode, this `champion` is only the SHARD winner -- aggregator picks the
+  // region-wide champion by comparing shard winners across all shards.
   champion: {
     idx: champion.idx,
     origin: champion.origin,
@@ -610,6 +692,8 @@ const output = {
   population: scoredCandidates,
   config: {
     populationSize: POPULATION_SIZE,
+    populationShardIndex: POPULATION_SHARD_INDEX,
+    populationShardCount: POPULATION_SHARD_COUNT,
     mirrorGames: MIRROR_GAMES,
     crossRegionOpponents: CROSS_REGION_OPPONENTS,
     gamesPerCrossOpponent: GAMES_PER_CROSS_OPPONENT,

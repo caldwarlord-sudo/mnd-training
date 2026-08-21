@@ -51,6 +51,17 @@
 //   --skipBaseline            Skip the baseline entrants (test only evolved champions).
 //   --latestGenOnly           Skip historical generations, keep only each region's LATEST
 //                             champion + baseline. Smaller field for a quick preview.
+//   --shapeCOnly              Filter historical champions to only Shape-C rows (from GH Actions
+//                             evolve runs, methodology='GH-Actions-ShapeC-betaOn'). Skips
+//                             pre-Shape-C rows so the field doesn't have "Cald-gen1" appearing
+//                             twice with different weights. Use for focused validation runs of
+//                             the current training methodology.
+//   --deckOverride Region=PATH   REPEATABLE. Substitute a non-default deck file for one region
+//                                (e.g. `--deckOverride Underneath=engine/decks-experimental/
+//                                new-underneath.json`). Path is absolute or relative to the
+//                                private repo root. Applies to auto-loaded entrants only --
+//                                extras from --extraEntrantsFile use their own explicit
+//                                deckPath. Non-destructive -- shipped defaults are untouched.
 //   --extraEntrantsFile FILE  Append custom entrants from a JSON file. File format is an
 //                             array of { label, region, deckPath, weightsMode? } entries.
 //                             deckPath can be absolute or relative to engine/. weightsMode
@@ -103,6 +114,44 @@ const BETA_MODE = !process.argv.includes('--noBetaMode');
 const RUN_ROUND_ROBIN = process.argv.includes('--postRoundRobin');
 const ROUND_ROBIN_GAMES = Number(arg('roundRobinGames', 40));
 
+// Shape-C-only filter (2026-08-21). `evolution-generations.jsonl` accumulates rows from every
+// era of training. Pre-Shape-C rows (from the old local beta-off / mirror-only runs) don't
+// carry a `methodology` field; Shape-C rows are tagged `GH-Actions-ShapeC-betaOn`. With this
+// flag set, only Shape-C rows are loaded as historical champions -- keeps the field focused on
+// the current training methodology and avoids the "Cald-gen1 appears twice with different
+// weights" label collision that happens when both eras are in the field.
+const SHAPE_C_ONLY = process.argv.includes('--shapeCOnly');
+
+// Per-region deck overrides (2026-08-21, owner ask -- mirrors evolve-generation.mjs's flag of
+// the same name). By default every region uses its shipped default-<region>.json file; the
+// override substitutes a different deck for one region for THIS invocation only -- shipped
+// defaults are untouched. Used to run the Underneath entrants against the redesigned new deck
+// (`engine/decks-experimental/new-underneath.json`) instead of the mirror-pathological default
+// so every Underneath variant (baseline + all historical Shape-C champions) is directly
+// comparable. Overrides apply only to auto-loaded entrants -- extras from --extraEntrantsFile
+// have their own explicit deckPath and are not affected.
+const DECK_OVERRIDES = new Map();
+{
+  for (let i = 0; i < process.argv.length; i += 1) {
+    if (process.argv[i] === '--deckOverride' && i + 1 < process.argv.length) {
+      const raw = process.argv[i + 1];
+      const eq = raw.indexOf('=');
+      if (eq < 0) {
+        console.error(`Invalid --deckOverride "${raw}": expected Region=path`);
+        process.exit(1);
+      }
+      const region = raw.slice(0, eq).trim();
+      const p = raw.slice(eq + 1).trim();
+      const absPath = resolve(REPO_ROOT, p);
+      if (!existsSync(absPath)) {
+        console.error(`--deckOverride "${region}" path does not exist: ${absPath}`);
+        process.exit(1);
+      }
+      DECK_OVERRIDES.set(region, absPath);
+    }
+  }
+}
+
 const CARDS_PATH = join(REPO_ROOT, 'data-pipeline', 'output', 'cards_final.json');
 const RESULTS_PATH = join(OUT_DIR, 'swiss-tournament-results.txt');
 const ROUNDS_JSONL_PATH = join(OUT_DIR, 'swiss-tournament-rounds.jsonl');
@@ -128,10 +177,15 @@ function expandDeck(deckJson) {
 function loadRegionalDecks() {
   const byRegion = new Map();
   for (const [deckId, region] of Object.entries(DECK_ID_TO_REGION)) {
-    const filePath = join(DECKS_DIR, `${deckId}.json`);
+    // Deck override applies first if set for this region -- see DECK_OVERRIDES above.
+    const override = DECK_OVERRIDES.get(region);
+    const filePath = override ?? join(DECKS_DIR, `${deckId}.json`);
     if (!existsSync(filePath)) {
       console.error(`Missing deck file: ${filePath}`);
       process.exit(1);
+    }
+    if (override) {
+      console.log(`  [deck-override] ${region} using ${filePath}`);
     }
     byRegion.set(region, expandDeck(JSON.parse(readFileSync(filePath, 'utf-8'))));
   }
@@ -148,13 +202,21 @@ function loadHistoricalChampions(jsonlPath) {
     return byRegion;
   }
   const lines = readFileSync(jsonlPath, 'utf-8').split('\n').filter((l) => l.trim());
+  let skippedNonShapeC = 0;
   for (const line of lines) {
     const row = JSON.parse(line);
+    if (SHAPE_C_ONLY && row.methodology !== 'GH-Actions-ShapeC-betaOn') {
+      skippedNonShapeC += 1;
+      continue;
+    }
     const arr = byRegion.get(row.region) ?? [];
     arr.push({ gen: row.gen, championWeights: row.championWeights, championFitness: row.championFitness });
     byRegion.set(row.region, arr);
   }
   for (const arr of byRegion.values()) arr.sort((a, b) => a.gen - b.gen);
+  if (SHAPE_C_ONLY && skippedNonShapeC > 0) {
+    console.log(`  [shapeCOnly] filtered out ${skippedNonShapeC} historical champion rows without methodology='GH-Actions-ShapeC-betaOn'`);
+  }
   return byRegion;
 }
 

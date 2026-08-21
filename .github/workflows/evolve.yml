@@ -93,11 +93,16 @@ on:
         description: 'Optional per-region deck override(s). Format: "Region=path,Region=path". Path relative to repo root. Example: "Underneath=engine/decks-experimental/new-underneath.json".'
         required: false
         default: ''
+      regionConfig:
+        description: 'Optional JSON array for per-region population + sub-shard control. Overrides `regions`/`populationSize` when set. Example: [{"region":"Bograth","population":16,"shards":2},{"region":"d''Resh","population":12,"shards":1}]. Each region + shard combo becomes one matrix job. Enables giving needy regions extra runner slots via sub-sharding.'
+        required: false
+        default: ''
 
 jobs:
-  # Planner: turn the `regions` input into a JSON array for the matrix strategy. Blank input
-  # expands to all 13 EVOLVING_REGIONS (hardcoded here to match the engine's list -- if
-  # EVOLVING_REGIONS changes in the engine, update this list too).
+  # Planner: build the matrix strategy from either `regionConfig` (JSON with per-region
+  # population + shard counts, takes precedence) or the simpler `regions` + `populationSize`
+  # input pair. Each matrix entry describes one runner slot -- a "sub-sharded" region contributes
+  # multiple entries (one per shard). See workflow header for regionConfig format.
   plan:
     runs-on: ubuntu-latest
     outputs:
@@ -105,15 +110,47 @@ jobs:
     steps:
       - name: Build region matrix
         id: build-matrix
+        env:
+          REGION_CONFIG_JSON: ${{ inputs.regionConfig }}
+          REGIONS_INPUT: ${{ inputs.regions }}
+          POPULATION_SIZE_INPUT: ${{ inputs.populationSize }}
         run: |
-          if [ -n "${{ inputs.regions }}" ]; then
-            REGIONS_CSV="${{ inputs.regions }}"
+          if [ -n "$REGION_CONFIG_JSON" ]; then
+            # regionConfig JSON path. Each {region, population, shards} entry expands into
+            # `shards` matrix rows, one per sub-shard. Each row carries the full population
+            # size and the shardIndex/shardCount for the script to filter its slice.
+            MATRIX=$(echo "$REGION_CONFIG_JSON" | jq -c '
+              [ .[]
+                | . as $r
+                | range(0; ($r.shards // 1))
+                | {
+                    region: $r.region,
+                    populationSize: ($r.population // 8),
+                    shardIndex: .,
+                    shardCount: ($r.shards // 1)
+                  }
+              ]
+            ')
+            echo "matrix={\"include\":$MATRIX}" >> $GITHUB_OUTPUT
+            echo "regionConfig path used. Matrix size:"
+            echo "$MATRIX" | jq 'length'
+            echo "Matrix contents:"
+            echo "$MATRIX" | jq -r '.[] | "  \(.region) shard \(.shardIndex)/\(.shardCount) pop=\(.populationSize)"'
           else
-            REGIONS_CSV="Arderial,Bograth,Cald,Core,d'Resh,Kybar's Teeth,Nar,Naroom,Orothe,Paradwyn,Underneath,Universal,Weave"
+            # Legacy path: uniform populationSize + regions list, one runner per region.
+            if [ -n "$REGIONS_INPUT" ]; then
+              REGIONS_CSV="$REGIONS_INPUT"
+            else
+              REGIONS_CSV="Arderial,Bograth,Cald,Core,d'Resh,Kybar's Teeth,Nar,Naroom,Orothe,Paradwyn,Underneath,Universal,Weave"
+            fi
+            MATRIX=$(echo "$REGIONS_CSV" | jq -R -s -c --argjson pop "$POPULATION_SIZE_INPUT" '
+              split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))
+              | map({region: ., populationSize: $pop, shardIndex: 0, shardCount: 1})
+            ')
+            echo "matrix={\"include\":$MATRIX}" >> $GITHUB_OUTPUT
+            echo "Legacy uniform path. Regions:"
+            echo "$MATRIX" | jq -r '.[] | "  \(.region) pop=\(.populationSize)"'
           fi
-          MATRIX=$(echo "$REGIONS_CSV" | jq -R -s -c 'split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')
-          echo "matrix={\"region\":$MATRIX}" >> $GITHUB_OUTPUT
-          echo "Planned regions: $MATRIX"
 
   # Region: run one region's population fitness eval. 13 concurrent max under 20-slot cap.
   region:
@@ -136,18 +173,16 @@ jobs:
       - name: Prepare output directory
         run: mkdir -p results
 
-      - name: Evolve region ${{ matrix.region }} generation ${{ inputs.generation }}
+      - name: Evolve ${{ matrix.region }} gen ${{ inputs.generation }} shard ${{ matrix.shardIndex }}/${{ matrix.shardCount }}
         env:
           OPPONENT_TURN_CROSSINGS: ${{ inputs.betaMode == 'true' && '1' || '0' }}
         run: |
           # Expand deckOverrides (comma-separated "Region=path,Region=path") into repeated
-          # --deckOverride flag pairs. Blank input = no overrides. Split preserves the "=path"
-          # side even if the path contains "=" (unlikely but safe).
+          # --deckOverride flag pairs. Blank input = no overrides.
           OVERRIDE_FLAGS=""
           if [ -n "${{ inputs.deckOverrides }}" ]; then
             IFS=',' read -ra OVERRIDES <<< "${{ inputs.deckOverrides }}"
             for o in "${OVERRIDES[@]}"; do
-              # trim leading/trailing whitespace
               o="${o#"${o%%[![:space:]]*}"}"
               o="${o%"${o##*[![:space:]]}"}"
               if [ -n "$o" ]; then
@@ -159,7 +194,9 @@ jobs:
           node engine/scripts/evolve-generation.mjs \
             --region "${{ matrix.region }}" \
             --generation ${{ inputs.generation }} \
-            --populationSize ${{ inputs.populationSize }} \
+            --populationSize ${{ matrix.populationSize }} \
+            --populationShardIndex ${{ matrix.shardIndex }} \
+            --populationShardCount ${{ matrix.shardCount }} \
             --mirrorGames ${{ inputs.mirrorGames }} \
             --crossRegionOpponents ${{ inputs.crossRegionOpponents }} \
             --gamesPerCrossOpponent ${{ inputs.gamesPerCrossOpponent }} \
