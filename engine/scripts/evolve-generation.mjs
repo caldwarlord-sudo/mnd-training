@@ -36,6 +36,11 @@
 //   --weights PATH            bot-weights.json path. Default engine/data/bot-weights.json.
 //   --decks DIR               Default-decks dir. Default app/resources/default-decks.
 //   --out DIR                 Output directory. Default engine/.
+//   --deckOverride Region=PATH   REPEATABLE. Substitute a non-default deck file for one region
+//                                (e.g. `--deckOverride Underneath=engine/decks-experimental/
+//                                new-underneath.json`). Path is absolute or relative to the
+//                                private repo root. Non-destructive -- shipped default-decks
+//                                are untouched.
 //   --aggregate DIR           AGGREGATOR MODE: read every region-generation JSON from DIR
 //                             (recursively), merge into an updated bot-weights.json plus a
 //                             generation summary, and exit. No games run in this mode. Used
@@ -79,6 +84,38 @@ const DECKS_DIR = resolve(arg('decks', join(REPO_ROOT, 'app', 'resources', 'defa
 const OUT_DIR = resolve(arg('out', join(here, '..')));
 const AGGREGATE_DIR = arg('aggregate', null);
 
+// Per-region deck overrides (2026-08-21, owner ask). By default every region uses its shipped
+// `app/resources/default-decks/default-<region>.json` file, which for Underneath is the
+// mirror-match-pathological default deck we know evolves poorly. `--deckOverride Region=path`
+// (repeatable) substitutes a different deck file for one region without touching the shipped
+// defaults; path is absolute or relative to the private repo root. Used from the workflow to
+// evolve Underneath against its redesigned deck (`engine/decks-experimental/new-underneath.json`)
+// while leaving the shipping app's Underneath deck untouched.
+const DECK_OVERRIDES = new Map();
+{
+  const overrideArgs = [];
+  for (let i = 0; i < process.argv.length; i += 1) {
+    if (process.argv[i] === '--deckOverride' && i + 1 < process.argv.length) {
+      overrideArgs.push(process.argv[i + 1]);
+    }
+  }
+  for (const raw of overrideArgs) {
+    const eq = raw.indexOf('=');
+    if (eq < 0) {
+      console.error(`Invalid --deckOverride "${raw}": expected Region=path`);
+      process.exit(1);
+    }
+    const region = raw.slice(0, eq).trim();
+    const p = raw.slice(eq + 1).trim();
+    const absPath = resolve(REPO_ROOT, p);
+    if (!existsSync(absPath)) {
+      console.error(`--deckOverride "${region}" path does not exist: ${absPath}`);
+      process.exit(1);
+    }
+    DECK_OVERRIDES.set(region, absPath);
+  }
+}
+
 const CARDS_PATH = join(REPO_ROOT, 'data-pipeline', 'output', 'cards_final.json');
 
 // Fitness blend: cross-region is weighted higher because cross-region play is what the shipped
@@ -106,10 +143,17 @@ function expandDeck(deckJson) {
 function loadRegionalDecks() {
   const byRegion = new Map();
   for (const [deckId, region] of Object.entries(DECK_ID_TO_REGION)) {
-    const filePath = join(DECKS_DIR, `${deckId}.json`);
+    // Deck-override lookup first: if --deckOverride Region=path was passed for this region,
+    // use that file instead of the shipped default. Overrides are noisy on purpose (log line)
+    // so operators can spot-check the run header.
+    const override = DECK_OVERRIDES.get(region);
+    const filePath = override ?? join(DECKS_DIR, `${deckId}.json`);
     if (!existsSync(filePath)) {
       console.error(`Missing deck file: ${filePath}`);
       process.exit(1);
+    }
+    if (override) {
+      console.log(`  [deck-override] ${region} using ${filePath}`);
     }
     byRegion.set(region, expandDeck(JSON.parse(readFileSync(filePath, 'utf-8'))));
   }

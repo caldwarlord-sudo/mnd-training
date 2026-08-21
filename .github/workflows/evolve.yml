@@ -89,6 +89,10 @@ on:
         description: 'Base seed for population + game seeds'
         required: false
         default: '42'
+      deckOverrides:
+        description: 'Optional per-region deck override(s). Format: "Region=path,Region=path". Path relative to repo root. Example: "Underneath=engine/decks-experimental/new-underneath.json".'
+        required: false
+        default: ''
 
 jobs:
   # Planner: turn the `regions` input into a JSON array for the matrix strategy. Blank input
@@ -136,6 +140,22 @@ jobs:
         env:
           OPPONENT_TURN_CROSSINGS: ${{ inputs.betaMode == 'true' && '1' || '0' }}
         run: |
+          # Expand deckOverrides (comma-separated "Region=path,Region=path") into repeated
+          # --deckOverride flag pairs. Blank input = no overrides. Split preserves the "=path"
+          # side even if the path contains "=" (unlikely but safe).
+          OVERRIDE_FLAGS=""
+          if [ -n "${{ inputs.deckOverrides }}" ]; then
+            IFS=',' read -ra OVERRIDES <<< "${{ inputs.deckOverrides }}"
+            for o in "${OVERRIDES[@]}"; do
+              # trim leading/trailing whitespace
+              o="${o#"${o%%[![:space:]]*}"}"
+              o="${o%"${o##*[![:space:]]}"}"
+              if [ -n "$o" ]; then
+                OVERRIDE_FLAGS="$OVERRIDE_FLAGS --deckOverride $o"
+              fi
+            done
+          fi
+
           node engine/scripts/evolve-generation.mjs \
             --region "${{ matrix.region }}" \
             --generation ${{ inputs.generation }} \
@@ -147,7 +167,8 @@ jobs:
             --maxTurns ${{ inputs.maxTurns }} \
             --gameTimeoutSec ${{ inputs.timeoutSec }} \
             --seed ${{ inputs.seed }} \
-            --out "${{ github.workspace }}/results"
+            --out "${{ github.workspace }}/results" \
+            $OVERRIDE_FLAGS
 
       - name: Show region output tail
         if: always()
