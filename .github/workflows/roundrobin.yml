@@ -1,0 +1,213 @@
+name: Round Robin
+
+# Full-field cross-region round-robin tournament.
+# See docs/plans/training-compute-scaling-plan.md (private repo) and
+# docs/investigations/evolve-shapeC-analyses/ for the shape-C evolution context this
+# tournament format is intended to validate.
+#
+# WHY this exists alongside swiss.yml: Swiss's 7-round / ~12-games-per-entrant sample is too
+# small for a 52-entrant field. The same frozen entrants can flip 20+ ranks between Swiss
+# events purely from pairing luck. Round-robin plays every entrant vs every other N times
+# (default 4 = 2 as p1 + 2 as p2, series draws allowed for 2-2 outcomes) which gives ~200
+# games per entrant and reduces per-run variance ~4x compared to Swiss.
+#
+# Trigger from a dev session:
+#   gh workflow run roundrobin.yml -R caldwarlord-sudo/mnd-training \
+#     -f jsonl="curated-swiss-52-gen1-7.jsonl" \
+#     -f gamesPerPair=4 \
+#     -f shards=20 \
+#     -f workers=2 \
+#     -f betaMode=true \
+#     -f deckOverrides="Underneath=engine/decks-experimental/new-underneath.json,Bograth=engine/decks-experimental/new-bograth.json"
+#
+# The `jsonl` input names a curated JSONL committed to the training repo (same format the
+# Swiss workflow consumes via its --jsonl flag).
+
+on:
+  workflow_dispatch:
+    inputs:
+      jsonl:
+        description: 'Curated JSONL of champion rows to include (relative to engine/, e.g. curated-swiss-52-gen1-7.jsonl). Blank = full evolution-generations.jsonl.'
+        required: false
+        default: 'curated-swiss-52-gen1-7.jsonl'
+      shapeCOnly:
+        description: 'Filter JSONL to Shape-C rows only (skip pre-Shape-C)'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+      gamesPerPair:
+        description: 'Games per pair (must be even -- half as each side). Default 4 (2 each side, 2-2 = draw).'
+        required: false
+        default: '4'
+      shards:
+        description: 'Matrix job count (1-20). Default 20 for max concurrency; drop for smaller runs.'
+        required: false
+        default: '20'
+      workers:
+        description: 'Worker processes per runner (max 2 on standard GH runners)'
+        required: false
+        default: '2'
+      maxTurns:
+        description: 'Per-game turn cap'
+        required: false
+        default: '200'
+      timeoutSec:
+        description: 'Per-game wall-clock cap (seconds)'
+        required: false
+        default: '300'
+      betaMode:
+        description: 'Opponent-turn crossings (beta ON = shipping-app parity)'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+      slowRegions:
+        description: 'Regions whose pairs get 5x weight in shard bin-packing (empty = uniform)'
+        required: false
+        default: 'Underneath,Weave,Paradwyn'
+      deckOverrides:
+        description: 'Optional per-region deck override(s). Format: "Region=path,Region=path".'
+        required: false
+        default: ''
+      regionsFilter:
+        description: 'Optional comma-separated regions filter (limit which regions contribute baselines/JSONL rows). Blank = all 13.'
+        required: false
+        default: ''
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+      shard-count: ${{ steps.build-matrix.outputs.shard-count }}
+    steps:
+      - name: Validate + emit matrix
+        id: build-matrix
+        run: |
+          SHARDS="${{ inputs.shards }}"
+          if [ "$SHARDS" -lt 1 ] || [ "$SHARDS" -gt 20 ]; then
+            echo "shards must be between 1 and 20 (got $SHARDS)"
+            exit 1
+          fi
+          MATRIX=$(seq 0 $((SHARDS - 1)) | jq -R -s -c 'split("\n") | map(select(length > 0) | tonumber)')
+          echo "matrix={\"shardIndex\":$MATRIX}" >> $GITHUB_OUTPUT
+          echo "shard-count=$SHARDS" >> $GITHUB_OUTPUT
+          echo "Planned $SHARDS shard job(s)"
+
+  shard:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Prepare output directory
+        run: mkdir -p results
+
+      - name: Run round-robin shard ${{ matrix.shardIndex }}
+        env:
+          OPPONENT_TURN_CROSSINGS: ${{ inputs.betaMode == 'true' && '1' || '0' }}
+          MND_BOT_BETA_MODE: ${{ inputs.betaMode == 'true' && '1' || '0' }}
+        run: |
+          # Expand deckOverrides -> repeated --deckOverride flags (same shape as evolve.yml).
+          OVERRIDE_FLAGS=""
+          if [ -n "${{ inputs.deckOverrides }}" ]; then
+            IFS=',' read -ra OVERRIDES <<< "${{ inputs.deckOverrides }}"
+            for o in "${OVERRIDES[@]}"; do
+              o="${o#"${o%%[![:space:]]*}"}"
+              o="${o%"${o##*[![:space:]]}"}"
+              if [ -n "$o" ]; then
+                OVERRIDE_FLAGS="$OVERRIDE_FLAGS --deckOverride $o"
+              fi
+            done
+          fi
+          SHAPE_FLAG=""
+          if [ "${{ inputs.shapeCOnly }}" == "true" ]; then SHAPE_FLAG="--shapeCOnly"; fi
+          JSONL_FLAG=""
+          if [ -n "${{ inputs.jsonl }}" ]; then JSONL_FLAG="--jsonl engine/${{ inputs.jsonl }}"; fi
+          REGIONS_FLAG=""
+          if [ -n "${{ inputs.regionsFilter }}" ]; then REGIONS_FLAG="--regions ${{ inputs.regionsFilter }}"; fi
+          SLOW_FLAG=""
+          if [ -n "${{ inputs.slowRegions }}" ]; then SLOW_FLAG="--slowRegions ${{ inputs.slowRegions }}"; fi
+
+          node engine/scripts/roundrobin.mjs \
+            --workers ${{ inputs.workers }} \
+            --gamesPerPair ${{ inputs.gamesPerPair }} \
+            --maxTurns ${{ inputs.maxTurns }} \
+            --gameTimeoutSec ${{ inputs.timeoutSec }} \
+            --shardIndex ${{ matrix.shardIndex }} \
+            --shardCount ${{ needs.plan.outputs.shard-count }} \
+            --out "${{ github.workspace }}/results" \
+            $JSONL_FLAG \
+            $SHAPE_FLAG \
+            $REGIONS_FLAG \
+            $SLOW_FLAG \
+            $OVERRIDE_FLAGS
+
+      - name: Show shard tail
+        if: always()
+        run: |
+          echo '--- shard ${{ matrix.shardIndex }} JSONL line count ---'
+          wc -l results/roundrobin-matches-shard-*.jsonl 2>/dev/null || echo '(no jsonl)'
+          echo '--- errors (head) ---'
+          head -20 results/roundrobin-errors-shard-*.jsonl 2>/dev/null || echo '(no errors)'
+          ls -lh results/ || true
+
+      - name: Upload shard results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: roundrobin-shard-${{ matrix.shardIndex }}-${{ github.run_id }}
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
+
+  aggregate:
+    needs: [plan, shard]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Download shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: roundrobin-shard-*-${{ github.run_id }}
+          path: shard-downloads
+
+      - name: List downloaded shards
+        run: find shard-downloads -type f | sort
+
+      - name: Run aggregator
+        run: |
+          mkdir -p results
+          node engine/scripts/roundrobin.mjs \
+            --aggregateShards shard-downloads \
+            --out "${{ github.workspace }}/results"
+
+      - name: Show final leaderboard
+        if: always()
+        run: cat results/roundrobin-results.txt 2>/dev/null || echo '(no results file)'
+
+      - name: Upload final aggregated results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: roundrobin-final-${{ github.run_id }}
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
