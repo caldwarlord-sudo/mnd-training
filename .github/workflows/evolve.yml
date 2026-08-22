@@ -97,6 +97,10 @@ on:
         description: 'Optional JSON array for per-region population + sub-shard control. Overrides `regions`/`populationSize` when set. Example: [{"region":"Bograth","population":16,"shards":2},{"region":"d''Resh","population":12,"shards":1}]. Each region + shard combo becomes one matrix job. Enables giving needy regions extra runner slots via sub-sharding.'
         required: false
         default: ''
+      mutationSigma:
+        description: 'Optional mutation sigma-relative override (engine default 0.15). Try 0.25-0.30 for stuck regions to escape local optima. Blank = engine default.'
+        required: false
+        default: ''
 
 jobs:
   # Planner: build the matrix strategy from either `regionConfig` (JSON with per-region
@@ -190,6 +194,10 @@ jobs:
               fi
             done
           fi
+          SIGMA_FLAG=""
+          if [ -n "${{ inputs.mutationSigma }}" ]; then
+            SIGMA_FLAG="--mutationSigma ${{ inputs.mutationSigma }}"
+          fi
 
           node engine/scripts/evolve-generation.mjs \
             --region "${{ matrix.region }}" \
@@ -205,7 +213,8 @@ jobs:
             --gameTimeoutSec ${{ inputs.timeoutSec }} \
             --seed ${{ inputs.seed }} \
             --out "${{ github.workspace }}/results" \
-            $OVERRIDE_FLAGS
+            $OVERRIDE_FLAGS \
+            $SIGMA_FLAG
 
       - name: Show region output tail
         if: always()

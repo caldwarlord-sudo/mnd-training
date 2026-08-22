@@ -36,6 +36,10 @@
 //   --weights PATH            bot-weights.json path. Default engine/data/bot-weights.json.
 //   --decks DIR               Default-decks dir. Default app/resources/default-decks.
 //   --out DIR                 Output directory. Default engine/.
+//   --mutationSigma N         Optional. Override the engine's default mutation sigma-relative
+//                             (default 0.15). Try larger values (e.g., 0.25 or 0.30) to escape
+//                             local optima when a region has plateaued. Passed to mutateWeights
+//                             as an override; engine default constant is untouched.
 //   --deckOverride Region=PATH   REPEATABLE. Substitute a non-default deck file for one region
 //                                (e.g. `--deckOverride Underneath=engine/decks-experimental/
 //                                new-underneath.json`). Path is absolute or relative to the
@@ -96,6 +100,15 @@ const WORKERS = Number(arg('workers', 2));
 const MAX_TURNS = Number(arg('maxTurns', 200));
 const GAME_TIMEOUT_SEC = Number(arg('gameTimeoutSec', 300));
 const BASE_SEED = Number(arg('seed', 42));
+// Optional mutation-sigma override (2026-08-22). Default undefined => mutateWeights uses the
+// engine default (0.15). Bumped via workflow flag for the gen-8 experiment (0.25) to try to
+// escape local optima the standard-sigma runs plateaued in. Zero or negative => reject.
+const MUTATION_SIGMA_ARG = arg('mutationSigma', null);
+const MUTATION_SIGMA = MUTATION_SIGMA_ARG !== null ? Number(MUTATION_SIGMA_ARG) : null;
+if (MUTATION_SIGMA !== null && (!isFinite(MUTATION_SIGMA) || MUTATION_SIGMA <= 0)) {
+  console.error(`Invalid --mutationSigma "${MUTATION_SIGMA_ARG}" -- must be positive number`);
+  process.exit(1);
+}
 const WEIGHTS_PATH = resolve(arg('weights', join(REPO_ROOT, 'engine', 'data', 'bot-weights.json')));
 const DECKS_DIR = resolve(arg('decks', join(REPO_ROOT, 'app', 'resources', 'default-decks')));
 const OUT_DIR = resolve(arg('out', join(here, '..')));
@@ -492,6 +505,14 @@ writeFileSync(ERRORS_JSONL_PATH, '', 'utf-8');
 // without shifting the population, and vice versa).
 const mutationRng = createSeededRng(evolveGenSeedFor(GENERATION, regionIdx, 0, 0, 0));
 
+// Optional per-run sigma override for mutateWeights. When null, mutateWeights falls back to its
+// engine default (MUTATION_SIGMA_RELATIVE = 0.15).
+const mutateOpts = MUTATION_SIGMA !== null ? { sigmaRelative: MUTATION_SIGMA } : undefined;
+if (MUTATION_SIGMA !== null) {
+  console.log(`Mutation sigma override: ${MUTATION_SIGMA} (default 0.15)`);
+  console.log('');
+}
+
 const population = [];
 // Slot 0: the current champion, unchanged. Serves as a "must not lose ground" anchor.
 population.push({ idx: 0, weights: { ...seedChampionWeights }, origin: 'champion' });
@@ -500,7 +521,7 @@ population.push({ idx: 0, weights: { ...seedChampionWeights }, origin: 'champion
 for (let i = 1; i < POPULATION_SIZE; i += 1) {
   if (i % 2 === 1) {
     // Mutation of champion
-    population.push({ idx: i, weights: mutateWeights(seedChampionWeights, mutationRng), origin: `mutate-champion` });
+    population.push({ idx: i, weights: mutateWeights(seedChampionWeights, mutationRng, mutateOpts), origin: `mutate-champion` });
   } else {
     // Crossover of two random prior members
     const aIdx = Math.floor(mutationRng() * i);
@@ -702,6 +723,7 @@ const output = {
     baseSeed: BASE_SEED,
     mirrorWeight: MIRROR_WEIGHT,
     crossRegionWeight: CROSS_REGION_WEIGHT,
+    mutationSigma: MUTATION_SIGMA,  // null = engine default 0.15
     betaMode: process.env.OPPONENT_TURN_CROSSINGS === '1',
   },
 };

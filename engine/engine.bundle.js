@@ -42301,11 +42301,13 @@ function sampleGaussian(rng) {
   const u2 = rng();
   return Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
 }
-function mutateWeights(parent, rng) {
+function mutateWeights(parent, rng, opts) {
+  const sigmaRel = opts?.sigmaRelative ?? MUTATION_SIGMA_RELATIVE;
+  const sigmaFloor = opts?.sigmaFloor ?? MUTATION_SIGMA_ABSOLUTE_FLOOR;
   const child = {};
   for (const key of WEIGHT_FIELDS) {
     const current = parent[key];
-    const sigma = Math.max(MUTATION_SIGMA_RELATIVE * Math.abs(current), MUTATION_SIGMA_ABSOLUTE_FLOOR);
+    const sigma = Math.max(sigmaRel * Math.abs(current), sigmaFloor);
     child[key] = current + sampleGaussian(rng) * sigma;
   }
   return child;
