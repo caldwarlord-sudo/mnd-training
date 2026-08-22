@@ -410,7 +410,7 @@ if (AGGREGATE_SHARDS_DIR) {
     lines.push(`${String(i + 1).padStart(2)}    ${e.label.padEnd(30)} ${String(e.seriesW).padStart(6)}   ${String(e.seriesL).padStart(6)}   ${String(e.seriesD).padStart(6)}   ${e.seriesPoints.toFixed(1).padStart(6)}   ${e.gameW}-${e.gameL}-${e.gameD}`);
   });
   lines.push('');
-  lines.push(`Each entrant played ${entrants.size - 1} series (once vs every other entrant), each series = ${GAMES_PER_PAIR} games.`);
+  lines.push(`Each entrant played ${entrants.size - 1} series (once vs every other entrant), each series = ${actualGamesPerPair ?? GAMES_PER_PAIR} games.`);
   lines.push('SeriesW/L/D = pair series won / lost / drawn (2-2 = draw when games/pair = 4).');
   lines.push('Points = SeriesW + SeriesD * 0.5. Games(W-L-D) = total game-level record across all series.');
   const dir = dirname(RESULTS_PATH);
