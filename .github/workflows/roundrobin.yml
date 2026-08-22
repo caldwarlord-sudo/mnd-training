@@ -74,6 +74,10 @@ on:
         description: 'Optional comma-separated regions filter (limit which regions contribute baselines/JSONL rows). Blank = all 13.'
         required: false
         default: ''
+      extraEntrantsFile:
+        description: 'Optional extras JSON with additional entrants (e.g. experimental-deck variants). Relative to engine/, e.g. extras-newdeck-comparison.json. Blank = none.'
+        required: false
+        default: ''
 
 jobs:
   plan:
@@ -138,6 +142,8 @@ jobs:
           if [ -n "${{ inputs.regionsFilter }}" ]; then REGIONS_FLAG="--regions ${{ inputs.regionsFilter }}"; fi
           SLOW_FLAG=""
           if [ -n "${{ inputs.slowRegions }}" ]; then SLOW_FLAG="--slowRegions ${{ inputs.slowRegions }}"; fi
+          EXTRAS_FLAG=""
+          if [ -n "${{ inputs.extraEntrantsFile }}" ]; then EXTRAS_FLAG="--extraEntrantsFile engine/${{ inputs.extraEntrantsFile }}"; fi
 
           node engine/scripts/roundrobin.mjs \
             --workers ${{ inputs.workers }} \
@@ -151,6 +157,7 @@ jobs:
             $SHAPE_FLAG \
             $REGIONS_FLAG \
             $SLOW_FLAG \
+            $EXTRAS_FLAG \
             $OVERRIDE_FLAGS
 
       - name: Show shard tail

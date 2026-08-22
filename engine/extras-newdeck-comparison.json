@@ -1,0 +1,10 @@
+[
+  {"label":"Arderial-Experimental-Baseline","region":"Arderial","deckPath":"engine/decks-experimental/new-arderial.json","weightsMode":"baseline"},
+  {"label":"Arderial-Experimental-Gen6","region":"Arderial","deckPath":"engine/decks-experimental/new-arderial.json","weightsMode":"jsonl:Arderial-Experimental:6"},
+  {"label":"Bograth-Experimental-Gen1","region":"Bograth","deckPath":"engine/decks-experimental/new-bograth.json","weightsMode":"jsonl:Bograth-Experimental:1"},
+  {"label":"Bograth-Experimental-Gen4","region":"Bograth","deckPath":"engine/decks-experimental/new-bograth.json","weightsMode":"jsonl:Bograth-Experimental:4"},
+  {"label":"Universal-Experimental-Gen1","region":"Universal","deckPath":"engine/decks-experimental/new-universal.json","weightsMode":"jsonl:Universal-Experimental:1"},
+  {"label":"Universal-Experimental-Gen4","region":"Universal","deckPath":"engine/decks-experimental/new-universal.json","weightsMode":"jsonl:Universal-Experimental:4"},
+  {"label":"Orothe-Experimental-Gen1","region":"Orothe","deckPath":"engine/decks-experimental/new-orothe.json","weightsMode":"jsonl:Orothe-Experimental:1"},
+  {"label":"Orothe-Experimental-Gen5","region":"Orothe","deckPath":"engine/decks-experimental/new-orothe.json","weightsMode":"jsonl:Orothe-Experimental:5"}
+]
