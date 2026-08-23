@@ -1,0 +1,152 @@
+name: Evolve Underneath (focused)
+
+# Focused per-region evolution runner (2026-08-22). See engine/scripts/evolve-underneath-focused.mjs
+# for the full design writeup.
+#
+# Shape per generation:
+#   Field = baseline + best-so-far + N mutations (all piloting the region + deck under test)
+#         + 12 opponents (every OTHER evolving region at its current retirement pick).
+#   Every pair involving the focus region plays Bo4 (skips opponent-vs-opponent pairs via
+#   --focusRegion, saving ~43% of the games a full round-robin would need).
+#   After the gen, the top target entrant is compared to best-so-far -- if it cleanly beats
+#   best-so-far, it becomes the new best-so-far; otherwise best-so-far persists.
+#
+# Best-so-far state persists across generations WITHIN a single workflow run by appending to
+# evolution-generations.jsonl (which the wrapper reads on startup for previous best-so-far
+# rows). BETWEEN workflow runs, persistence is manual: the final evolution-generations.jsonl
+# is uploaded as an artifact; the caller downloads it, commits over the mnd-training version
+# (or the private repo's version, then syncs), and pushes before firing the next batch.
+#
+# Trigger:
+#   gh workflow run evolve-underneath.yml -R caldwarlord-sudo/mnd-training \
+#     -f deckPath="engine/decks-experimental/underneath-test-v2.json" \
+#     -f generations=5 \
+#     -f populationSize=4 \
+#     -f mutationSigma="" \
+#     -f gamesPerPair=4 \
+#     -f workers=2 \
+#     -f betaMode=true
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: 'Region under test (default: Underneath)'
+        required: false
+        default: 'Underneath'
+      deckPath:
+        description: 'Deck file (relative to repo root, e.g. engine/decks-experimental/underneath-test-v2.json)'
+        required: true
+        default: 'engine/decks-experimental/underneath-test-v2.json'
+      generations:
+        description: 'How many generations to run in this batch. 3-5 is a comfortable batch.'
+        required: false
+        default: '3'
+      startGeneration:
+        description: 'Optional generation number to start at. Blank = auto-infer from genlog (last gen + 1).'
+        required: false
+        default: ''
+      populationSize:
+        description: 'Mutations per generation (in addition to baseline + best-so-far).'
+        required: false
+        default: '4'
+      mutationSigma:
+        description: 'Optional override for mutateWeights sigma-relative (default 0.15). Blank = default.'
+        required: false
+        default: ''
+      gamesPerPair:
+        description: 'Games per pair series (must be even). Default 4.'
+        required: false
+        default: '4'
+      workers:
+        description: 'Worker processes (2 max on standard runners).'
+        required: false
+        default: '2'
+      maxTurns:
+        description: 'Per-game turn cap.'
+        required: false
+        default: '200'
+      timeoutSec:
+        description: 'Per-game wall-clock cap (seconds).'
+        required: false
+        default: '300'
+      betaMode:
+        description: 'Opponent-turn crossings (beta ON = shipping-app parity)'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+      methodology:
+        description: 'Genlog methodology tag. Best-so-far lookup filters to rows with this tag + region.'
+        required: false
+        default: 'focused-underneath-v2'
+      seed:
+        description: 'Base seed for mutation RNG (final per-gen seed derived from this + gen number).'
+        required: false
+        default: '42'
+
+jobs:
+  evolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 720   # 12h ceiling; 5-gen batches at ~1.5-2h/gen fit comfortably
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Prepare output directory
+        run: mkdir -p results
+
+      - name: Run focused evolution
+        env:
+          OPPONENT_TURN_CROSSINGS: ${{ inputs.betaMode == 'true' && '1' || '0' }}
+          MND_BOT_BETA_MODE: ${{ inputs.betaMode == 'true' && '1' || '0' }}
+        run: |
+          START_GEN_FLAG=""
+          if [ -n "${{ inputs.startGeneration }}" ]; then START_GEN_FLAG="--startGeneration ${{ inputs.startGeneration }}"; fi
+          SIGMA_FLAG=""
+          if [ -n "${{ inputs.mutationSigma }}" ]; then SIGMA_FLAG="--mutationSigma ${{ inputs.mutationSigma }}"; fi
+
+          node engine/scripts/evolve-underneath-focused.mjs \
+            --region "${{ inputs.region }}" \
+            --deckPath "${{ inputs.deckPath }}" \
+            --generations ${{ inputs.generations }} \
+            --populationSize ${{ inputs.populationSize }} \
+            --gamesPerPair ${{ inputs.gamesPerPair }} \
+            --workers ${{ inputs.workers }} \
+            --maxTurns ${{ inputs.maxTurns }} \
+            --gameTimeoutSec ${{ inputs.timeoutSec }} \
+            --seed ${{ inputs.seed }} \
+            --methodology "${{ inputs.methodology }}" \
+            --out "${{ github.workspace }}/results" \
+            $START_GEN_FLAG \
+            $SIGMA_FLAG
+
+      - name: Show updated genlog tail
+        if: always()
+        run: |
+          echo '--- last 5 lines of engine/evolution-generations.jsonl ---'
+          tail -5 engine/evolution-generations.jsonl 2>/dev/null || echo '(no genlog)'
+          echo '--- per-gen result files ---'
+          ls -lh results/focused-evo-gen-*/ 2>/dev/null || echo '(no per-gen outputs)'
+
+      - name: Upload updated genlog
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evolve-underneath-genlog-${{ github.run_id }}
+          path: engine/evolution-generations.jsonl
+          retention-days: 60
+
+      - name: Upload per-gen results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evolve-underneath-per-gen-${{ github.run_id }}
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn

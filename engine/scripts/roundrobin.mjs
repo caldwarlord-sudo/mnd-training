@@ -43,6 +43,11 @@
 //   --deckOverride Region=PATH   REPEATABLE. Substitute a non-default deck for one region.
 //   --slowRegions "A,B,C"     Regions whose pairs get 5x weight for shard balancing.
 //                             Default "Underneath,Weave,Paradwyn". Empty = uniform.
+//   --focusRegion NAME        Optional. Only play pairs where at least one entrant's region is
+//                             NAME. Used by focused per-generation evolution runs where the
+//                             other regions are "opponent fodder" for a single region -- no
+//                             point wasting compute on opponent-vs-opponent pairs. Compatible
+//                             with sharding (the filtered pair list gets sharded normally).
 //   --shardIndex N            0-based shard index. Default 0.
 //   --shardCount N            Total shards. Default 1 (no sharding).
 //   --aggregateShards DIR     AGGREGATOR MODE. Merges shard JSONLs into final report.
@@ -99,6 +104,7 @@ if (SHARD_INDEX < 0 || SHARD_INDEX >= SHARD_COUNT) {
 const SLOW_REGIONS_ARG = arg('slowRegions', 'Underneath,Weave,Paradwyn');
 const SLOW_REGIONS = new Set(SLOW_REGIONS_ARG.split(',').map((s) => s.trim()).filter((s) => s));
 const HEAVY_WEIGHT = 5;
+const FOCUS_REGION = arg('focusRegion', null);
 
 const CARDS_PATH = join(REPO_ROOT, 'data-pipeline', 'output', 'cards_final.json');
 const RESULTS_PATH = join(OUT_DIR, 'roundrobin-results.txt');
@@ -452,12 +458,19 @@ console.log('');
 initJsonl(MATCHES_JSONL_PATH);
 initJsonl(ERRORS_JSONL_PATH);
 
-// Build the pair list: unique unordered pairs (i, j) with i < j.
+// Build the pair list: unique unordered pairs (i, j) with i < j. If --focusRegion is set,
+// keep only pairs where at least one endpoint's region matches (opponent-vs-opponent pairs
+// are discarded -- they're compute waste in focused per-generation runs).
 const pairs = [];
 for (let i = 0; i < entrants.length; i += 1) {
   for (let j = i + 1; j < entrants.length; j += 1) {
+    if (FOCUS_REGION && entrants[i].region !== FOCUS_REGION && entrants[j].region !== FOCUS_REGION) continue;
     pairs.push({ aIdx: i, bIdx: j });
   }
+}
+if (FOCUS_REGION) {
+  const fullCount = entrants.length * (entrants.length - 1) / 2;
+  console.log(`Focus-region filter: keeping ${pairs.length}/${fullCount} pairs (only pairs involving "${FOCUS_REGION}")`);
 }
 
 // Apply weighted bin-packing sharding: heavy pairs (either endpoint in SLOW_REGIONS) get
