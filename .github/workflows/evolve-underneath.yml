@@ -39,9 +39,9 @@ on:
         required: true
         default: 'engine/decks-experimental/underneath-test-v2.json'
       generations:
-        description: 'How many generations to run in this batch. 3-5 is a comfortable batch.'
+        description: 'Generations per invocation. KEEP AT 1 -- GH enforces a hard 6h job cap that a slow region like Underneath can exceed in a single generation. Session-driven pattern: fire, wait for completion, auto-fire the next.'
         required: false
-        default: '3'
+        default: '1'
       startGeneration:
         description: 'Optional generation number to start at. Blank = auto-infer from genlog (last gen + 1).'
         required: false
