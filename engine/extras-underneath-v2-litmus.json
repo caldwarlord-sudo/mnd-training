@@ -1,0 +1,20 @@
+[
+  {
+    "label": "Underneath-Contender-Gen1-Mut1",
+    "region": "Underneath",
+    "deckPath": "engine/decks-experimental/underneath-test-v2.json",
+    "weightsMode": "jsonl:Underneath-Focused-v2:1"
+  },
+  {
+    "label": "Underneath-Contender-Gen3-Mut2",
+    "region": "Underneath",
+    "deckPath": "engine/decks-experimental/underneath-test-v2.json",
+    "weightsMode": "jsonl:Underneath-Focused-v2:2"
+  },
+  {
+    "label": "Underneath-BestSoFar-Gen3-Mut4",
+    "region": "Underneath",
+    "deckPath": "engine/decks-experimental/underneath-test-v2.json",
+    "weightsMode": "jsonl:Underneath-Focused-v2:3"
+  }
+]
