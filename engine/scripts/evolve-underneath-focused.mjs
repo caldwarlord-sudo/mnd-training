@@ -130,16 +130,32 @@ function readMethodologyRows() {
   return rows;
 }
 
-/** Best-so-far = highest series-points across all methodology rows so far, tie-break by lower gen.
- *  Returns { gen, weights } or null if no rows exist yet (first ever run for this methodology).
- *  Series points are stored on each row as `focusPoints`. */
+/** Best-so-far = highest series-points across all methodology rows so far.
+ *  Tie-break by RECENCY (more recent gen wins), which matters because two runs with
+ *  statistically-indistinguishable focus points shouldn't lock in the older one -- see
+ *  the 2026-08-23 case where gen 1's Mut1 (13pts, likely a noise-lucky win) tied gen 2's
+ *  baseline (13pts, more stable measure) and the old tie-break kept mutating from Mut1
+ *  for a third generation. Anchor stability now flows from "beat the current anchor
+ *  cleanly", not "was the first entrant to hit this score."
+ *
+ *  Returns { gen, weights, points, origin } or null if no rows exist yet. `origin` is the
+ *  row's `championOrigin` string (e.g. "baseline", "mutation 1", "best-so-far-*") so callers
+ *  can tell if the anchor IS baseline and skip a redundant best-so-far slot in the field. */
 function bestSoFarFrom(rows) {
   if (rows.length === 0) return null;
   let best = rows[0];
   for (const r of rows) {
-    if ((r.focusPoints ?? -Infinity) > (best.focusPoints ?? -Infinity)) best = r;
+    const rPts = r.focusPoints ?? -Infinity;
+    const bestPts = best.focusPoints ?? -Infinity;
+    // Prefer strictly higher; on a tie, prefer more recent gen.
+    if (rPts > bestPts || (rPts === bestPts && r.gen > best.gen)) best = r;
   }
-  return { gen: best.gen, weights: best.championWeights, points: best.focusPoints ?? null };
+  return {
+    gen: best.gen,
+    weights: best.championWeights,
+    points: best.focusPoints ?? null,
+    origin: best.championOrigin ?? null,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -193,14 +209,23 @@ function writeFieldFiles(gen, bestSoFar, mutations, scratchDir, weightsFile) {
   const fakeRegion = `${REGION}-Focus`;
   const jsonlRows = [];
 
-  // Focus rows (fake region, seen only by the extras loader's jsonl:REGION:GEN lookup).
-  jsonlRows.push({
-    gen: 0, region: fakeRegion,
-    championWeights: bestSoFar?.weights ?? { ...BASELINE_WEIGHTS },
-    methodology: `${METHODOLOGY}-focus-slot`,
-    appendedAt: new Date().toISOString(),
-    note: bestSoFar ? `best-so-far from gen ${bestSoFar.gen}` : 'seed = baseline (first gen)',
-  });
+  // If the anchor IS baseline (or there's no anchor yet), skip a dedicated best-so-far slot --
+  // baseline is already in the field. Field becomes: baseline + N mutations = N+1 target
+  // entrants. Otherwise: baseline + best-so-far + N mutations = N+2. This keeps mutation-lineage
+  // anchors distinct from baseline while avoiding a duplicate baseline entrant when best-so-far
+  // has landed back on baseline.
+  const includeBestSoFarSlot = bestSoFar != null && bestSoFar.origin !== 'baseline';
+
+  // Focus row for best-so-far (only if it's distinct from baseline).
+  if (includeBestSoFarSlot) {
+    jsonlRows.push({
+      gen: 0, region: fakeRegion,
+      championWeights: bestSoFar.weights,
+      methodology: `${METHODOLOGY}-focus-slot`,
+      appendedAt: new Date().toISOString(),
+      note: `best-so-far from gen ${bestSoFar.gen} (origin=${bestSoFar.origin})`,
+    });
+  }
   mutations.forEach((mut, i) => {
     jsonlRows.push({
       gen: i + 1, region: fakeRegion,
@@ -220,12 +245,14 @@ function writeFieldFiles(gen, bestSoFar, mutations, scratchDir, weightsFile) {
     deckPath: DECK_PATH_RAW,
     weightsMode: 'baseline',
   });
-  extras.push({
-    label: `${REGION}-BestSoFar${bestSoFar ? `-Gen${bestSoFar.gen}` : ''}`,
-    region: REGION,
-    deckPath: DECK_PATH_RAW,
-    weightsMode: `jsonl:${fakeRegion}:0`,
-  });
+  if (includeBestSoFarSlot) {
+    extras.push({
+      label: `${REGION}-BestSoFar-Gen${bestSoFar.gen}`,
+      region: REGION,
+      deckPath: DECK_PATH_RAW,
+      weightsMode: `jsonl:${fakeRegion}:0`,
+    });
+  }
   mutations.forEach((_, i) => {
     extras.push({
       label: `${REGION}-Gen${gen}-Mut${i + 1}`,
@@ -398,19 +425,31 @@ for (let g = 0; g < GENERATIONS_TO_RUN; g += 1) {
     winningNote = `mutation ${mutIdx + 1}`;
   }
 
-  // Decide if best-so-far updates. Only when a mutation topped the leaderboard AND its points
-  // are strictly greater than the best-so-far's points this gen (a tie doesn't dethrone).
-  const bestSoFarPointsThisGen = targetEntries.find((e) => e.label.startsWith(`${REGION}-BestSoFar`))?.points ?? null;
-  const isMutationWin = winningNote.startsWith('mutation');
-  const cleanlyBeatsAnchor = bestSoFarPointsThisGen != null && topTarget.points > bestSoFarPointsThisGen;
-  const shouldUpdateBestSoFar = isMutationWin && cleanlyBeatsAnchor;
+  // Decide if best-so-far updates. Any winner (baseline, mutation, or the best-so-far slot
+  // itself) can become the new anchor -- baseline is a valid ceiling. Update when the winner
+  // has strictly higher points than the previous anchor's score this gen. If the winner IS
+  // the previous anchor (it topped the leaderboard again), no update needed -- it already IS
+  // the anchor.
+  //
+  // Two anchor-carrier labels depending on whether we included a best-so-far slot this gen:
+  //   - No slot (anchor == baseline): the baseline entrant IS the anchor's carrier
+  //   - Slot present (anchor != baseline): the -BestSoFar entrant is the anchor's carrier
+  const anchorIsBaseline = bestSoFar == null || bestSoFar.origin === 'baseline';
+  const anchorCarrierLabel = anchorIsBaseline ? `${REGION}-Baseline` : `${REGION}-BestSoFar`;
+  const anchorEntryThisGen = targetEntries.find((e) => e.label.startsWith(anchorCarrierLabel));
+  const anchorPointsThisGen = anchorEntryThisGen?.points ?? null;
+  const winnerIsAnchor = anchorEntryThisGen != null && topTarget.label === anchorEntryThisGen.label;
+  const cleanlyBeatsAnchor = anchorPointsThisGen != null && topTarget.points > anchorPointsThisGen;
+  const shouldUpdateBestSoFar = !winnerIsAnchor && cleanlyBeatsAnchor;
 
   console.log(`\n[gen ${gen}] Winner: ${topTarget.label} (${winningNote}, ${topTarget.points.toFixed(1)}pts)`);
-  if (isMutationWin) {
-    console.log(`[gen ${gen}]   Best-so-far scored ${bestSoFarPointsThisGen?.toFixed(1) ?? '?'}pts this gen`);
-    console.log(`[gen ${gen}]   ${cleanlyBeatsAnchor ? 'UPDATING' : 'HOLDING'} best-so-far`);
+  console.log(`[gen ${gen}]   Previous anchor was ${bestSoFar ? `gen ${bestSoFar.gen} ${bestSoFar.origin}` : 'BASELINE (no prior)'} -- scored ${anchorPointsThisGen?.toFixed(1) ?? '?'}pts this gen`);
+  if (winnerIsAnchor) {
+    console.log(`[gen ${gen}]   Anchor HELD (previous anchor topped the leaderboard again)`);
+  } else if (shouldUpdateBestSoFar) {
+    console.log(`[gen ${gen}]   ANCHOR UPDATED -- new best-so-far is ${winningNote}`);
   } else {
-    console.log(`[gen ${gen}]   Best-so-far unchanged (${winningNote} won, not a new mutation)`);
+    console.log(`[gen ${gen}]   Anchor HELD (winner did not strictly beat the anchor's score)`);
   }
 
   // Append to genlog. Always append -- one row per generation, regardless of whether best-so-far
@@ -429,7 +468,7 @@ for (let g = 0; g < GENERATIONS_TO_RUN; g += 1) {
     championOrigin: winningNote,
     bestSoFarUpdated: shouldUpdateBestSoFar,
     priorBestSoFarGen: bestSoFar?.gen ?? null,
-    priorBestSoFarPoints: bestSoFarPointsThisGen,
+    priorBestSoFarPoints: anchorPointsThisGen,
     allTargetPoints: targetEntries.map((e) => ({ label: e.label, rank: e.rank, points: e.points })),
     deckPath: DECK_PATH_RAW,
     methodology: METHODOLOGY,
