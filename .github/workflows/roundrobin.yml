@@ -78,6 +78,16 @@ on:
         description: 'Optional extras JSON with additional entrants (e.g. experimental-deck variants). Relative to engine/, e.g. extras-newdeck-comparison.json. Blank = none.'
         required: false
         default: ''
+      focusRegion:
+        description: 'Optional focus-region filter. If set, plays only pairs involving that region (opponent-vs-opponent pairs skipped -- big compute savings for focused per-region tests).'
+        required: false
+        default: ''
+      skipBaseline:
+        description: 'Skip auto-loading per-region baseline entrants. Useful when the field is composed entirely via curated JSONL + extras (like focused per-region tests).'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
 
 jobs:
   plan:
@@ -144,6 +154,10 @@ jobs:
           if [ -n "${{ inputs.slowRegions }}" ]; then SLOW_FLAG="--slowRegions ${{ inputs.slowRegions }}"; fi
           EXTRAS_FLAG=""
           if [ -n "${{ inputs.extraEntrantsFile }}" ]; then EXTRAS_FLAG="--extraEntrantsFile engine/${{ inputs.extraEntrantsFile }}"; fi
+          FOCUS_FLAG=""
+          if [ -n "${{ inputs.focusRegion }}" ]; then FOCUS_FLAG="--focusRegion ${{ inputs.focusRegion }}"; fi
+          SKIP_BASELINE_FLAG=""
+          if [ "${{ inputs.skipBaseline }}" == "true" ]; then SKIP_BASELINE_FLAG="--skipBaseline"; fi
 
           node engine/scripts/roundrobin.mjs \
             --workers ${{ inputs.workers }} \
@@ -158,6 +172,8 @@ jobs:
             $REGIONS_FLAG \
             $SLOW_FLAG \
             $EXTRAS_FLAG \
+            $FOCUS_FLAG \
+            $SKIP_BASELINE_FLAG \
             $OVERRIDE_FLAGS
 
       - name: Show shard tail

@@ -1,0 +1,56 @@
+[
+  {
+    "label": "Underneath-Baseline-v2",
+    "region": "Underneath",
+    "deckPath": "engine/decks-experimental/underneath-test-v2.json",
+    "weightsMode": "baseline"
+  },
+  {
+    "label": "Underneath-Gen1-Mut1",
+    "region": "Underneath",
+    "deckPath": "engine/decks-experimental/underneath-test-v2.json",
+    "weightsMode": "jsonl:Underneath-Focused-v2-Final:1"
+  },
+  {
+    "label": "Underneath-Gen3-Mut2",
+    "region": "Underneath",
+    "deckPath": "engine/decks-experimental/underneath-test-v2.json",
+    "weightsMode": "jsonl:Underneath-Focused-v2-Final:2"
+  },
+  {
+    "label": "Underneath-Gen3-Mut4",
+    "region": "Underneath",
+    "deckPath": "engine/decks-experimental/underneath-test-v2.json",
+    "weightsMode": "jsonl:Underneath-Focused-v2-Final:3"
+  },
+  {
+    "label": "Arderial-Baseline",
+    "region": "Arderial",
+    "deckPath": "app/resources/default-decks/default-arderial.json",
+    "weightsMode": "baseline"
+  },
+  {
+    "label": "Bograth-Baseline",
+    "region": "Bograth",
+    "deckPath": "app/resources/default-decks/default-bograth.json",
+    "weightsMode": "baseline"
+  },
+  {
+    "label": "Nar-Baseline",
+    "region": "Nar",
+    "deckPath": "app/resources/default-decks/default-nar.json",
+    "weightsMode": "baseline"
+  },
+  {
+    "label": "Orothe-Baseline",
+    "region": "Orothe",
+    "deckPath": "app/resources/default-decks/default-orothe.json",
+    "weightsMode": "baseline"
+  },
+  {
+    "label": "Universal-Baseline",
+    "region": "Universal",
+    "deckPath": "app/resources/default-decks/default-universal.json",
+    "weightsMode": "baseline"
+  }
+]
