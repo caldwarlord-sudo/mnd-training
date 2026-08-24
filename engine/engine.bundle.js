@@ -9641,7 +9641,8 @@ function setupGame(playerConfigs, cardDb, options = {}) {
       tranquilityExtraDrawUntilTurn: null,
       skipEnergizeForMagiInstanceId: null,
       bloomBonusActionPending: false,
-      botRegion: config.botRegion ?? null
+      botRegion: config.botRegion ?? null,
+      botName: config.botName ?? null
     });
   }
   const usePreGameChoice = options.usePreGameChoice === true && options.turnOrder === void 0 && !tutorialMode;
@@ -40130,8 +40131,20 @@ registerCardEffect("Tranquility", {
 function replayGameLog(log, cardDb) {
   const rng = createSeededRng(log.seed);
   const playerConfigs = [
-    { playerId: "p1", deckCardKeys: log.p1.deckCardKeys, magiOrder: log.p1.magiOrder },
-    { playerId: "p2", deckCardKeys: log.p2.deckCardKeys, magiOrder: log.p2.magiOrder }
+    {
+      playerId: "p1",
+      deckCardKeys: log.p1.deckCardKeys,
+      magiOrder: log.p1.magiOrder,
+      ...log.p1.botRegion != null ? { botRegion: log.p1.botRegion } : {},
+      ...log.p1.botName != null ? { botName: log.p1.botName } : {}
+    },
+    {
+      playerId: "p2",
+      deckCardKeys: log.p2.deckCardKeys,
+      magiOrder: log.p2.magiOrder,
+      ...log.p2.botRegion != null ? { botRegion: log.p2.botRegion } : {},
+      ...log.p2.botName != null ? { botName: log.p2.botName } : {}
+    }
   ];
   const state = usesPreGameChoicePath(log) ? (
     // Mirror Play.tsx's `startGame` EXACTLY: no roll out here, `usePreGameChoice: true` so
@@ -41820,9 +41833,38 @@ var EVOLVING_REGIONS = [
   "Universal",
   "Weave"
 ];
+function isSingleVector(entry) {
+  return entry != null && typeof entry.WEIGHT_REMAINING_MAGI === "number";
+}
 function resolveWeightsForRegion(file, region) {
+  return resolveWeightsForBot(file, region, null);
+}
+function resolveWeightsForBot(file, region, botName) {
   if (!region) return file.baseline;
-  return file.regions[region] ?? file.baseline;
+  const entry = file.regions[region];
+  if (!entry) return file.baseline;
+  if (isSingleVector(entry)) return entry;
+  if (botName != null && Object.prototype.hasOwnProperty.call(entry, botName)) {
+    return entry[botName];
+  }
+  const names = Object.keys(entry).sort();
+  if (names.length === 0) return file.baseline;
+  return entry[names[0]];
+}
+function pickBotForRegion(file, region, rng) {
+  if (!region) return null;
+  const entry = file.regions[region];
+  if (!entry || isSingleVector(entry)) return null;
+  const names = Object.keys(entry).sort();
+  if (names.length === 0) return null;
+  const idx = Math.floor(rng() * names.length);
+  return names[Math.min(idx, names.length - 1)];
+}
+function getBotNamesForRegion(file, region) {
+  if (!region) return [];
+  const entry = file.regions[region];
+  if (!entry || isSingleVector(entry)) return [];
+  return Object.keys(entry).sort();
 }
 function normalizeWeightsFile(raw) {
   const parsed = raw ?? {};
@@ -42773,6 +42815,7 @@ export {
   frozenByLabel,
   generateDeck,
   getActivePlayer,
+  getBotNamesForRegion,
   getCardEffectByName,
   getLegalMoves,
   getOpponents,
@@ -42826,6 +42869,7 @@ export {
   opposingMagi,
   parseStartingCategory,
   peekTopOfDeck,
+  pickBotForRegion,
   pickChampion,
   playBotVsBotGame,
   playCard,
@@ -42931,6 +42975,7 @@ export {
   resolveTiebreakByMagiCount,
   resolveCardRef as resolveTutorialCardRef,
   resolveVariableCost,
+  resolveWeightsForBot,
   resolveWeightsForRegion,
   restoreEnergy2 as restoreEnergy,
   revealNextMagi,
