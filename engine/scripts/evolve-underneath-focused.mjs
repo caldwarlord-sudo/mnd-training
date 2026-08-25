@@ -262,28 +262,47 @@ function writeFieldFiles(gen, bestSoFar, mutations, scratchDir, weightsFile) {
     });
   });
 
-  // Opponents. Trained-gen retirement => clone the weights as a JSONL row under the REAL region
-  // name so auto-loader materializes an entrant (piloting the region's default deck). Baseline
-  // retirement => extras entry with weightsMode: baseline.
+  // Opponents. One representative per region cloned as a JSONL row under the REAL region name so
+  // the auto-loader materializes an entrant piloting the region's default deck. The weight vector
+  // comes from `resolveWeightsForRegion` which handles BOTH the single-vector legacy shape and
+  // the multi-bot object shape (returns the alphabetically-first bot for multi-bot regions --
+  // deterministic + scales as more regions complete their own focused-evo campaigns). Returns
+  // baseline for regions absent from bot-weights.json entirely, so the "no entry at all" case is
+  // handled inside the resolver rather than needing its own extras fallback here.
+  //
+  // Precedent for opponent selection during per-gen focused-evo -- see
+  // docs/plans/multi-bot-per-region-plan.md: "Per-gen: opponent slot = alphabetically-first bot
+  // per region (from bot-weights.json)." Fits compute regardless of how many regions become
+  // multi-bot. Full-fidelity "all bots per region" opponent testing is reserved for the final
+  // round-robin verification at campaign completion (once, not every gen).
+  //
+  // 2026-08-24 fix: prior code used `weightsFile.regions[region]` directly, which returned the
+  // multi-bot OBJECT for regions like Underneath after the 2026-08-24 multi-bot rollout and
+  // would have been passed through as `championWeights` -- an object where a WeightVector was
+  // expected. Would have produced nonsense scoring for opponent slots. resolveWeightsForRegion
+  // always returns a WeightVector; safe on both shapes.
   for (const region of OPPONENT_REGIONS) {
-    const retirementWeights = weightsFile && weightsFile.regions[region];
-    if (retirementWeights) {
-      jsonlRows.push({
-        gen: 0, region,
-        championWeights: retirementWeights,
-        methodology: `${METHODOLOGY}-opponent-slot`,
-        appendedAt: new Date().toISOString(),
-        note: `retirement weights for ${region} (cloned from bot-weights.json for this focused-evo run)`,
-      });
-      // Auto-loader will name this entrant `${region}-gen0` when it materializes.
-    } else {
+    if (!weightsFile) {
+      // Defensive: if bot-weights.json didn't load at all, opponent falls back to baseline
+      // via extras. Doesn't happen in practice (WEIGHTS_PATH is always present + readable) but
+      // keeps the field valid in the pathological case.
       extras.push({
         label: `${region}-Baseline`,
         region,
         deckPath: defaultDeckPathFor(region),
         weightsMode: 'baseline',
       });
+      continue;
     }
+    const opponentWeights = resolveWeightsForRegion(weightsFile, region);
+    jsonlRows.push({
+      gen: 0, region,
+      championWeights: opponentWeights,
+      methodology: `${METHODOLOGY}-opponent-slot`,
+      appendedAt: new Date().toISOString(),
+      note: `opponent representative for ${region} (via resolveWeightsForRegion; alphabetically-first bot for multi-bot regions per docs/plans/multi-bot-per-region-plan.md)`,
+    });
+    // Auto-loader materializes this entrant as `${region}-gen0` with the region's default deck.
   }
 
   writeFileSync(focusJsonlPath, jsonlRows.map((r) => JSON.stringify(r)).join('\n') + '\n', 'utf-8');
