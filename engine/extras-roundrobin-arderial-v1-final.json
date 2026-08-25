@@ -1,0 +1,44 @@
+[
+  {
+    "label": "Arderial-Baseline",
+    "region": "Arderial",
+    "deckPath": "app/resources/default-decks/default-arderial.json",
+    "weightsMode": "baseline"
+  },
+  {
+    "label": "Arderial-Gen3-Mut2",
+    "region": "Arderial",
+    "deckPath": "app/resources/default-decks/default-arderial.json",
+    "weightsMode": "jsonl:Arderial-Focused-v1-Final:1"
+  },
+  {
+    "label": "Arderial-Gen3-Mut4",
+    "region": "Arderial",
+    "deckPath": "app/resources/default-decks/default-arderial.json",
+    "weightsMode": "jsonl:Arderial-Focused-v1-Final:2"
+  },
+  {
+    "label": "Arderial-Gen4-Mut3",
+    "region": "Arderial",
+    "deckPath": "app/resources/default-decks/default-arderial.json",
+    "weightsMode": "jsonl:Arderial-Focused-v1-Final:3"
+  },
+  {
+    "label": "Underneath-Motash",
+    "region": "Underneath",
+    "deckPath": "app/resources/default-decks/default-underneath.json",
+    "weightsMode": "jsonl:Underneath-Ship-Motash:0"
+  },
+  {
+    "label": "Underneath-Ogar",
+    "region": "Underneath",
+    "deckPath": "app/resources/default-decks/default-underneath.json",
+    "weightsMode": "jsonl:Underneath-Ship-Ogar:0"
+  },
+  {
+    "label": "Underneath-Trygar",
+    "region": "Underneath",
+    "deckPath": "app/resources/default-decks/default-underneath.json",
+    "weightsMode": "jsonl:Underneath-Ship-Trygar:0"
+  }
+]
