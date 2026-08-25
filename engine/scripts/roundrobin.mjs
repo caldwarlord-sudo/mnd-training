@@ -241,11 +241,18 @@ function buildEntrants(regionalDecks, historicalChampions, regionsFilter) {
   return entrants;
 }
 
-/** Seed per game: unique per (entrantAIdx, entrantBIdx, gameIdx). Different XOR constant from
- *  swiss/evolve seeds so a round-robin's game states can never coincide with those. */
-function roundRobinSeedFor(aIdx, bIdx, gameIdx) {
-  const h = (aIdx * 100000 + bIdx * 100 + gameIdx) >>> 0;
-  return (h ^ 0x2f8b5d17) >>> 0;
+/** Seed per game (2026-08-25 change): genuinely-random uint32 per game, sourced from
+ *  `Math.random()`. Every game gets a fresh shuffle + fresh opening hands regardless of pair
+ *  position or run history. HISTORICAL: prior formula `(aIdx*100000 + bIdx*100 + gameIdx) ^
+ *  0x2f8b5d17` was deterministic per pair-index, which meant the SAME 4 hands were dealt for a
+ *  given pair position across every run. Weights that memorized how to play those specific 4
+ *  hands looked good in per-gen training but collapsed in the final RR where field composition
+ *  shifted the pair indices. Fixed to expose bots to the full card-draw distribution -- fitness
+ *  is now measured on deck-wide skill, not hand-specific pattern-matching. The random seed IS
+ *  captured in each game's outcome record (see `gameOutcomes` push below) so any specific game
+ *  can still be replayed for debugging by feeding the recorded seed back into the worker. */
+function randomGameSeed() {
+  return (Math.floor(Math.random() * 4294967296)) >>> 0;
 }
 
 // ============================================================================
@@ -538,23 +545,26 @@ const pairJobPromises = pairs.map(async (pair) => {
     const aIsP1 = g < HALF_GAMES;
     const p1Entrant = aIsP1 ? entrantA : entrantB;
     const p2Entrant = aIsP1 ? entrantB : entrantA;
+    const seed = randomGameSeed();
     const payload = {
-      seed: roundRobinSeedFor(pair.aIdx, pair.bIdx, g),
+      seed,
       p1Region: p1Entrant.region, p1Deck: p1Entrant.deck, p1MagiOrder: p1Entrant.magiOrder, p1Weights: p1Entrant.weights,
       p2Region: p2Entrant.region, p2Deck: p2Entrant.deck, p2MagiOrder: p2Entrant.magiOrder, p2Weights: p2Entrant.weights,
       maxTurns: MAX_TURNS, maxActions: 20000,
       timeoutMs: GAME_TIMEOUT_SEC > 0 ? GAME_TIMEOUT_SEC * 1000 : undefined,
     };
-    gamePromises.push(pool.runJob(payload).then((r) => ({ r, aIsP1 })));
+    gamePromises.push(pool.runJob(payload).then((r) => ({ r, aIsP1, seed })));
   }
   const gameResults = await Promise.all(gamePromises);
   let aWon = 0, bWon = 0, draws = 0;
   const gameOutcomes = [];
-  for (const { r, aIsP1 } of gameResults) {
+  for (const { r, aIsP1, seed } of gameResults) {
     const aPts = aIsP1 ? pointsForOutcomeSide(r.outcome, 'p1') : pointsForOutcomeSide(r.outcome, 'p2');
     const bPts = aIsP1 ? pointsForOutcomeSide(r.outcome, 'p2') : pointsForOutcomeSide(r.outcome, 'p1');
     if (aPts === 1) aWon += 1; else if (bPts === 1) bWon += 1; else draws += 1;
-    gameOutcomes.push({ outcome: r.outcome, aIsP1 });
+    // Seed captured for debug: individual games can be replayed by feeding the recorded seed
+    // back into tournament-worker.mjs (identical bot decisions given identical weights + seed).
+    gameOutcomes.push({ outcome: r.outcome, aIsP1, seed });
   }
   appendPairJsonl(MATCHES_JSONL_PATH, entrantA.label, entrantB.label, entrantA.region, entrantB.region, aWon, bWon, draws, gameOutcomes);
   return { pair, aWon, bWon, draws };

@@ -138,12 +138,13 @@ function selectedRegions() {
   return regions;
 }
 
-/** Deterministic seed for one cross-region game. XOR constant is different from evolve.mjs's
- *  own seedFor so tournament games can never coincidentally reproduce an evolution run's
- *  exact seed. */
-function tournamentSeedFor(p1RegionIdx, p2RegionIdx, gameIdx) {
-  const h = (p1RegionIdx * 10000 + p2RegionIdx * 100 + gameIdx) >>> 0;
-  return (h ^ 0x3a5f7d21) >>> 0;
+/** Seed per game (2026-08-25 change): genuinely-random uint32 via `Math.random()`. HISTORICAL:
+ *  prior formula `(p1RegionIdx*10000 + p2RegionIdx*100 + gameIdx) ^ 0x3a5f7d21` was
+ *  deterministic per region-pair position, which meant every tournament run dealt the same
+ *  hands for a given region matchup. See roundrobin.mjs's `randomGameSeed` for the full
+ *  rationale on why per-game random seeding replaces per-index deterministic seeding. */
+function randomGameSeed() {
+  return (Math.floor(Math.random() * 4294967296)) >>> 0;
 }
 
 // ============================================================================
@@ -546,7 +547,7 @@ for (let p1Idx = 0; p1Idx < _regions.length; p1Idx += 1) {
         payload: {
           p1Region, p1Deck: p1Deck.deckCardKeys, p1MagiOrder: p1Deck.magiOrder, p1Weights,
           p2Region, p2Deck: p2Deck.deckCardKeys, p2MagiOrder: p2Deck.magiOrder, p2Weights,
-          seed: tournamentSeedFor(p1Idx, p2Idx, g),
+          seed: randomGameSeed(),
           maxTurns: MAX_TURNS,
           maxActions: MAX_ACTIONS,
           timeoutMs: GAME_TIMEOUT_SEC > 0 ? GAME_TIMEOUT_SEC * 1000 : undefined,

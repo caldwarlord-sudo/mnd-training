@@ -316,19 +316,16 @@ function buildEntrants(regionalDecks, historicalChampions, regionsFilter) {
   return entrants;
 }
 
-/** Deterministic seed per game -- includes round, series, and game index so every game in
- *  the tournament has a unique reproducible seed. XOR constant differs from evolve.mjs's
- *  seedFor and tournament.mjs's tournamentSeedFor to keep runs distinguishable. */
-function swissSeedFor(round, seriesIdx, gameIdxInSeries) {
-  const h = (round * 100000 + seriesIdx * 100 + gameIdxInSeries) >>> 0;
-  return (h ^ 0x7e2b9c48) >>> 0;
-}
-
-/** Deterministic seed for the post-Swiss round-robin phase. Different XOR from `swissSeedFor`
- *  so the two phases' games can't collide on identical seeds even at pairIdx=0/gameIdx=0. */
-function roundRobinSeedFor(pairIdx, gameIdx) {
-  const h = (pairIdx * 1000 + gameIdx) >>> 0;
-  return (h ^ 0x4bc6fa9d) >>> 0;
+/** Seed per game (2026-08-25 change): genuinely-random uint32 per game via `Math.random()`. Every
+ *  game gets a fresh shuffle + fresh opening hands regardless of round / series / game index or
+ *  run history. HISTORICAL: prior formulae were index-based -- `(round*100000 + seriesIdx*100 +
+ *  gameIdx) ^ 0x7e2b9c48` for Swiss games, `(pairIdx*1000 + gameIdx) ^ 0x4bc6fa9d` for post-Swiss
+ *  RR games. Deterministic seeds turned out to over-fit weights to specific card-draw sequences;
+ *  see the equivalent fix in roundrobin.mjs's `randomGameSeed` for the full rationale. Same
+ *  helper used for both Swiss and post-Swiss RR phases -- no phase-distinguishing XOR needed
+ *  once the source is random. */
+function randomGameSeed() {
+  return (Math.floor(Math.random() * 4294967296)) >>> 0;
 }
 
 // ============================================================================
@@ -535,7 +532,7 @@ async function playSeries(pool, entrantA, entrantB, seriesFormat, round, seriesI
     const result = await pool.runJob({
       p1Region: p1.region, p1Deck: p1.deck, p1MagiOrder: p1.magiOrder, p1Weights: p1.weights,
       p2Region: p2.region, p2Deck: p2.deck, p2MagiOrder: p2.magiOrder, p2Weights: p2.weights,
-      seed: swissSeedFor(round, seriesIdx, g),
+      seed: randomGameSeed(),
       maxTurns: perGameCaps.maxTurns,
       maxActions: perGameCaps.maxActions,
       timeoutMs: perGameCaps.timeoutMs,
@@ -759,7 +756,7 @@ async function runPostSwissRoundRobin(pool, entrants, gamesPerPair, perGameCaps)
       const p1Entrant = aIsP1 ? entrantA : entrantB;
       const p2Entrant = aIsP1 ? entrantB : entrantA;
       const jobPayload = {
-        seed: roundRobinSeedFor(pairIdx, g),
+        seed: randomGameSeed(),
         p1Deck: p1Entrant.deck,
         p1MagiOrder: p1Entrant.magiOrder,
         p1Region: p1Entrant.region,

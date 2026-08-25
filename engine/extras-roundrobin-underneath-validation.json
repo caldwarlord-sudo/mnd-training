@@ -1,0 +1,20 @@
+[
+  {
+    "label": "Underneath-Motash",
+    "region": "Underneath",
+    "deckPath": "app/resources/default-decks/default-underneath.json",
+    "weightsMode": "jsonl:Underneath-Ship-Validation:1"
+  },
+  {
+    "label": "Underneath-Ogar",
+    "region": "Underneath",
+    "deckPath": "app/resources/default-decks/default-underneath.json",
+    "weightsMode": "jsonl:Underneath-Ship-Validation:2"
+  },
+  {
+    "label": "Underneath-Trygar",
+    "region": "Underneath",
+    "deckPath": "app/resources/default-decks/default-underneath.json",
+    "weightsMode": "jsonl:Underneath-Ship-Validation:3"
+  }
+]

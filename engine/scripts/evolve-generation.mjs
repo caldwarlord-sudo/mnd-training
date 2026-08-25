@@ -190,10 +190,26 @@ function loadRegionalDecks() {
   return byRegion;
 }
 
-/** Deterministic seed per game -- unique per (generation, region, candidate, matchup, gameIdx).
- *  XOR constant differs from evolve.mjs's seedFor and tournament seeds so evolution-generation
- *  runs can never coincidentally reproduce another run's game states. */
-function evolveGenSeedFor(generation, regionIdx, candidateIdx, matchupIdx, gameIdx) {
+/** Seed per game (2026-08-25 change): genuinely-random uint32 via `Math.random()`. Every game
+ *  gets a fresh shuffle + fresh opening hands regardless of gen / region / candidate / matchup /
+ *  game index or run history. HISTORICAL: prior formula `(generation*1M + regionIdx*10K +
+ *  candidateIdx*100 + matchupIdx*10 + gameIdx) ^ 0x9b1c4e37 + BASE_SEED` was deterministic per
+ *  (gen, region, cand, matchup, gameIdx) tuple -- same tuple across runs dealt identical hands.
+ *  See roundrobin.mjs's `randomGameSeed` for the full rationale on why per-game random seeding
+ *  replaces per-tuple deterministic seeding.
+ *
+ *  `evolveGenSeedFor` is REMOVED. `mutationRng` further down still uses the DETERMINISTIC seed
+ *  path (below) since mutation lineages must be reproducible for a given (generation, region)
+ *  pair -- only the GAME seeds go random. */
+function randomGameSeed() {
+  return (Math.floor(Math.random() * 4294967296)) >>> 0;
+}
+
+/** Deterministic seed for non-game uses (mutation Rng, warm-start pop, etc.) -- keep the old
+ *  hash so a `mutationRng` given the same (generation, region) always produces the same
+ *  mutation weight vectors, which is essential for reproducing which champion emerged from a
+ *  given evolve-generation invocation. */
+function evolveGenDeterministicSeedFor(generation, regionIdx, candidateIdx, matchupIdx, gameIdx) {
   const h = (generation * 1_000_000 + regionIdx * 10_000 + candidateIdx * 100 + matchupIdx * 10 + gameIdx) >>> 0;
   return ((h ^ 0x9b1c4e37) + BASE_SEED) >>> 0;
 }
@@ -503,7 +519,7 @@ writeFileSync(ERRORS_JSONL_PATH, '', 'utf-8');
 
 // Deterministic RNG for mutation (separate seed stream from game RNG so game seeds change
 // without shifting the population, and vice versa).
-const mutationRng = createSeededRng(evolveGenSeedFor(GENERATION, regionIdx, 0, 0, 0));
+const mutationRng = createSeededRng(evolveGenDeterministicSeedFor(GENERATION, regionIdx, 0, 0, 0));
 
 // Optional per-run sigma override for mutateWeights. When null, mutateWeights falls back to its
 // engine default (MUTATION_SIGMA_RELATIVE = 0.15).
@@ -560,7 +576,7 @@ for (const candIdx of myCandIndexes) {
       payload: {
         p1Region: REGION, p1Deck: regionDeck.deckCardKeys, p1MagiOrder: regionDeck.magiOrder, p1Weights: cand.weights,
         p2Region: REGION, p2Deck: regionDeck.deckCardKeys, p2MagiOrder: regionDeck.magiOrder, p2Weights: regionBaselineWeights,
-        seed: evolveGenSeedFor(GENERATION, regionIdx, candIdx, 0, g),
+        seed: randomGameSeed(),
         maxTurns: MAX_TURNS,
         maxActions: 20000,
         timeoutMs: GAME_TIMEOUT_SEC > 0 ? GAME_TIMEOUT_SEC * 1000 : undefined,
@@ -583,7 +599,7 @@ for (const candIdx of myCandIndexes) {
         payload: {
           p1Region: REGION, p1Deck: regionDeck.deckCardKeys, p1MagiOrder: regionDeck.magiOrder, p1Weights: cand.weights,
           p2Region: oppRegion, p2Deck: oppDeck.deckCardKeys, p2MagiOrder: oppDeck.magiOrder, p2Weights: { ...BASELINE_WEIGHTS },
-          seed: evolveGenSeedFor(GENERATION, regionIdx, candIdx, oppIdx + 1, g),
+          seed: randomGameSeed(),
           maxTurns: MAX_TURNS,
           maxActions: 20000,
           timeoutMs: GAME_TIMEOUT_SEC > 0 ? GAME_TIMEOUT_SEC * 1000 : undefined,

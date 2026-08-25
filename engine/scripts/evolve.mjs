@@ -96,6 +96,15 @@ import {
   CHAMPION_ROUND_ROBIN_GAMES,
   POPULATION_MATCH_GAMES,
 } from '../engine.bundle.js';
+
+/** Seed per game (2026-08-25 change): genuinely-random uint32 via `Math.random()`. Every game
+ *  gets a fresh shuffle + fresh opening hands. Replaces the deterministic `seedFor(gen, region,
+ *  cand, opp, gameIdx)` game-seed derivation to prevent over-fitting mutations to specific
+ *  card-draw patterns -- see roundrobin.mjs's `randomGameSeed` for the full rationale. `seedFor`
+ *  itself stays used for non-game deterministic uses (warm-start pop below, selectionRngFor). */
+function randomGameSeed() {
+  return (Math.floor(Math.random() * 4294967296)) >>> 0;
+}
 import {
   initJsonlFile,
   rotateJsonlFile,
@@ -467,7 +476,7 @@ async function evaluatePopulationParallel(pool, population, region, regionIndex,
           region, deck, magiOrder,
           p1Weights: evolverWeights,
           p2Weights: baselineWeights,
-          seed: seedFor(generation, regionIndex, evolverSlot, SLOT_BASELINE, g),
+          seed: randomGameSeed(),
           maxTurns: caps.maxTurns,
           maxActions: caps.maxActions,
           timeoutMs: caps.timeoutMs,
@@ -487,7 +496,7 @@ async function evaluatePopulationParallel(pool, population, region, regionIndex,
             region, deck, magiOrder,
             p1Weights: evolverWeights,
             p2Weights: opponentWeights,
-            seed: seedFor(generation, regionIndex, evolverSlot, opponentSlot, g),
+            seed: randomGameSeed(),
             maxTurns: caps.maxTurns,
             maxActions: caps.maxActions,
             timeoutMs: caps.timeoutMs,
@@ -614,7 +623,7 @@ function evaluatePopulation(cardDb, population, region, regionIndex, deck, magiO
     const evolverWeights = slot.weights;
 
     // vs baseline
-    const vsBaselineSeed = seedFor(generation, regionIndex, evolverSlot, SLOT_BASELINE, 0);
+    const vsBaselineSeed = randomGameSeed();
     const winRateVsBaseline = playMatchup(
       cardDb, deck, magiOrder, region,
       evolverWeights, baselineWeights,
@@ -628,7 +637,7 @@ function evaluatePopulation(cardDb, population, region, regionIndex, deck, magiO
       if (opponentSlot === SLOT_BASELINE) continue;
       if (opponentSlot === evolverSlot) continue;
       const opponentWeights = population.slots[opponentSlot].weights;
-      const seed = seedFor(generation, regionIndex, evolverSlot, opponentSlot, 0);
+      const seed = randomGameSeed();
       const rate = playMatchup(cardDb, deck, magiOrder, region, evolverWeights, opponentWeights, seed, peerGames, caps);
       peerWins += rate * peerGames;
       peerGamesTotal += peerGames;
