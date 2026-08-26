@@ -55,9 +55,9 @@ on:
         required: false
         default: ''
       gamesPerPair:
-        description: 'Games per pair series (must be even). Default 4.'
+        description: 'Games per pair series (must be even). Default 6 (raised 2026-08-25 from 4 after seed-randomization fix -- random seeds add per-pair variance that 4 games didnt cover cleanly; owner note: fall back to 4 if any specific gen hits the 6h runtime ceiling).'
         required: false
-        default: '4'
+        default: '6'
       workers:
         description: 'Worker processes (2 max on standard runners).'
         required: false
