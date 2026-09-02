@@ -65,7 +65,7 @@ import { fork } from 'node:child_process';
 
 import '../engine.bundle.js';
 import { BASELINE_WEIGHTS } from '../engine.bundle.js';
-import { EVOLVING_REGIONS, loadWeightsFile, resolveWeightsForRegion } from '../engine.bundle.js';
+import { EVOLVING_REGIONS, loadWeightsFile, resolveWeightsForRegion, resolveWeightsForBot, getBotNamesForRegion } from '../engine.bundle.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(here, '..', '..');
@@ -181,7 +181,7 @@ function loadHistoricalChampions(jsonlPath) {
   return byRegion;
 }
 
-function loadExtraEntrantWeights(weightsMode, historicalChampions) {
+function loadExtraEntrantWeights(weightsMode, historicalChampions, weightsFile) {
   if (!weightsMode || weightsMode === 'baseline') return { ...BASELINE_WEIGHTS };
   const m = weightsMode.match(/^jsonl:(.+):(\d+)$/);
   if (m) {
@@ -191,10 +191,20 @@ function loadExtraEntrantWeights(weightsMode, historicalChampions) {
     if (!found) { console.error(`Extra entrant "${weightsMode}" not found in JSONL`); process.exit(1); }
     return found.championWeights;
   }
+  const bw = weightsMode.match(/^botweights:([^:]+):(.+)$/);
+  if (bw) {
+    const [, region, botName] = bw;
+    if (!weightsFile) { console.error(`weightsMode "${weightsMode}" needs bot-weights.json but none loaded`); process.exit(1); }
+    const names = getBotNamesForRegion(weightsFile, region);
+    if (names.length > 0 && !names.includes(botName)) {
+      console.error(`bot "${botName}" not found in region "${region}" (available: ${names.join(', ')})`); process.exit(1);
+    }
+    return resolveWeightsForBot(weightsFile, region, botName);
+  }
   console.error(`Unknown weightsMode "${weightsMode}"`); process.exit(1);
 }
 
-function loadExtraEntrants(filePath, historicalChampions) {
+function loadExtraEntrants(filePath, historicalChampions, weightsFile) {
   if (!filePath) return [];
   const absPath = resolve(filePath);
   if (!existsSync(absPath)) { console.error(`--extraEntrantsFile "${absPath}" not found`); process.exit(1); }
@@ -209,7 +219,7 @@ function loadExtraEntrants(filePath, historicalChampions) {
     if (!existsSync(deckAbsPath)) { console.error(`Extra deckPath missing: ${deckAbsPath}`); process.exit(1); }
     const deckJson = JSON.parse(readFileSync(deckAbsPath, 'utf-8'));
     const { deckCardKeys, magiOrder } = expandDeck(deckJson);
-    const weights = loadExtraEntrantWeights(entry.weightsMode, historicalChampions);
+    const weights = loadExtraEntrantWeights(entry.weightsMode, historicalChampions, weightsFile);
     extras.push({ label: entry.label, region: entry.region, deck: deckCardKeys, magiOrder, weights, gen: -1 });
   }
   return extras;
@@ -442,7 +452,7 @@ const weightsFile = existsSync(WEIGHTS_PATH) ? loadWeightsFile(WEIGHTS_PATH) : n
 const historicalChampions = loadHistoricalChampions(JSONL_PATH);
 const regionsToUse = REGIONS_FILTER ? REGIONS_FILTER.split(',').map((s) => s.trim()) : EVOLVING_REGIONS;
 const autoEntrants = buildEntrants(decksByRegion, historicalChampions, regionsToUse);
-const extraEntrants = loadExtraEntrants(EXTRA_ENTRANTS_FILE, historicalChampions);
+const extraEntrants = loadExtraEntrants(EXTRA_ENTRANTS_FILE, historicalChampions, weightsFile);
 const entrants = [...autoEntrants, ...extraEntrants];
 if (entrants.length < 2) { console.error(`Too few entrants (${entrants.length})`); process.exit(1); }
 
