@@ -1,0 +1,51 @@
+=== Cross-region full-field round-robin results ===
+Aggregated from 20 shard file(s) at 2026-09-02T22:00:49.521Z
+Total entrants: 39
+Total pair series: 741
+Games per pair: 4 (half as each side)
+
+--- Full leaderboard ---
+Rank  Label                            SeriesW  SeriesL  SeriesD  Points   Games(W-L-D)
+ 1    Naroom-Pruitt                      23        7        8     27.0   101-48-3
+ 2    Underneath-Trygar                  21        5       12     27.0   100-50-2
+ 3    Underneath-Motash                  23        7        8     27.0   94-50-8
+ 4    Kybar's Teeth-Jagt                 21        7       10     26.0   92-60-0
+ 5    Underneath-Ogar                    21        8        9     25.5   90-57-5
+ 6    Nar-Aurorea                        19        7       12     25.0   92-60-0
+ 7    Nar-Velouria                       20        8       10     25.0   91-59-2
+ 8    Naroom-Orwin                       21        9        8     25.0   89-57-6
+ 9    Naroom-Eidon                       22       13        3     23.5   95-54-3
+10    Nar-Halsted                        19       10        9     23.5   85-64-3
+11    Paradwyn-Ninx                      20       11        7     23.5   83-55-14
+12    Paradwyn-Boria                     19       10        9     23.5   80-56-16
+13    d'Resh-Risha                       19       11        8     23.0   89-62-1
+14    Kybar's Teeth-Groll                19       11        8     23.0   88-61-3
+15    Arderial-Nimbulo                   18       10       10     23.0   85-64-3
+16    Weave-Gia                          19       11        8     23.0   81-62-9
+17    Paradwyn-Taisa                     20       13        5     22.5   81-55-16
+18    Arderial-Jaela                     19       13        6     22.0   89-63-0
+19    Kybar's Teeth-Emec                 16       12       10     21.0   82-69-1
+20    Cald-Sinder                        18       14        6     21.0   78-69-5
+21    d'Resh-Ahron                       18       14        6     21.0   78-72-2
+22    Arderial-Ora                       15       13       10     20.0   78-71-3
+23    d'Resh-Nahara                      15       13       10     20.0   75-70-7
+24    Cald-Ashgar                        13       14       11     18.5   72-73-7
+25    Cald-Raega                         14       15        9     18.5   70-79-3
+26    Weave-Iyori                        10       13       15     17.5   74-73-5
+27    Core-Morag                         10       19        9     14.5   61-87-4
+28    Core-Zet                           10       19        9     14.5   61-88-3
+29    Weave-Zaya                          8       21        9     12.5   59-89-4
+30    Core-Warrada                       10       23        5     12.5   58-91-3
+31    Orothe-Borse                        7       21       10     12.0   54-97-1
+32    Universal-Rayje                     8       23        7     11.5   51-95-6
+33    Bograth-Obgren                      7       22        9     11.5   48-103-1
+34    Orothe-Arosa                        6       22       10     11.0   51-99-2
+35    Orothe-Blu                          4       20       14     11.0   51-101-0
+36    Universal-Tony                      4       22       12     10.0   49-101-2
+37    Universal-Tuku                      4       23       11      9.5   46-103-3
+38    Bograth-Whilp                       6       29        3      7.5   43-106-3
+39    Bograth-King Korg                   2       25       11      7.5   38-109-5
+
+Each entrant played 38 series (once vs every other entrant), each series = 4 games.
+SeriesW/L/D = pair series won / lost / drawn (2-2 = draw when games/pair = 4).
+Points = SeriesW + SeriesD * 0.5. Games(W-L-D) = total game-level record across all series.
