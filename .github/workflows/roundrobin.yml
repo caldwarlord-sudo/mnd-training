@@ -27,9 +27,9 @@ on:
   workflow_dispatch:
     inputs:
       jsonl:
-        description: 'Curated JSONL of champion rows to include (relative to engine/, e.g. curated-swiss-52-gen1-7.jsonl). Blank = full evolution-generations.jsonl.'
+        description: 'Curated JSONL of champion rows to include (relative to engine/, e.g. curated-swiss-52-gen1-7.jsonl). Blank = NO historical champions (safer default; the extras field alone drives the run). Set explicitly when you want historicals in the field.'
         required: false
-        default: 'curated-swiss-52-gen1-7.jsonl'
+        default: ''
       shapeCOnly:
         description: 'Filter JSONL to Shape-C rows only (skip pre-Shape-C)'
         required: false
