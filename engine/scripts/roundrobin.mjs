@@ -83,7 +83,13 @@ if (GAMES_PER_PAIR % 2 !== 0) {
 }
 const HALF_GAMES = GAMES_PER_PAIR / 2;
 const REGIONS_FILTER = arg('regions', null);
-const JSONL_PATH = resolve(arg('jsonl', join(REPO_ROOT, 'engine', 'evolution-generations.jsonl')));
+// --noJsonl (boolean, no value) OR --jsonl "" disables historical-champion loading. Useful when
+// the field is composed entirely from --extraEntrantsFile (e.g. shipped-bots RRs) and any genlog
+// contribution would just bloat the entrant count. Without this, arg('jsonl') falls back to the
+// default JSONL_PATH and loads every genlog row -- which caused the 2026-09-02 78-entrant blowup.
+const NO_JSONL = process.argv.includes('--noJsonl');
+const JSONL_ARG = arg('jsonl', join(REPO_ROOT, 'engine', 'evolution-generations.jsonl'));
+const JSONL_PATH = (NO_JSONL || JSONL_ARG === '') ? null : resolve(JSONL_ARG);
 const WEIGHTS_PATH = resolve(arg('weights', join(REPO_ROOT, 'engine', 'data', 'bot-weights.json')));
 const DECKS_DIR = resolve(arg('decks', join(REPO_ROOT, 'app', 'resources', 'default-decks')));
 const MAX_TURNS = Number(arg('maxTurns', 200));
@@ -163,6 +169,10 @@ function loadRegionalDecks() {
 /** Loads Shape-C (or all) champions grouped by region -- same shape swiss-tournament uses. */
 function loadHistoricalChampions(jsonlPath) {
   const byRegion = new Map();
+  if (jsonlPath === null) {
+    console.log('  [--jsonl ""] historical-champion loading disabled -- field will come from baselines + extras only');
+    return byRegion;
+  }
   if (!existsSync(jsonlPath)) {
     console.warn(`JSONL not found at ${jsonlPath} -- only baseline entrants will run.`);
     return byRegion;

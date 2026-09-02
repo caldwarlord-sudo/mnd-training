@@ -146,8 +146,10 @@ jobs:
           fi
           SHAPE_FLAG=""
           if [ "${{ inputs.shapeCOnly }}" == "true" ]; then SHAPE_FLAG="--shapeCOnly"; fi
-          JSONL_FLAG=""
-          if [ -n "${{ inputs.jsonl }}" ]; then JSONL_FLAG="--jsonl engine/${{ inputs.jsonl }}"; fi
+          # Explicit empty jsonl input means "no historical champions" -- pass --noJsonl so the
+          # script skips historical-champion loading entirely (rather than falling back to the
+          # default JSONL_PATH, which caused the 2026-09-02 78-entrant blowup).
+          if [ -n "${{ inputs.jsonl }}" ]; then JSONL_FLAG="--jsonl engine/${{ inputs.jsonl }}"; else JSONL_FLAG="--noJsonl"; fi
           REGIONS_FLAG=""
           if [ -n "${{ inputs.regionsFilter }}" ]; then REGIONS_FLAG="--regions ${{ inputs.regionsFilter }}"; fi
           SLOW_FLAG=""
