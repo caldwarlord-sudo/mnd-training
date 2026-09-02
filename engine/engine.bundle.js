@@ -139,6 +139,7 @@ function moveToDiscardPile(state, player, card, cause, source, causedByPlayerId)
   card.discardedByPlayerId = causedByPlayerId;
   const owner = state.players.get(card.ownerId) ?? player;
   card.controllerId = card.ownerId;
+  if (card.effectiveRegionOverride?.clearOnLeavePlay) card.effectiveRegionOverride = null;
   owner.discardPile.push(card);
 }
 function findCard(state, instanceId) {
@@ -473,6 +474,7 @@ var NO_ENERGY_LOST_IN_ATTACKS = "noEnergyLostInAttacks";
 var LOSES_BONUS_ENERGY_IN_ATTACKS = "losesBonusEnergyInAttacks";
 var NO_ENERGY_LOST_FROM_OPPOSING_POWER = "noEnergyLostFromOpposingPower";
 var NO_ENERGY_GAIN = "noEnergyGain";
+var NO_NEXT_ENERGIZE = "noNextEnergize";
 var CANNOT_BE_ATTACKED = "cannotBeAttacked";
 var FROZEN = "frozen";
 var BURROWED = "burrowed";
@@ -512,6 +514,13 @@ function blockedByShadowCloakFromNonCorePowerOrSpell(state, cardDb, target) {
   if (sourceKey === void 0) return false;
   const sourceRegions = cardDb.get(sourceKey)?.regions ?? [];
   return !sourceRegions.includes("Core");
+}
+function blockedByShellFromOpposingPowerOrSpell(state, cardDb, target) {
+  if (!hasDurationTag(target, SHELL_PROTECTED)) return false;
+  const action = state.currentAction;
+  if (!action) return false;
+  if (action.source !== "power" && action.source !== "spell") return false;
+  return true;
 }
 function blockedByFirdStoneProtection(instance) {
   return hasDurationTag(instance, FIRD_STONE_PROTECTED);
@@ -1287,152 +1296,6 @@ function effectiveBograthCreatureCount(state, cardDb, playerId) {
   return raw + emlobBonus(cardDb, magi) + bogStenchBonus;
 }
 
-// src/costBreakdown.ts
-function noteAdjustment(into, label, delta) {
-  if (delta !== 0) into.push({ label, delta });
-}
-function frozenByLabel(state, cardDb, instance) {
-  if (hasDurationTag(instance, FROZEN) || instance.tags.has(FROZEN)) return "Frozen";
-  for (const player of state.players.values()) {
-    const contributors = player.activeMagi ? [player.activeMagi, ...player.inPlay] : [...player.inPlay];
-    for (const contributor of contributors) {
-      for (const { effect, sourceName } of effectsWithSourceFor(state, cardDb, contributor)) {
-        if (effect.grantsFrozenTo?.(state, cardDb, contributor, instance)) {
-          return `Frozen by ${sourceName}`;
-        }
-      }
-    }
-  }
-  return null;
-}
-function formatCostBreakdown(breakdown) {
-  if (breakdown.adjustments.length === 0) return String(breakdown.total);
-  const parts = breakdown.adjustments.map((a) => `${a.delta > 0 ? "+" : ""}${a.delta} ${a.label}`);
-  return `${breakdown.printed} (${parts.join(", ")}) = ${breakdown.total}`;
-}
-
-// src/regions.ts
-var UNIVERSAL = "Universal";
-var CORE = "Core";
-var ALL_REGIONS = ["Arderial", "Bograth", "Cald", "Core", "d'Resh", "Kybar's Teeth", "Naroom", "Nar", "Orothe", "Paradwyn", "Underneath", "Universal", "Weave"];
-function effectiveMagiDef(magiDef, magiInstance) {
-  const shadowOverride = magiInstance.magiIdentityOverride;
-  if (shadowOverride) {
-    return { ...magiDef, regions: [CORE], original_region: shadowOverride.asShadowOfOriginalRegion };
-  }
-  const regionOverride = magiInstance.effectiveRegionOverride;
-  if (regionOverride) {
-    return { ...magiDef, regions: [regionOverride.region] };
-  }
-  return magiDef;
-}
-function isUniversal(regions) {
-  return regions.includes(UNIVERSAL);
-}
-function isCoreRegion(regions) {
-  return regions.includes(CORE);
-}
-function regionsOverlap(a, b) {
-  return a.some((r) => b.includes(r));
-}
-function parseRegionList(value) {
-  if (!value) return [];
-  return value.split(",").map((r) => r.trim()).filter((r) => r.length > 0);
-}
-function qualifiesForShadowPlayGrant(magi, card, magiIsShadow) {
-  const grantRegions = parseRegionList(card.shadow_play);
-  if (grantRegions.length === 0) return false;
-  if (magiIsShadow) {
-    return magi.original_region !== null && grantRegions.includes(magi.original_region);
-  }
-  if (isCoreRegion(card.regions)) {
-    return regionsOverlap(magi.regions, grantRegions);
-  }
-  if (grantRegions.includes(CORE) && isCoreRegion(magi.regions)) {
-    return true;
-  }
-  return false;
-}
-function isExemptFromRestriction(magi, card, magiIsShadow) {
-  const anyShadowMagiOnly = card.shadow_play === null && isCoreRegion(card.regions);
-  if (anyShadowMagiOnly) {
-    return magiIsShadow;
-  }
-  const parsedShadowPlay = parseRegionList(card.shadow_play);
-  const restrictedRegions = parsedShadowPlay.length > 0 ? parsedShadowPlay : card.regions;
-  if (magiIsShadow) {
-    if (restrictedRegions.includes(CORE)) {
-      return true;
-    }
-    return magi.original_region !== null && restrictedRegions.includes(magi.original_region);
-  }
-  return regionsOverlap(magi.regions, restrictedRegions);
-}
-function checkRegionLegality(magi, card, effectiveCardRegions) {
-  const magiRegions2 = magi.regions;
-  const cardRegions = effectiveCardRegions ?? card.regions;
-  const magiIsCoreOrShadow = isCoreRegion(magiRegions2);
-  const magiIsShadow = magiIsCoreOrShadow && magi.original_region !== null;
-  const isRelic2 = card.card_type === "Relic";
-  if (card.shadow_magi_excluded && magiIsShadow) {
-    return { legal: false, reason: `${magi.name} is a Shadow Magi and cannot play ${card.name}` };
-  }
-  let tier;
-  let reason = "";
-  if (isUniversal(cardRegions)) {
-    tier = 2;
-  } else if (magiIsCoreOrShadow) {
-    if (isCoreRegion(cardRegions) || regionsOverlap(magiRegions2, cardRegions)) {
-      tier = 2;
-    } else {
-      tier = 0;
-      reason = `${magi.name} is a ${magiIsShadow ? "Shadow" : "Core"} Magi and cannot play ${card.name}`;
-    }
-  } else {
-    const sharesRegion = regionsOverlap(magiRegions2, cardRegions);
-    if (isCoreRegion(cardRegions) && !sharesRegion) {
-      tier = 0;
-      reason = `${magi.name} is not a Core Magi and cannot play the Core card ${card.name}`;
-    } else if (isRelic2) {
-      tier = sharesRegion ? 2 : 0;
-      if (!sharesRegion) {
-        reason = `${card.name} does not share a region with ${magi.name}, and Relics have no off-region penalty option`;
-      }
-    } else {
-      tier = sharesRegion ? 2 : 1;
-    }
-  }
-  if (tier < 2 && qualifiesForShadowPlayGrant(magi, card, magiIsShadow)) {
-    tier = isRelic2 ? 2 : tier + 1;
-    reason = "";
-  }
-  if (card.region_restrictive && !isExemptFromRestriction(magi, card, magiIsShadow)) {
-    tier = 0;
-    reason = `Only ${card.shadow_play ?? "Shadow"} Magi can play ${card.name}`;
-  }
-  if (tier === 0) {
-    return { legal: false, reason: reason || `${magi.name} cannot play ${card.name}` };
-  }
-  return { legal: true, regionalPenalty: tier === 1 ? 1 : 0 };
-}
-var TEXT_LOCKED_CARD_NAMES = /* @__PURE__ */ new Set([
-  "Renegade Epik",
-  "Creeping Ainjer",
-  "Jakla Prowler",
-  "Slinking Greal",
-  "Olum Fiend",
-  "Crouching Xamf",
-  "Rask Deserter",
-  "Sneaky Weebo",
-  "Malevolent Corf",
-  "Lurking Minani",
-  "Venomous Korrit",
-  "Scurrying Weggit"
-]);
-function hasImmutableText(cardName) {
-  return TEXT_LOCKED_CARD_NAMES.has(cardName);
-}
-
 // src/cardEffects/promptIntent.ts
 var PROMPT_META = {
   // ---- Optional: the printed text says "may"/"up to" about THIS choice -------------------------
@@ -1454,6 +1317,8 @@ var PROMPT_META = {
   // Allies: "you may search your deck"
   "Ember Vard": { optional: true, intent: "harmful" },
   // Scorch: "you may discard Ember Vard from play"
+  "Everburning Wick": { optional: true, intent: "harmful" },
+  // Really Short Fuse: "you may discard Everburning Wick from play to choose a Creature" (2026-08-31 retrofit)
   "Flame Control": { optional: true },
   // "Rearrange the energy on your Creatures AS YOU WISH"
   "Flame Spurt": { optional: true, intent: "harmful" },
@@ -1649,7 +1514,6 @@ var PROMPT_META = {
   Wanderlust: { intent: "beneficial" },
   "Sunbeam's End": { intent: "beneficial" },
   "Spark Chogo": { intent: "harmful" },
-  "Everburning Wick": { intent: "harmful" },
   Uban: { intent: "harmful" },
   Hasseth: { intent: "harmful" },
   "Chill of Night": { intent: "harmful" },
@@ -2061,7 +1925,15 @@ function findPendingMultiTargetChoices(state, cardDb) {
       const choice = match_pendingMultiTargetChoice?.choice;
       if (choice) {
         const meta = resolvePendingChoiceMeta(match_pendingMultiTargetChoice.sourceName, "pendingMultiTargetChoice", choice);
-        pending.push({ self: card, ...choice, optional: meta.optional });
+        pending.push({
+          self: card,
+          prompt: choice.prompt,
+          pool: choice.pool,
+          minCount: choice.minCount,
+          maxCount: choice.maxCount,
+          optional: meta.optional,
+          answeringPlayerId: choice.answeringPlayerId ?? card.controllerId
+        });
       }
     }
   }
@@ -2088,6 +1960,2361 @@ function findPendingNumericChoices(state, cardDb) {
     }
   }
   return pending;
+}
+
+// src/rollConsumers.ts
+var consumers = /* @__PURE__ */ new Map();
+function registerRollConsumer(key, fn) {
+  consumers.set(key, fn);
+}
+function getRollConsumer(key) {
+  return consumers.get(key);
+}
+
+// src/effects.ts
+var searingTouchDefKeyCache = null;
+function findSearingTouchDefKey(cardDb) {
+  if (searingTouchDefKeyCache !== null) return searingTouchDefKeyCache;
+  for (const [key, def] of cardDb) {
+    if (def.name === "Searing Touch") {
+      searingTouchDefKeyCache = key;
+      return key;
+    }
+  }
+  searingTouchDefKeyCache = void 0;
+  return void 0;
+}
+function ownControllerEnergyChangeLocked(state, cardDb, instance, actor) {
+  if (actor !== instance.controllerId) return false;
+  for (const effect of effectsFor(state, cardDb, instance)) {
+    if (effect.locksOwnControllerEnergyChange?.(state, cardDb, instance)) return true;
+  }
+  return false;
+}
+function blockedByAttachedProtection(state, cardDb, instance) {
+  for (const attached of instance.attachedCards) {
+    for (const attachedEffect of effectsFor(state, cardDb, attached)) {
+      if (attachedEffect.blocksEnergyChangeFromSource?.(state, cardDb, instance, attached)) return true;
+    }
+  }
+  return false;
+}
+function blockedByElementalShield(state, instance, actor) {
+  const shields = state.players.get(instance.controllerId)?.elementalShields;
+  if (!shields || shields.length === 0) return false;
+  if (actor === void 0) return false;
+  const actingMagiId = state.players.get(actor)?.activeMagi?.instanceId;
+  if (actingMagiId === void 0) return false;
+  return shields.some((s) => s.magiInstanceId === actingMagiId && s.untilTurn >= state.turnNumber);
+}
+function consumeIntensifyIfUsed(state) {
+  if (state.pendingIntensify?.used) state.pendingIntensify = null;
+}
+function addEnergy(state, cardDb, instance, amount, cause = "power", causedByPlayerId, rng = defaultRng) {
+  if (amount < 0) throw new Error("addEnergy amount must be non-negative");
+  if (hasDurationTag(instance, NO_ENERGY_GAIN)) return;
+  const actor = causedByPlayerId ?? state.currentAction?.actorPlayerId ?? state.activePlayerId;
+  if (ownControllerEnergyChangeLocked(state, cardDb, instance, actor)) return;
+  if (instance.controllerId !== actor) {
+    for (const reverseEffect of effectsFor(state, cardDb, instance)) {
+      if (reverseEffect.reversesOpposingEnergyChange?.(state, cardDb, instance)) {
+        const applied = Math.min(instance.currentEnergy ?? 0, amount);
+        instance.currentEnergy = (instance.currentEnergy ?? 0) - applied;
+        logEvent(state, "effectDiscardEnergy", { instanceId: instance.instanceId, amount: applied });
+        checkCreatureDefeats(state, cardDb, void 0, void 0, rng);
+        return;
+      }
+    }
+  }
+  if (cause === "power" && instance.controllerId !== actor) {
+    const owner = state.players.get(actor);
+    if (owner) {
+      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
+      for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          if (contributorEffect.substitutesEnergyGainForLoss?.(state, cardDb, instance, amount, actor, contributor)) {
+            return;
+          }
+        }
+      }
+    }
+  }
+  if (instance.controllerId === actor) {
+    const owner = state.players.get(instance.controllerId);
+    if (owner) {
+      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
+      for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          if (contributorEffect.blocksOwnCausedEnergyGainTo?.(state, cardDb, contributor, instance)) {
+            return;
+          }
+        }
+      }
+    }
+  }
+  if (cause === "power" && state.currentAction?.sourceInstanceId !== void 0) {
+    const sourceInstanceId = state.currentAction.sourceInstanceId;
+    const sourceDef = state.currentAction.sourceDefinitionKey !== void 0 ? cardDb.get(state.currentAction.sourceDefinitionKey) : void 0;
+    const targetIsOtherCreature = instance.instanceId !== sourceInstanceId && cardDb.get(instance.definitionKey)?.card_type === "Creature";
+    if (sourceDef?.card_type === "Creature" && targetIsOtherCreature) {
+      const actingPlayer = state.players.get(actor);
+      if (actingPlayer) {
+        const contributors = actingPlayer.activeMagi ? [actingPlayer.activeMagi, ...actingPlayer.inPlay] : [...actingPlayer.inPlay];
+        for (const contributor of contributors) {
+          for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+            if (contributorEffect.blocksOwnCreaturePowersFromEnergizingOtherCreatures?.(state, cardDb, contributor)) {
+              return;
+            }
+          }
+        }
+      }
+    }
+  }
+  let actualAmount = amount;
+  if (cause === "effect" && actualAmount > 0) {
+    for (const p of state.players.values()) {
+      const contributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
+      for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          const reduction = contributorEffect.reducesEnergyGainFrom?.(state, cardDb, instance, contributor);
+          if (reduction) actualAmount = Math.max(0, actualAmount - reduction);
+        }
+      }
+    }
+  }
+  if (cause === "power" && actualAmount > 0) {
+    for (const p of state.players.values()) {
+      const contributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
+      for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          const increase = contributorEffect.increasesEnergyGainFrom?.(state, cardDb, instance, contributor);
+          if (increase) actualAmount += increase;
+        }
+      }
+    }
+  }
+  if (cause === "effect" && actualAmount > 0 && instance.controllerId !== actor && grantsEffectImmunity(state, cardDb, instance)) {
+    actualAmount = 0;
+  }
+  if (actualAmount > 0 && blockedByElementalShield(state, instance, actor)) {
+    actualAmount = 0;
+  }
+  if ((cause === "power" || cause === "spell") && actualAmount > 0) {
+    if (blockedByShadowCloakProtection(state, cardDb, instance) || blockedByFirdStoneProtection(instance) || blockedByThreeLeafCloverProtection(instance) || blockedByAttachedProtection(state, cardDb, instance)) {
+      actualAmount = 0;
+    } else {
+      for (const selfEffect of effectsFor(state, cardDb, instance)) {
+        if (selfEffect.blocksPowerEffectBySourceRegion?.(state, cardDb, instance)) {
+          actualAmount = 0;
+          break;
+        }
+      }
+    }
+  }
+  if (cause === "spell" && actualAmount > 0) {
+    const owner = state.players.get(instance.controllerId);
+    if (owner) {
+      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
+      outer: for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          if (contributorEffect.grantsNonCaldSpellImmunityTo?.(state, cardDb, contributor, instance)) {
+            actualAmount = 0;
+            break outer;
+          }
+        }
+      }
+    }
+  }
+  if (cause === "spell" && actualAmount > 0 && instance.controllerId !== actor) {
+    const owner = state.players.get(instance.controllerId);
+    if (owner) {
+      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
+      outer: for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          if (contributorEffect.grantsOpposingSpellImmunityTo?.(state, cardDb, contributor, instance)) {
+            actualAmount = 0;
+            break outer;
+          }
+        }
+      }
+    }
+  }
+  if ((cause === "spell" || cause === "power") && actualAmount > 0 && instance.controllerId !== actor && protectionTagActive(state, cardDb, instance, SHELL_PROTECTED, "energyLoss")) {
+    actualAmount = 0;
+  }
+  if (cause === "spell" && actualAmount > 0) {
+    const owner = state.players.get(instance.controllerId);
+    if (owner) {
+      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
+      outer: for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          const multiplier = contributorEffect.multipliesOwnSpellCausedEnergyGainTo?.(state, cardDb, contributor, instance);
+          if (multiplier !== void 0) {
+            actualAmount *= multiplier;
+            break outer;
+          }
+        }
+      }
+    }
+  }
+  instance.currentEnergy = (instance.currentEnergy ?? 0) + actualAmount;
+  outer: for (const p of state.players.values()) {
+    const contributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
+    for (const contributor of contributors) {
+      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+        if (contributorEffect.capsEnergyGainAt?.(state, cardDb, instance, contributor)) {
+          const cap = effectiveStartingEnergy(state, cardDb, instance);
+          if ((instance.currentEnergy ?? 0) > cap) instance.currentEnergy = cap;
+          break outer;
+        }
+      }
+    }
+  }
+  logEvent(state, "effectAddEnergy", { instanceId: instance.instanceId, amount: actualAmount });
+  checkCreatureDefeats(state, cardDb, void 0, void 0, rng);
+  broadcastMagiEnergyGainOutsideEnergize(state, cardDb, instance, actualAmount);
+  if (cause === "effect" && actualAmount > 0) {
+    for (const gainedEffect of effectsFor(state, cardDb, instance)) {
+      gainedEffect.onEffectEnergyAdded?.(state, cardDb, instance, actualAmount);
+    }
+  }
+  if (actualAmount > 0) discardIfTopHeavy(state, cardDb, instance);
+}
+function discardIfTopHeavy(state, cardDb, instance, rng) {
+  if (!instance.attachedCards.some((c2) => cardDb.get(c2.definitionKey)?.name === "Top Heavy")) return;
+  const owner = state.players.get(instance.controllerId);
+  if (owner) discardFromPlay(state, cardDb, owner, instance.instanceId, void 0, "effect", rng);
+}
+function printsShifty(cardDb, instance) {
+  return cardDb.get(instance.definitionKey)?.effects?.some((e) => e.name === "Shifty") ?? false;
+}
+function printsSuperInvulnerability(cardDb, instance) {
+  return cardDb.get(instance.definitionKey)?.effects?.some((e) => e.name === "Super Invulnerability") ?? false;
+}
+function grantsEffectImmunity(state, cardDb, instance) {
+  const owner = state.players.get(instance.controllerId);
+  if (!owner) return false;
+  const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
+  for (const contributor of contributors) {
+    for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+      if (contributorEffect.grantsEffectImmunityTo?.(state, cardDb, contributor, instance)) return true;
+    }
+  }
+  return false;
+}
+function discardEnergy(state, cardDb, instance, amount, cause = "power", causedByPlayerId, rng, bypassReductions) {
+  if (amount < 0) throw new Error("discardEnergy amount must be non-negative");
+  const actor = causedByPlayerId ?? state.currentAction?.actorPlayerId ?? state.activePlayerId;
+  if (ownControllerEnergyChangeLocked(state, cardDb, instance, actor)) return;
+  if (instance.controllerId !== actor) {
+    for (const reverseEffect of effectsFor(state, cardDb, instance)) {
+      if (reverseEffect.reversesOpposingEnergyChange?.(state, cardDb, instance)) {
+        instance.currentEnergy = (instance.currentEnergy ?? 0) + amount;
+        logEvent(state, "effectAddEnergy", { instanceId: instance.instanceId, amount });
+        checkCreatureDefeats(state, cardDb, void 0, void 0, rng);
+        broadcastMagiEnergyGainOutsideEnergize(state, cardDb, instance, amount);
+        return;
+      }
+    }
+  }
+  if (cause === "power" && instance.controllerId === actor) {
+    const owner = state.players.get(instance.controllerId);
+    if (owner) {
+      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
+      for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          if (contributorEffect.substitutesEnergyLossForGain?.(state, cardDb, instance, amount, actor, contributor)) {
+            return;
+          }
+        }
+      }
+    }
+  }
+  let actualAmount = amount;
+  if (state.pendingIntensify !== null && (cause === "power" || cause === "spell") && cardDb.get(instance.definitionKey)?.card_type === "Magi") {
+    actualAmount = amount * 2;
+    state.pendingIntensify.used = true;
+  }
+  if (instance.controllerId !== actor && cardDb.get(instance.definitionKey)?.card_type === "Magi") {
+    const actingPlayer = state.players.get(actor);
+    const contributors = actingPlayer?.activeMagi ? [actingPlayer.activeMagi, ...actingPlayer.inPlay] : actingPlayer?.inPlay ?? [];
+    outer: for (const contributor of contributors) {
+      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+        if (contributorEffect.blocksOwnEnergyLossToOpposingMagi?.(state, cardDb, contributor)) {
+          actualAmount = 0;
+          break outer;
+        }
+      }
+    }
+  }
+  if (actualAmount > 0 && blockedByElementalShield(state, instance, actor)) {
+    actualAmount = 0;
+  }
+  if (actualAmount > 0 && (cause === "power" || cause === "spell")) {
+    if (blockedByShadowCloakProtection(state, cardDb, instance) || blockedByFirdStoneProtection(instance) || blockedByThreeLeafCloverProtection(instance) || blockedByAttachedProtection(state, cardDb, instance)) {
+      actualAmount = 0;
+    } else {
+      for (const selfEffect of effectsFor(state, cardDb, instance)) {
+        if (selfEffect.blocksPowerEffectBySourceRegion?.(state, cardDb, instance)) {
+          actualAmount = 0;
+          break;
+        }
+      }
+    }
+  }
+  if (actualAmount > 0 && cause === "spell") {
+    const owner = state.players.get(instance.controllerId);
+    if (owner) {
+      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
+      outer: for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          if (contributorEffect.grantsNonCaldSpellImmunityTo?.(state, cardDb, contributor, instance)) {
+            actualAmount = 0;
+            break outer;
+          }
+        }
+      }
+    }
+  }
+  if (actualAmount > 0 && cause === "spell" && instance.controllerId !== actor) {
+    const owner = state.players.get(instance.controllerId);
+    if (owner) {
+      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
+      outer: for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          if (contributorEffect.grantsOpposingSpellImmunityTo?.(state, cardDb, contributor, instance)) {
+            actualAmount = 0;
+            break outer;
+          }
+        }
+      }
+    }
+  }
+  if ((cause === "spell" || cause === "power") && actualAmount > 0 && instance.controllerId !== actor && protectionTagActive(state, cardDb, instance, SHELL_PROTECTED, "energyLoss")) {
+    actualAmount = 0;
+  }
+  if (actualAmount === 0) {
+  } else if (isEnergyLossReductionBlocked(state, cardDb, { scope: "general", instance, cause })) {
+  } else if (cause === "effect" && state.phase === "attack" && printsSuperInvulnerability(cardDb, instance)) {
+    actualAmount = 0;
+  } else if (instance.controllerId !== actor) {
+    if (tryConsumeFirstOpposingLossShield(state, cardDb, instance)) {
+      actualAmount = 0;
+    } else if (cause === "effect" && printsShifty(cardDb, instance)) {
+      actualAmount = 0;
+    } else if (cause === "effect" && grantsEffectImmunity(state, cardDb, instance)) {
+      actualAmount = 0;
+    } else if ((cause === "power" || cause === "spell") && (state.players.get(instance.controllerId)?.oasisEnergyImmunityUntilTurn ?? -1) >= state.turnNumber) {
+      actualAmount = 0;
+    } else if ((cause === "power" || cause === "spell") && hasDurationTag(instance, NO_ENERGY_LOST_FROM_OPPOSING_POWER)) {
+      actualAmount = 0;
+    } else if (!bypassReductions) {
+      if (cause === "power" || cause === "spell") {
+        actualAmount = burrowCappedLoss(state, cardDb, instance, actualAmount);
+      }
+      for (const effect of effectsFor(state, cardDb, instance)) {
+        const cap = effect.opposingEnergyLossCap?.(state, cardDb, instance);
+        if (cap !== void 0) actualAmount = Math.min(actualAmount, cap);
+        const reduction = effect.opposingEnergyLossReduction?.(state, cardDb, instance);
+        if (reduction !== void 0) actualAmount = Math.max(0, actualAmount - reduction);
+      }
+      if (instance.grantedEnergyLossReduction) {
+        actualAmount = Math.max(0, actualAmount - instance.grantedEnergyLossReduction);
+      }
+      const owner = state.players.get(instance.controllerId);
+      if (owner) {
+        const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
+        for (const contributor of contributors) {
+          if (isProtectionSuppressed(state, cardDb, instance, contributor, "energyLoss")) continue;
+          for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+            const grantedReduction = contributorEffect.grantsOpposingEnergyLossReductionTo?.(state, cardDb, contributor, instance, cause);
+            if (grantedReduction !== void 0) actualAmount = Math.max(0, actualAmount - grantedReduction);
+          }
+        }
+      }
+      if ((cause === "power" || cause === "spell") && owner) {
+        const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
+        for (const contributor of contributors) {
+          for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+            const floor = contributorEffect.grantsEnergyFloorTo?.(state, cardDb, contributor, instance);
+            if (floor !== void 0) {
+              const resultingEnergy = (instance.currentEnergy ?? 0) - actualAmount;
+              if (resultingEnergy < floor) {
+                actualAmount = Math.max(0, (instance.currentEnergy ?? 0) - floor);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  let target = instance;
+  if ((cause === "power" || cause === "spell") && instance.controllerId !== actor) {
+    const owner = state.players.get(instance.controllerId);
+    if (owner) {
+      outer: for (const contributor of owner.inPlay) {
+        if (contributor.instanceId === instance.instanceId) continue;
+        if (isProtectionSuppressed(state, cardDb, instance, contributor, "energyLoss")) continue;
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          if (contributorEffect.redirectsEnergyLossFrom?.(state, cardDb, instance, contributor)) {
+            target = contributor;
+            break outer;
+          }
+        }
+      }
+    }
+  }
+  const preCollectedRedirect = state.currentAction?.energyLossRedirect;
+  if (instance.controllerId !== actor && actualAmount > 0 && target.instanceId === instance.instanceId && preCollectedRedirect !== "skip") {
+    const owner = state.players.get(instance.controllerId);
+    if (owner) {
+      outer: for (const contributor of owner.inPlay) {
+        if (preCollectedRedirect && contributor.instanceId !== preCollectedRedirect.chosenRedirectorInstanceId) continue;
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          const redirected = contributorEffect.redirectsEnergyLossToOpponent?.(state, cardDb, instance, contributor, rng);
+          if (redirected) {
+            target = redirected;
+            if (state.currentAction && state.currentAction.energyLossRedirect) {
+              state.currentAction.energyLossRedirect = void 0;
+            }
+            break outer;
+          }
+        }
+      }
+    }
+  }
+  if ((cause === "power" || cause === "spell") && actualAmount > 0 && !bypassReductions && hasDurationTag(target, CONDEMNED)) {
+    actualAmount += 3;
+  }
+  if (actualAmount > 0 && !bypassReductions && target.attachedCards.length > 0) {
+    for (const attached of target.attachedCards) {
+      for (const attachedEffect of effectsFor(state, cardDb, attached)) {
+        const amplification = attachedEffect.amplifiesOwnEnergyLoss?.(state, cardDb, target);
+        if (amplification) actualAmount += amplification;
+      }
+    }
+  }
+  target.currentEnergy = Math.max(0, (target.currentEnergy ?? 0) - actualAmount);
+  if (target.controllerId !== actor && actualAmount > 0 && cardDb.get(target.definitionKey)?.card_type === "Magi") {
+    const owner = state.players.get(target.controllerId);
+    if (owner) {
+      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
+      for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          contributorEffect.onOwnMagiLostEnergyFromOpposingCard?.(state, cardDb, contributor, target, actualAmount, rng);
+        }
+      }
+    }
+  }
+  if (target.controllerId !== actor && actualAmount > 0 && cardDb.get(target.definitionKey)?.card_type === "Creature") {
+    const owner = state.players.get(target.controllerId);
+    if (owner) {
+      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
+      for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          contributorEffect.onOwnCreatureLostEnergy?.(state, cardDb, contributor, target, actualAmount, rng);
+        }
+      }
+    }
+  }
+  logEvent(state, "effectDiscardEnergy", { instanceId: target.instanceId, amount: actualAmount });
+  checkCreatureDefeats(state, cardDb, cause, void 0, rng);
+  if (actualAmount > 0) discardIfTopHeavy(state, cardDb, target, rng);
+}
+function applyModifierDiscard(state, cardDb, instance, amount, cause = "power", causedByPlayerId, rng) {
+  discardEnergy(state, cardDb, instance, amount, cause, causedByPlayerId, rng, true);
+}
+function rearrangeEnergy(state, cardDb, from, to, amount, rng) {
+  if (amount < 0) throw new Error("rearrangeEnergy amount must be non-negative");
+  const rearrangeActor = state.currentAction?.actorPlayerId ?? state.activePlayerId;
+  if (ownControllerEnergyChangeLocked(state, cardDb, from, rearrangeActor) || ownControllerEnergyChangeLocked(state, cardDb, to, rearrangeActor)) return;
+  if (to.controllerId === rearrangeActor) {
+    const owner = state.players.get(to.controllerId);
+    if (owner) {
+      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
+      for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          if (contributorEffect.blocksOwnCausedEnergyGainTo?.(state, cardDb, contributor, to)) return;
+        }
+      }
+    }
+  }
+  if (from.controllerId === to.controllerId && cardDb.get(from.definitionKey)?.card_type === "Creature" && cardDb.get(to.definitionKey)?.card_type === "Creature") {
+    const owner = state.players.get(to.controllerId);
+    if (owner) {
+      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
+      outer: for (const contributor of contributors) {
+        if (contributor.instanceId === from.instanceId || contributor.instanceId === to.instanceId) continue;
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          if (contributorEffect.redirectsRearrangeEnergyTo?.(state, cardDb, from, to, contributor)) {
+            to = contributor;
+            break outer;
+          }
+        }
+      }
+    }
+  }
+  const available = from.currentEnergy ?? 0;
+  const moved = Math.min(available, amount);
+  from.currentEnergy = available - moved;
+  to.currentEnergy = (to.currentEnergy ?? 0) + moved;
+  logEvent(state, "effectRearrangeEnergy", {
+    fromInstanceId: from.instanceId,
+    toInstanceId: to.instanceId,
+    amount: moved
+  });
+  checkCreatureDefeats(state, cardDb, void 0, void 0, rng);
+  broadcastMagiEnergyGainOutsideEnergize(state, cardDb, to, moved);
+  checkMagiDefeats(state, cardDb, rng);
+}
+function broadcastMagiEnergyGainOutsideEnergize(state, cardDb, magi, amount) {
+  if (amount <= 0) return;
+  const owner = state.players.get(magi.controllerId);
+  if (!owner || owner.activeMagi?.instanceId !== magi.instanceId) return;
+  if (state.phase === "energize" && state.activePlayerId === magi.controllerId) return;
+  for (const p of state.players.values()) {
+    const reactors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
+    for (const reactor of reactors) {
+      for (const effect of effectsFor(state, cardDb, reactor)) {
+        effect.onMagiGainedEnergyOutsideOwnEnergizeStep?.(state, cardDb, magi, reactor, amount);
+      }
+    }
+  }
+}
+function restoreEnergy(state, cardDb, instance, targetEnergy) {
+  const before = instance.currentEnergy ?? 0;
+  instance.currentEnergy = Math.max(0, targetEnergy);
+  logEvent(state, "effectRestoreEnergy", { instanceId: instance.instanceId, newTotal: instance.currentEnergy });
+  broadcastMagiEnergyGainOutsideEnergize(state, cardDb, instance, instance.currentEnergy - before);
+  checkCreatureDefeats(state, cardDb);
+}
+function applyReactiveDreamwarp(state, cardDb, target, chosenEnergy) {
+  target.currentEnergy = chosenEnergy;
+  target.startingEnergyOverride = { value: chosenEnergy, expiresAfterTurnNumber: state.turnNumber };
+  logEvent(state, "effectReactiveDreamwarp", { instanceId: target.instanceId, newTotal: chosenEnergy });
+  checkCreatureDefeats(state, cardDb);
+}
+function drawCards(state, cardDb, player, count) {
+  if (player.cannotDrawThisTurn) return [];
+  const drawn = drawCardsRaw(player, count);
+  logEvent(state, "effectDrewCards", { playerId: player.playerId, count: drawn.length });
+  for (let i = 0; i < drawn.length; i += 1) {
+    for (const p of state.players.values()) {
+      const inPlayContributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
+      for (const contributor of inPlayContributors) {
+        for (const effect of effectsFor(state, cardDb, contributor)) {
+          effect.onAnyCardDrawn?.(state, cardDb, contributor, player.playerId, drawn[i]);
+        }
+        for (const attached of activeAttachedCards(cardDb, contributor)) {
+          for (const attachedEffect of effectsFor(state, cardDb, attached)) {
+            attachedEffect.onAnyCardDrawn?.(state, cardDb, attached, player.playerId, drawn[i]);
+          }
+        }
+      }
+      for (const handCard of p.hand) {
+        for (const effect of effectsFor(state, cardDb, handCard)) {
+          effect.onAnyCardDrawnWhileInHand?.(state, cardDb, handCard, player.playerId, drawn[i]);
+        }
+      }
+    }
+  }
+  if (state.phase === "draw") {
+    for (const drawnCard of drawn) {
+      for (const effect of effectsFor(state, cardDb, drawnCard)) {
+        effect.onSelfDrawnDuringDrawStep?.(state, cardDb, drawnCard);
+      }
+    }
+  }
+  return drawn;
+}
+function revealHandToAll(state, cardDb, revealedPlayerId, sourceInstanceId) {
+  const player = getPlayer(state, revealedPlayerId);
+  const cards = player.hand.map((c2) => ({ instanceId: c2.instanceId, definitionKey: c2.definitionKey }));
+  logEvent(state, "handRevealed", { revealedPlayerId, sourceInstanceId, cards });
+}
+function riptideBanActiveFor(state, playerId) {
+  const player = state.players.get(playerId);
+  if (!player || player.riptideBanExpiresAfterTurnNumber === null) return false;
+  return state.turnNumber <= player.riptideBanExpiresAfterTurnNumber;
+}
+function findSubstituteCandidate(player, instanceId) {
+  return player.hand.find((c2) => "instanceId" in c2 && c2.instanceId === instanceId) ?? player.inPlay.find((c2) => c2.instanceId === instanceId);
+}
+function findBlockerContributor(player, instanceId) {
+  if (player.activeMagi?.instanceId === instanceId) return player.activeMagi;
+  return player.inPlay.find((c2) => c2.instanceId === instanceId);
+}
+function armStandaloneHostileHandDiscardIfEligible(state, cardDb, victimPlayer, targetIds, causedByPlayerId, checkedStages = []) {
+  if (state.pendingReactiveOffer !== null) return false;
+  if (checkedStages.length === 0 && state.acceptedHandDiscardOffer !== null) return false;
+  if (targetIds.length === 0) return false;
+  if (victimPlayer.handDiscardImmuneUntilMagiDefeated) return false;
+  if (!checkedStages.includes("hostileHandDiscardBlock")) {
+    const pool3 = previewHostileHandDiscardBlockOffers(state, cardDb, causedByPlayerId);
+    if (pool3.length > 0) {
+      state.pendingReactiveOffer = {
+        attemptKind: "hostileHandDiscardStandalone",
+        stage: "hostileHandDiscardBlock",
+        owedToPlayerId: victimPlayer.playerId,
+        pool: pool3.map((c2) => c2.instanceId),
+        victimPlayerId: victimPlayer.playerId,
+        targetIds: [...targetIds],
+        causedByPlayerId,
+        checkedStages: [...checkedStages]
+      };
+      return true;
+    }
+  }
+  if (!checkedStages.includes("hostileHandDiscardSubstitute")) {
+    const pool3 = previewHostileHandDiscardSubstitutionOffers(state, cardDb, causedByPlayerId);
+    if (pool3.length > 0) {
+      state.pendingReactiveOffer = {
+        attemptKind: "hostileHandDiscardStandalone",
+        stage: "hostileHandDiscardSubstitute",
+        owedToPlayerId: victimPlayer.playerId,
+        pool: pool3.map((c2) => c2.instanceId),
+        victimPlayerId: victimPlayer.playerId,
+        targetIds: [...targetIds],
+        causedByPlayerId,
+        checkedStages: [...checkedStages]
+      };
+      return true;
+    }
+  }
+  return false;
+}
+function discardFromHand(state, cardDb, player, instanceIds2, causedByPlayerId, rng = defaultRng) {
+  const actor = causedByPlayerId ?? state.currentAction?.actorPlayerId ?? state.activePlayerId;
+  if (player.playerId !== actor) {
+    if (player.handDiscardImmuneUntilMagiDefeated) return;
+    if (armStandaloneHostileHandDiscardIfEligible(state, cardDb, player, instanceIds2, actor)) {
+      return;
+    }
+    const accepted = state.acceptedHandDiscardOffer;
+    if (accepted?.substitutedByInstanceId) {
+      state.acceptedHandDiscardOffer = null;
+      const substitute = findSubstituteCandidate(player, accepted.substitutedByInstanceId);
+      if (substitute) {
+        const zone = player.hand.includes(substitute) ? "hand" : "inPlay";
+        const card = removeFromZone(player, zone, substitute.instanceId);
+        moveToDiscardPile(state, player, card);
+        player.handDiscardImmuneUntilMagiDefeated = true;
+        logEvent(state, "effectDiscardedFromHand", { playerId: player.playerId, count: 0 });
+        for (const candidateEffect of effectsFor(state, cardDb, substitute)) {
+          candidateEffect.onSubstitutedForHostileHandDiscard?.(state, cardDb, card, actor, rng);
+        }
+      }
+      return;
+    }
+    if (accepted?.blockedByInstanceId) {
+      state.acceptedHandDiscardOffer = null;
+      const blocker = findBlockerContributor(player, accepted.blockedByInstanceId);
+      if (blocker) {
+        for (const blockerEffect of effectsFor(state, cardDb, blocker)) {
+          blockerEffect.resolveHostileHandDiscardBlock?.(state, cardDb, blocker, actor, rng);
+        }
+      }
+      return;
+    }
+    const offerDeclined = accepted?.declined === true;
+    const offerWasArmed = accepted !== null;
+    if (accepted) state.acceptedHandDiscardOffer = null;
+    const contributors = player.activeMagi ? [player.activeMagi, ...player.inPlay] : [...player.inPlay];
+    for (const contributor of contributors) {
+      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+        if (contributorEffect.offersHostileHandDiscardBlock && offerWasArmed) continue;
+        if (contributorEffect.blocksHostileHandDiscard?.(state, cardDb, contributor)) return;
+      }
+    }
+    const actingPlayer = state.players.get(actor);
+    const actorContributors = actingPlayer ? actingPlayer.activeMagi ? [actingPlayer.activeMagi, ...actingPlayer.inPlay] : [...actingPlayer.inPlay] : [];
+    for (const contributor of actorContributors) {
+      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+        if (contributorEffect.preventsOwnHostileHandDiscard?.(state, cardDb, contributor)) return;
+      }
+    }
+    if (!offerDeclined) {
+      for (const candidate of [...player.hand, ...player.inPlay]) {
+        for (const candidateEffect of effectsFor(state, cardDb, candidate)) {
+          if (candidateEffect.offersHostileHandDiscardSubstitution && offerWasArmed) continue;
+          if (candidateEffect.substitutesForHostileHandDiscard?.(state, cardDb, candidate)) {
+            const zone = player.hand.includes(candidate) ? "hand" : "inPlay";
+            const card = removeFromZone(player, zone, candidate.instanceId);
+            moveToDiscardPile(state, player, card);
+            player.handDiscardImmuneUntilMagiDefeated = true;
+            logEvent(state, "effectDiscardedFromHand", { playerId: player.playerId, count: 0 });
+            candidateEffect.onSubstitutedForHostileHandDiscard?.(state, cardDb, card, actor, rng);
+            return;
+          }
+        }
+      }
+    }
+  }
+  let actuallyDiscarded = 0;
+  const discardedCards = [];
+  outerDiscard: for (const id of instanceIds2) {
+    if (player.playerId !== actor) {
+      const pending = player.hand.find((c2) => c2.instanceId === id);
+      if (pending) {
+        let skipToNextId = false;
+        for (const pendingEffect of effectsFor(state, cardDb, pending)) {
+          if (pendingEffect.redirectsHostileHandDiscardToPlay?.(state, cardDb, pending)) {
+            forcePlayFromHand(state, cardDb, player, id, rng);
+            continue outerDiscard;
+          }
+          if (pendingEffect.preventsOwnDiscardFromHand?.(state, cardDb, pending)) {
+            skipToNextId = true;
+            break;
+          }
+        }
+        if (skipToNextId) continue;
+      }
+    }
+    const card = removeFromZone(player, "hand", id);
+    moveToDiscardPile(state, player, card);
+    actuallyDiscarded += 1;
+    discardedCards.push({ instanceId: card.instanceId, definitionKey: card.definitionKey });
+    if (player.playerId !== actor) {
+      for (const cardEffect of effectsFor(state, cardDb, card)) {
+        cardEffect.onOwnHandDiscardedByOpponent?.(state, cardDb, card, actor, rng);
+      }
+    }
+  }
+  logEvent(state, "effectDiscardedFromHand", { playerId: player.playerId, count: actuallyDiscarded, cards: discardedCards });
+  if (player.playerId !== actor && actuallyDiscarded > 0) {
+    const reactors = player.activeMagi ? [player.activeMagi, ...player.inPlay] : [...player.inPlay];
+    for (const reactor of reactors) {
+      for (const reactorEffect of effectsFor(state, cardDb, reactor)) {
+        reactorEffect.onForcedToDiscardFromHand?.(state, cardDb, reactor, actuallyDiscarded, rng);
+      }
+    }
+  }
+  checkHandEmptied(state, cardDb, rng);
+}
+function checkHandEmptied(state, cardDb, rng = defaultRng) {
+  for (const player of state.players.values()) {
+    if (player.hand.length !== 0) continue;
+    const candidates = player.activeMagi ? [...player.inPlay, player.activeMagi] : [...player.inPlay];
+    for (const candidate of candidates) {
+      for (const effect of effectsFor(state, cardDb, candidate)) {
+        effect.onOwnHandEmptied?.(state, cardDb, candidate, rng);
+      }
+    }
+  }
+}
+function kybarsEchoApplies(state, cardDb, owner, target) {
+  return owner.kybarsEchoUntilTurn !== null && state.turnNumber <= owner.kybarsEchoUntilTurn && cardDb.get(target.definitionKey)?.card_type === "Creature" && effectiveRegions(state, cardDb, target).includes("Kybar's Teeth");
+}
+function checkEternalVigor(state, cardDb, card, owner, actor, viaCombatDamage) {
+  if (!owner.activeMagi?.hasEternalVigor) return;
+  if (cardDb.get(card.definitionKey)?.card_type !== "Creature") return;
+  if (!effectiveRegions(state, cardDb, card).includes("Naroom")) return;
+  if (!viaCombatDamage && owner.playerId === actor) return;
+  addEnergy(state, cardDb, owner.activeMagi, 1, "effect");
+}
+function findEligibleYrichoCandidatesForDiscard(state, cardDb, owner, target) {
+  if (cardDb.get(target.definitionKey)?.card_type !== "Creature") return [];
+  const magi = owner.activeMagi;
+  if (!magi || (magi.currentEnergy ?? 0) < 1) return [];
+  const candidates = [];
+  for (const inPlayCard of owner.inPlay) {
+    if (inPlayCard.instanceId === target.instanceId) continue;
+    if (cardDb.get(inPlayCard.definitionKey)?.name !== "Yricho's Staff") continue;
+    if (isProtectionSuppressed(state, cardDb, target, inPlayCard, "specificDiscard")) continue;
+    if (isCardEffectLockedDown(state, cardDb, inPlayCard)) continue;
+    candidates.push(inPlayCard.instanceId);
+  }
+  return candidates;
+}
+function resumeDiscardFromPlay(state, cardDb, pending, rng = defaultRng) {
+  const owner = state.players.get(pending.ownerId);
+  if (!owner) return;
+  const stillInPlay = owner.inPlay.find((c2) => c2.instanceId === pending.targetInstanceId);
+  if (!stillInPlay) return;
+  discardFromPlay(
+    state,
+    cardDb,
+    owner,
+    pending.targetInstanceId,
+    pending.causedByPlayerId,
+    pending.source,
+    rng,
+    { skipPreventionChain: true }
+  );
+}
+function drainPendingDiscardQueue(state, cardDb, rng = defaultRng) {
+  while (state.pendingDiscardFromPlay === null && state.pendingDieRoll === null && state.pendingDiscardFromPlayQueue.length > 0) {
+    const next = state.pendingDiscardFromPlayQueue.shift();
+    const owner = state.players.get(next.ownerId);
+    if (!owner) continue;
+    discardFromPlay(state, cardDb, owner, next.targetInstanceId, next.causedByPlayerId, next.source, rng);
+  }
+}
+function discardFromPlay(state, cardDb, owner, instanceId, causedByPlayerId, source, rng = defaultRng, internalOptions) {
+  const target = owner.inPlay.find((c2) => c2.instanceId === instanceId);
+  if (!target) return;
+  const actor = causedByPlayerId ?? state.currentAction?.actorPlayerId ?? state.activePlayerId;
+  const resolvedSource = source ?? state.currentAction?.source;
+  const skipPrevention = internalOptions?.skipPreventionChain === true;
+  if (!skipPrevention && owner.playerId !== actor && blockedByShadowCloakFromNonCorePowerOrSpell(state, cardDb, target)) return;
+  if (!skipPrevention && owner.playerId !== actor && blockedByShellFromOpposingPowerOrSpell(state, cardDb, target)) return;
+  if (!skipPrevention && owner.playerId !== actor) {
+    const def = cardDb.get(target.definitionKey);
+    for (const effect of effectsFor(state, cardDb, target)) {
+      if (effect.canBeDiscardedFromPlay?.(state, cardDb, target) === false) return;
+    }
+    if (blockedByUmmmNoProtection(target)) {
+      logEvent(state, "discardPreventedByUmmmNo", { instanceId, name: def?.name });
+      return;
+    }
+    if (blockedByThreeLeafCloverProtection(target)) {
+      logEvent(state, "discardPreventedByThreeLeafClover", { instanceId, name: def?.name });
+      return;
+    }
+    for (const p of state.players.values()) {
+      const contributors = p.activeMagi ? [...p.inPlay, p.activeMagi] : p.inPlay;
+      for (const contributor of contributors) {
+        if (contributor.instanceId === target.instanceId) continue;
+        if (isProtectionSuppressed(state, cardDb, target, contributor, "specificDiscard")) continue;
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          if (contributorEffect.preventsDiscardOf?.(state, cardDb, target, contributor, "explicit", rng)) return;
+        }
+      }
+    }
+    if (resolvedSource === "power" || resolvedSource === "spell") {
+      for (const p of state.players.values()) {
+        const contributors = p.activeMagi ? [...p.inPlay, p.activeMagi] : p.inPlay;
+        for (const contributor of contributors) {
+          if (contributor.instanceId === target.instanceId) continue;
+          if (isProtectionSuppressed(state, cardDb, target, contributor, "specificDiscard")) continue;
+          for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+            if (contributorEffect.preventsDiscardOfViaOwnCost?.(state, cardDb, target, contributor, rng)) return;
+          }
+        }
+      }
+    }
+    if (resolvedSource === "power" || resolvedSource === "spell") {
+      const yrichoCandidates = findEligibleYrichoCandidatesForDiscard(state, cardDb, owner, target);
+      if (yrichoCandidates.length > 0) {
+        if (state.pendingDiscardFromPlay === null && state.pendingDieRoll === null) {
+          state.pendingDiscardFromPlay = {
+            ownerId: owner.playerId,
+            targetInstanceId: target.instanceId,
+            causedByPlayerId: actor,
+            source: resolvedSource,
+            remainingYrichoCandidateInstanceIds: yrichoCandidates.slice(1)
+          };
+          const firstYricho = owner.inPlay.find((c2) => c2.instanceId === yrichoCandidates[0]);
+          requestDieRoll(
+            state,
+            cardDb,
+            firstYricho,
+            owner.playerId,
+            6,
+            "yrichoStaff:safe",
+            { yrichoStaffInstanceId: firstYricho.instanceId, ownerId: owner.playerId, targetInstanceId: target.instanceId },
+            rng
+          );
+          return;
+        }
+        state.pendingDiscardFromPlayQueue.push({
+          ownerId: owner.playerId,
+          targetInstanceId: target.instanceId,
+          causedByPlayerId: actor,
+          source: resolvedSource
+        });
+        return;
+      }
+    }
+  }
+  if (owner.playerId === actor && cardDb.get(target.definitionKey)?.card_type === "Relic" && state.currentAction?.sourceInstanceId === target.instanceId && state.currentAction.archiveRedirect) {
+    const redirectChoice = state.currentAction.archiveRedirect;
+    if (typeof redirectChoice === "object") {
+      const substitute = owner.inPlay.find((c2) => c2.instanceId === redirectChoice.substituteInstanceId);
+      const vault = owner.inPlay.find((c2) => cardDb.get(c2.definitionKey)?.name === "Vault of Knowledge Key");
+      const magi = owner.activeMagi;
+      const substituteValid = !!substitute && substitute.instanceId !== target.instanceId && cardDb.get(substitute.definitionKey)?.card_type === "Relic";
+      const vaultUsable = !!vault && !hasDurationTag(vault, "archiveUsedThisTurn");
+      const magiCanPay = !!magi && (magi.currentEnergy ?? 0) >= 1;
+      if (substituteValid && vaultUsable && magiCanPay) {
+        magi.currentEnergy = Math.max(0, (magi.currentEnergy ?? 0) - 1);
+        vault.durationTags.push({ tag: "archiveUsedThisTurn", expiresAfterTurnNumber: state.turnNumber + state.turnOrder.length });
+        logEvent(state, "archiveRedirect", {
+          vaultInstanceId: vault.instanceId,
+          originalInstanceId: target.instanceId,
+          originalName: cardDb.get(target.definitionKey)?.name,
+          substituteInstanceId: substitute.instanceId,
+          substituteName: cardDb.get(substitute.definitionKey)?.name
+        });
+        state.currentAction.archiveRedirect = void 0;
+        discardFromPlay(state, cardDb, owner, substitute.instanceId, actor, resolvedSource, rng);
+        return;
+      }
+    }
+  }
+  if (kybarsEchoApplies(state, cardDb, owner, target)) {
+    const card2 = removeFromZone(owner, "inPlay", instanceId);
+    card2.currentEnergy = null;
+    addToZone(owner, "hand", card2);
+    releaseAttachedOnLeavePlay(state, cardDb, card2);
+    logEvent(state, "effectReturnedToHand", { instanceId, name: cardDb.get(card2.definitionKey)?.name });
+    return;
+  }
+  const stillInPlay = owner.inPlay.find((c2) => c2.instanceId === instanceId);
+  const wasFrozen = stillInPlay ? isFrozen(state, cardDb, stillInPlay) : false;
+  const card = removeFromZone(owner, "inPlay", instanceId);
+  if (wasFrozen) addPermanentTagRaw(card, FROZEN);
+  moveToDiscardPile(state, owner, card, "explicit", resolvedSource, actor);
+  logEvent(state, "effectDiscardedFromPlay", { instanceId, name: cardDb.get(card.definitionKey)?.name });
+  const trueOwner = state.players.get(card.ownerId) ?? owner;
+  checkEternalVigor(state, cardDb, card, trueOwner, actor, false);
+  const reactorSets = [[card]];
+  for (const player of state.players.values()) {
+    reactorSets.push(player.activeMagi ? [...player.inPlay, player.activeMagi] : player.inPlay);
+  }
+  for (const reactors of reactorSets) {
+    for (const instance of reactors) {
+      const def = cardDb.get(instance.definitionKey);
+      for (const effect of effectsFor(state, cardDb, instance)) {
+        if (!effect.onCardDiscardedFromPlay) continue;
+        const energyBefore = instance.currentEnergy;
+        effect.onCardDiscardedFromPlay(state, cardDb, card, trueOwner.playerId, instance, "explicit", resolvedSource, actor, rng);
+        logEvent(state, "onCardDiscardedFromPlayHookFired", {
+          cardName: def.name,
+          instanceId: instance.instanceId,
+          reactingTo: cardDb.get(card.definitionKey)?.name,
+          // Deliberately narrow: only this reactor's OWN energy delta. A hook that moves energy
+          // elsewhere still logs `changedOwnEnergy: false` -- it means "Yaromant's own total moved",
+          // not "nothing happened at all".
+          changedOwnEnergy: instance.currentEnergy !== energyBefore
+        });
+      }
+    }
+  }
+  for (const instance of trueOwner.hand) {
+    const def = cardDb.get(instance.definitionKey);
+    for (const effect of effectsFor(state, cardDb, instance)) {
+      if (!effect.onCardDiscardedFromPlayWhileInHand) continue;
+      effect.onCardDiscardedFromPlayWhileInHand(state, cardDb, card, trueOwner.playerId, instance);
+      logEvent(state, "onCardDiscardedFromPlayHookFired", { cardName: def.name, instanceId: instance.instanceId, reactingTo: cardDb.get(card.definitionKey)?.name });
+    }
+  }
+  broadcastDiscardPileReactors(state, cardDb, card);
+  releaseAttachedOnLeavePlay(state, cardDb, card);
+  sweepStandingConditions(state, cardDb);
+}
+function broadcastDiscardPileReactors(state, cardDb, discardedCard) {
+  const discardedDef = cardDb.get(discardedCard.definitionKey);
+  if (!discardedDef) return;
+  for (const player of state.players.values()) {
+    for (const instance of player.discardPile) {
+      for (const effect of effectsFor(state, cardDb, instance)) {
+        effect.reactsFromDiscardPileToDiscard?.(state, cardDb, instance, discardedDef);
+      }
+    }
+  }
+}
+function sweepStandingConditions(state, cardDb, rng = defaultRng) {
+  for (const player of state.players.values()) {
+    for (const card of player.inPlay) {
+      for (const effect of effectsFor(state, cardDb, card)) {
+        if (effect.standingConditionMet?.(state, cardDb, card)) {
+          discardFromPlay(state, cardDb, player, card.instanceId, void 0, void 0, rng);
+          return;
+        }
+      }
+    }
+  }
+}
+function gainControl(state, cardDb, card, newControllerId) {
+  if (blockedByShadowCloakFromNonCorePowerOrSpell(state, cardDb, card)) return;
+  if (blockedByShellFromOpposingPowerOrSpell(state, cardDb, card)) return;
+  for (const effect of effectsFor(state, cardDb, card)) {
+    if (effect.canBeGainedControlOf?.(state, cardDb, card) === false) return;
+  }
+  for (const p of state.players.values()) {
+    const contributors = p.activeMagi ? [...p.inPlay, p.activeMagi] : p.inPlay;
+    for (const contributor of contributors) {
+      if (contributor.instanceId === card.instanceId) continue;
+      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+        if (contributorEffect.preventsGainControlOf?.(state, cardDb, card, contributor)) return;
+      }
+    }
+  }
+  const oldController = state.players.get(card.controllerId);
+  if (!oldController) return;
+  if (!oldController.inPlay.some((c2) => c2.instanceId === card.instanceId)) return;
+  removeFromZone(oldController, "inPlay", card.instanceId);
+  card.controllerId = newControllerId;
+  const newController = state.players.get(newControllerId);
+  addToZone(newController, "inPlay", card);
+  logEvent(state, "effectGainedControl", { instanceId: card.instanceId, name: cardDb.get(card.definitionKey)?.name, newControllerId });
+  for (const player of state.players.values()) {
+    for (const instance of player.inPlay) {
+      for (const effect of effectsFor(state, cardDb, instance)) {
+        effect.onGainControl?.(state, cardDb, card, newControllerId, instance);
+      }
+    }
+  }
+  checkCreatureDefeats(state, cardDb);
+}
+function returnToHand(state, cardDb, owner, instanceId, fromZone = "inPlay", causedByPlayerId) {
+  const list = owner[fromZone];
+  const target = list.find((c2) => c2.instanceId === instanceId);
+  if (!target) return;
+  if (blockedByShadowCloakFromNonCorePowerOrSpell(state, cardDb, target)) return;
+  const actor = causedByPlayerId ?? state.currentAction?.actorPlayerId ?? state.activePlayerId;
+  if (owner.playerId !== actor && blockedByShellFromOpposingPowerOrSpell(state, cardDb, target)) return;
+  if (owner.playerId !== actor) {
+    for (const p of state.players.values()) {
+      const contributors = p.activeMagi ? [...p.inPlay, p.activeMagi] : p.inPlay;
+      for (const contributor of contributors) {
+        if (contributor.instanceId === target.instanceId) continue;
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          if (contributorEffect.redirectsOwnReturnToHandToMagiEnergy?.(state, cardDb, target, contributor)) {
+            const magi = p.activeMagi;
+            if (magi) {
+              const gain = Math.min(target.currentEnergy ?? 0, printedStartingEnergy(cardDb, target.definitionKey));
+              addEnergy(state, cardDb, magi, gain, "effect");
+            }
+            logEvent(state, "effectReturnToHandRedirected", { instanceId: target.instanceId, byInstanceId: contributor.instanceId });
+            return;
+          }
+          if (contributorEffect.preventsReturnToHand?.(state, cardDb, target, contributor)) return;
+        }
+      }
+    }
+  }
+  const card = removeFromZone(owner, fromZone, instanceId);
+  card.currentEnergy = null;
+  owner.hand.push(card);
+  releaseAttachedOnLeavePlay(state, cardDb, card);
+  logEvent(state, "effectReturnedToHand", { instanceId });
+}
+function returnToOwnersHand(state, cardDb, card) {
+  const currentController = state.players.get(card.controllerId);
+  const trueOwner = state.players.get(card.ownerId);
+  if (!currentController || !trueOwner) return;
+  if (!currentController.inPlay.some((c2) => c2.instanceId === card.instanceId)) return;
+  removeFromZone(currentController, "inPlay", card.instanceId);
+  card.currentEnergy = null;
+  card.controllerId = card.ownerId;
+  if (card.effectiveRegionOverride?.clearOnLeavePlay) card.effectiveRegionOverride = null;
+  trueOwner.hand.push(card);
+  releaseAttachedOnLeavePlay(state, cardDb, card);
+  logEvent(state, "effectReturnedToHand", { instanceId: card.instanceId });
+}
+function shuffleFromPlayIntoOwnersDeck(state, cardDb, card, rng = defaultRng) {
+  const currentController = state.players.get(card.controllerId);
+  const trueOwner = state.players.get(card.ownerId);
+  if (!currentController || !trueOwner) return;
+  if (!currentController.inPlay.some((c2) => c2.instanceId === card.instanceId)) return;
+  removeFromZone(currentController, "inPlay", card.instanceId);
+  card.currentEnergy = null;
+  card.controllerId = card.ownerId;
+  if (card.effectiveRegionOverride?.clearOnLeavePlay) card.effectiveRegionOverride = null;
+  releaseAttachedOnLeavePlay(state, cardDb, card);
+  trueOwner.deck.push(card);
+  shuffleDeck(trueOwner, rng);
+  logEvent(state, "effectShuffledIntoDeck", { instanceId: card.instanceId, ownerId: card.ownerId });
+}
+function setCardTypeOverride(state, cardDb, instance, override) {
+  const before = effectiveCardType(cardDb, instance);
+  instance.cardTypeOverride = override;
+  const after = effectiveCardType(cardDb, instance);
+  if (before === after) return;
+  const def = cardDb.get(instance.definitionKey);
+  for (const effect of effectsFor(state, cardDb, instance)) {
+    if (after === "Creature") effect.onBecameCreature?.(state, cardDb, instance);
+    if (after === "Relic") effect.onBecameRelic?.(state, cardDb, instance);
+  }
+  logEvent(state, "cardTypeOverrideChanged", { instanceId: instance.instanceId, name: def?.name, from: before, to: after });
+}
+function sweepExpiredControlThefts(state, cardDb) {
+  for (const player of state.players.values()) {
+    for (const card of [...player.inPlay]) {
+      const theft = card.temporaryControlTheft;
+      if (theft && theft.expiresAfterTurnNumber < state.turnNumber) {
+        card.temporaryControlTheft = null;
+        returnToOwnersHand(state, cardDb, card);
+      }
+    }
+  }
+}
+function sweepExpiredCardTypeOverrides(state, cardDb) {
+  for (const player of state.players.values()) {
+    const holders = [...player.inPlay];
+    if (player.activeMagi) holders.push(player.activeMagi);
+    for (const instance of holders) {
+      const override = instance.cardTypeOverride;
+      if (override && override.expiresAfterTurnNumber !== null && override.expiresAfterTurnNumber < state.turnNumber) {
+        setCardTypeOverride(state, cardDb, instance, null);
+      }
+    }
+  }
+}
+function discardTopOfDeck(state, player) {
+  const card = player.deck.shift();
+  if (!card) return void 0;
+  moveToDiscardPile(state, player, card);
+  logEvent(state, "effectDiscardedTopOfDeck", { playerId: player.playerId });
+  return card;
+}
+function searchDeck(state, player, instanceIds2, rng = defaultRng) {
+  const foundCards = [];
+  for (const id of instanceIds2) {
+    const index = player.deck.findIndex((c2) => c2.instanceId === id);
+    if (index === -1) continue;
+    const [card] = player.deck.splice(index, 1);
+    addPermanentTagRaw(card, KNOWN_HAND_CARD);
+    player.hand.push(card);
+    foundCards.push({ instanceId: card.instanceId, definitionKey: card.definitionKey });
+  }
+  shuffleDeck(player, rng);
+  logEvent(state, "effectSearchedDeck", { playerId: player.playerId, count: instanceIds2.length, cards: foundCards });
+}
+function dieRollBonus(state, cardDb, rollingPlayerId, rollingSource) {
+  const player = state.players.get(rollingPlayerId);
+  if (!player) return 0;
+  const contributors = player.activeMagi ? [player.activeMagi, ...player.inPlay] : [...player.inPlay];
+  let bonus = 0;
+  for (const contributor of contributors) {
+    for (const effect of effectsFor(state, cardDb, contributor)) {
+      bonus += effect.addsToOwnDieRolls?.(state, cardDb, contributor, rollingSource) ?? 0;
+    }
+  }
+  return bonus;
+}
+function rollDie(rng = defaultRng, sides = 6, luckContext) {
+  const raw = 1 + Math.floor(rng() * sides);
+  if (!luckContext) return raw;
+  const bonus = dieRollBonus(luckContext.state, luckContext.cardDb, luckContext.rollingPlayerId, luckContext.source);
+  const final = Math.min(sides, raw + bonus);
+  const sourceDef = luckContext.cardDb.get(luckContext.source.definitionKey);
+  logEvent(luckContext.state, "dieRolled", {
+    rollerId: luckContext.rollingPlayerId,
+    sourceInstanceId: luckContext.source.instanceId,
+    sourceName: sourceDef?.name,
+    sides,
+    raw,
+    bonus,
+    final
+  });
+  return final;
+}
+function rollDieWithRerolls(state, cardDb, roller, rng = defaultRng, sides = 6, prefer = "high") {
+  const luckContext = { state, cardDb, rollingPlayerId: roller.controllerId, source: roller };
+  const first = rollDie(rng, sides, luckContext);
+  const preCollectedRerollGrant = state.dieRerollGrantAnswer;
+  let granted = false;
+  if (preCollectedRerollGrant !== "skip") {
+    outer: for (const p of state.players.values()) {
+      const contributors = p.activeMagi ? [...p.inPlay, p.activeMagi] : p.inPlay;
+      for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          if (contributorEffect.grantsDieReroll?.(state, cardDb, roller, contributor)) {
+            granted = true;
+            break outer;
+          }
+        }
+      }
+    }
+  }
+  if (!granted) return first;
+  const second = rollDie(rng, sides, luckContext);
+  return prefer === "high" ? Math.max(first, second) : Math.min(first, second);
+}
+function previewEnergyLossRedirectOffers(state, cardDb, actingPlayerId, hitTargetId) {
+  const hitTarget = (() => {
+    for (const p of state.players.values()) {
+      const inPlayHit = p.inPlay.find((c2) => c2.instanceId === hitTargetId);
+      if (inPlayHit) return inPlayHit;
+      if (p.activeMagi?.instanceId === hitTargetId) return p.activeMagi;
+    }
+    return void 0;
+  })();
+  if (!hitTarget) return [];
+  if (hitTarget.controllerId === actingPlayerId) return [];
+  const owner = state.players.get(hitTarget.controllerId);
+  if (!owner) return [];
+  const redirectors = [];
+  for (const contributor of owner.inPlay) {
+    for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+      if (contributorEffect.offersEnergyLossRedirectToOpponent?.(state, cardDb, hitTarget, contributor)) {
+        redirectors.push(contributor);
+        break;
+      }
+    }
+  }
+  return redirectors;
+}
+function previewHostileHandDiscardSubstitutionOffers(state, cardDb, actingPlayerId) {
+  const victim = getOpponents(state, actingPlayerId)[0];
+  if (!victim) return [];
+  if (victim.handDiscardImmuneUntilMagiDefeated) return [];
+  const candidates = [...victim.hand.filter((c2) => !isHiddenCardRef(c2)), ...victim.inPlay];
+  const offers = [];
+  for (const candidate of candidates) {
+    for (const candidateEffect of effectsFor(state, cardDb, candidate)) {
+      if (candidateEffect.offersHostileHandDiscardSubstitution?.(state, cardDb, candidate)) {
+        offers.push(candidate);
+        break;
+      }
+    }
+  }
+  return offers;
+}
+function previewHostileHandDiscardBlockOffers(state, cardDb, actingPlayerId) {
+  const victim = getOpponents(state, actingPlayerId)[0];
+  if (!victim) return [];
+  if (victim.handDiscardImmuneUntilMagiDefeated) return [];
+  const contributors = victim.activeMagi ? [victim.activeMagi, ...victim.inPlay] : [...victim.inPlay];
+  const offers = [];
+  for (const contributor of contributors) {
+    for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+      if (contributorEffect.offersHostileHandDiscardBlock?.(state, cardDb, contributor)) {
+        offers.push(contributor);
+        break;
+      }
+    }
+  }
+  return offers;
+}
+function actorCausesHostileHandDiscard(state, cardDb, actor, options) {
+  for (const effect of effectsFor(state, cardDb, actor)) {
+    if (effect.causesHostileHandDiscard?.(state, cardDb, actor, options)) return true;
+  }
+  return false;
+}
+function previewDieRerollOffers(state, cardDb, roller) {
+  const owner = state.players.get(roller.controllerId);
+  if (!owner) return [];
+  const contributors = owner.activeMagi ? [...owner.inPlay, owner.activeMagi] : owner.inPlay;
+  const grantors = [];
+  for (const contributor of contributors) {
+    for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+      if (contributorEffect.offersDieReroll?.(state, cardDb, roller, contributor)) {
+        grantors.push(contributor);
+        break;
+      }
+    }
+  }
+  return grantors;
+}
+function findFateWhimsyEligibleReactors(state, cardDb) {
+  const eligible4 = [];
+  const active = state.activePlayerId;
+  const orderedIds = [active, ...state.turnOrder.filter((id) => id !== active)];
+  for (const id of orderedIds) {
+    const player = state.players.get(id);
+    if (!player) continue;
+    if (!player.activeMagi || (player.activeMagi.currentEnergy ?? 0) < 1) continue;
+    if (player.hand.some((c2) => cardDb.get(c2.definitionKey)?.name === "Fate's Whimsy")) {
+      eligible4.push(id);
+    }
+  }
+  return eligible4;
+}
+function requestDieRoll(state, cardDb, source, rollerId, sides, consumerKey, consumerPayload, rng = defaultRng) {
+  if (state.dieRerollGrantAnswer === void 0) {
+    const grantors = previewDieRerollOffers(state, cardDb, source);
+    if (grantors.length > 0) {
+      state.pendingDieRerollGrantOffer = {
+        rollerId,
+        sourceInstanceId: source.instanceId,
+        sides,
+        consumerKey,
+        consumerPayload,
+        eligibleGrantorInstanceIds: grantors.map((c2) => c2.instanceId),
+        owedToPlayerId: rollerId
+      };
+      logEvent(state, "dieRollAwaitingRerollGrant", {
+        rollerId,
+        sourceInstanceId: source.instanceId,
+        sides,
+        eligibleGrantorInstanceIds: grantors.map((c2) => c2.instanceId)
+      });
+      return;
+    }
+  }
+  const raw = rollDieWithRerolls(state, cardDb, source, rng, sides);
+  const sourceDef = cardDb.get(source.definitionKey);
+  const sourceEffect = sourceDef ? getCardEffectByName(sourceDef.name) : void 0;
+  if (sourceEffect?.dieRollCannotBeAltered) {
+    invokeRollConsumer(state, cardDb, source, consumerKey, consumerPayload, raw, rng);
+    return;
+  }
+  const eligible4 = findFateWhimsyEligibleReactors(state, cardDb);
+  if (eligible4.length === 0) {
+    invokeRollConsumer(state, cardDb, source, consumerKey, consumerPayload, raw, rng);
+    return;
+  }
+  recordOpportunity("dieRollWindow:fateWhimsy");
+  state.pendingDieRoll = {
+    currentValue: raw,
+    originalValue: raw,
+    sides,
+    rollerId,
+    sourceInstanceId: source.instanceId,
+    consumerKey,
+    consumerPayload,
+    eligibleReactorPlayerIds: eligible4,
+    pendingRerollChoice: null
+  };
+  logEvent(state, "dieRollAwaitingWhimsy", {
+    rollerId,
+    sourceInstanceId: source.instanceId,
+    value: raw,
+    eligibleReactorPlayerIds: eligible4
+  });
+}
+function invokeRollConsumer(state, cardDb, source, consumerKey, consumerPayload, finalRoll, rng) {
+  const consumer = getRollConsumer(consumerKey);
+  if (!consumer) throw new Error(`Unknown roll consumer key: ${consumerKey}`);
+  consumer(state, cardDb, source, consumerPayload, finalRoll, rng);
+}
+function getCounter(instance, key) {
+  return instance.counters[key] ?? 0;
+}
+function setCounter(instance, key, value) {
+  instance.counters[key] = value;
+}
+function spendCounter(instance, key, amount) {
+  const current = getCounter(instance, key);
+  if (current < amount) return false;
+  instance.counters[key] = current - amount;
+  return true;
+}
+var FIRST_OPPOSING_LOSS_SHIELD_KEY = "firstOpposingLossShieldConsumedTurn";
+function tryConsumeFirstOpposingLossShield(state, cardDb, instance) {
+  const marker = state.turnNumber + 1;
+  for (const effect of effectsFor(state, cardDb, instance)) {
+    if (effect.absorbsFirstOpposingLossPerTurn?.(state, cardDb, instance)) {
+      if (getCounter(instance, FIRST_OPPOSING_LOSS_SHIELD_KEY) !== marker) {
+        setCounter(instance, FIRST_OPPOSING_LOSS_SHIELD_KEY, marker);
+        return true;
+      }
+    }
+  }
+  const owner = state.players.get(instance.controllerId);
+  if (owner) {
+    const granters = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
+    for (const granter of granters) {
+      for (const granterEffect of effectsFor(state, cardDb, granter)) {
+        if (!granterEffect.grantsFirstOpposingLossShieldTo?.(state, cardDb, granter, instance)) continue;
+        if (getCounter(granter, FIRST_OPPOSING_LOSS_SHIELD_KEY) === marker) continue;
+        setCounter(granter, FIRST_OPPOSING_LOSS_SHIELD_KEY, marker);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+function forcePlayFromHand(state, cardDb, player, instanceId, rng = defaultRng) {
+  const index = player.hand.findIndex((c2) => c2.instanceId === instanceId);
+  if (index === -1) return void 0;
+  const [card] = player.hand.splice(index, 1);
+  const def = cardDb.get(card.definitionKey);
+  if (def?.card_type === "Spell") {
+    card.currentEnergy = null;
+    const spellEffect = getCardEffectByName(def.name);
+    if (spellEffect?.spellStaysInPlay) {
+      addToZone(player, "inPlay", card);
+    } else if (spellEffect?.resolveSpell) {
+      const previousCurrentAction = state.currentAction;
+      state.currentAction = {
+        actorPlayerId: player.playerId,
+        source: "spell",
+        sourceDefinitionKey: card.definitionKey,
+        sourceInstanceId: card.instanceId
+      };
+      const opposingBefore = /* @__PURE__ */ new Map();
+      for (const opponent of getOpponents(state, player.playerId)) {
+        for (const c2 of opponent.inPlay) opposingBefore.set(c2.instanceId, c2.currentEnergy ?? 0);
+      }
+      const allBefore = /* @__PURE__ */ new Map();
+      for (const p of state.players.values()) {
+        for (const c2 of p.inPlay) allBefore.set(c2.instanceId, c2.currentEnergy ?? 0);
+      }
+      spellEffect.resolveSpell({ state, cardDb, source: card, controllingPlayer: player, rng });
+      logEvent(state, "spellResolved", { instanceId: card.instanceId, name: def.name, viaForcePlay: true });
+      broadcastSpellDiscardedOpposingEnergy(state, cardDb, player.playerId, card, opposingBefore, allBefore);
+      broadcastSpellAddedEnergyToCreature(state, cardDb, card, allBefore);
+      checkMagiDefeats(state, cardDb, rng);
+      consumeIntensifyIfUsed(state);
+      state.currentAction = previousCurrentAction;
+      moveToDiscardPile(state, player, card);
+    } else {
+      moveToDiscardPile(state, player, card);
+    }
+  } else {
+    card.currentEnergy = def?.card_type === "Creature" ? printedStartingEnergy(cardDb, card.definitionKey) : null;
+    card.controllerId = player.playerId;
+    resetPerTurnStateOnEnterPlay(card);
+    addToZone(player, "inPlay", card);
+  }
+  logEvent(state, "effectForcePlayedFromHand", { instanceId: card.instanceId, name: def?.name });
+  checkCreatureDefeats(state, cardDb);
+  checkHandEmptied(state, cardDb, rng);
+  return card;
+}
+function searchDeckIntoPlay(state, cardDb, player, instanceId, startingEnergy, broadcastAsPlayed = false, rng = defaultRng) {
+  const index = player.deck.findIndex((c2) => c2.instanceId === instanceId);
+  if (index === -1) return void 0;
+  const [card] = player.deck.splice(index, 1);
+  card.currentEnergy = startingEnergy;
+  resetPerTurnStateOnEnterPlay(card);
+  addToZone(player, "inPlay", card);
+  logEvent(state, "effectSearchedDeckIntoPlay", { playerId: player.playerId, instanceId, definitionKey: card.definitionKey });
+  if (broadcastAsPlayed) {
+    broadcastCardEnteredPlay(state, cardDb, player.playerId, card, rng);
+    checkCreatureDefeats(state, cardDb, void 0, void 0, rng);
+  }
+  return card;
+}
+function moveHandCardToDeck(state, cardDb, player, instanceId, position, rng) {
+  const card = removeFromZone(player, "hand", instanceId);
+  addToZone(player, "deck", card, position);
+  logEvent(state, "effectMovedHandCardToDeck", { playerId: player.playerId, instanceId, position });
+  checkHandEmptied(state, cardDb, rng);
+}
+function discardRandomFromHand(state, cardDb, player, count, rng = defaultRng) {
+  const discarded = [];
+  for (let i = 0; i < count && player.hand.length > 0; i += 1) {
+    const index = Math.floor(rng() * player.hand.length);
+    const [card] = player.hand.splice(index, 1);
+    moveToDiscardPile(state, player, card);
+    discarded.push(card);
+  }
+  logEvent(state, "effectDiscardedRandomFromHand", {
+    playerId: player.playerId,
+    count: discarded.length,
+    cards: discarded.map((card) => ({ instanceId: card.instanceId, definitionKey: card.definitionKey }))
+  });
+  checkHandEmptied(state, cardDb, rng);
+  return discarded;
+}
+function discardFromDeck(state, player, instanceIds2) {
+  for (const id of instanceIds2) {
+    const index = player.deck.findIndex((c2) => c2.instanceId === id);
+    if (index === -1) continue;
+    const [card] = player.deck.splice(index, 1);
+    moveToDiscardPile(state, player, card);
+  }
+  logEvent(state, "effectDiscardedFromDeck", { playerId: player.playerId, count: instanceIds2.length });
+}
+function retrieveFromDiscardPile(state, player, instanceId, destination, rng = defaultRng) {
+  const index = player.discardPile.findIndex((c2) => c2.instanceId === instanceId);
+  if (index === -1) return void 0;
+  const [card] = player.discardPile.splice(index, 1);
+  if (destination === "hand") {
+    addPermanentTagRaw(card, KNOWN_HAND_CARD);
+    player.hand.push(card);
+  } else if (destination === "deckTop") {
+    player.deck.unshift(card);
+  } else {
+    player.deck.push(card);
+    shuffleDeck(player, rng);
+  }
+  logEvent(state, "effectRetrievedFromDiscardPile", { playerId: player.playerId, instanceId, definitionKey: card.definitionKey, destination });
+  return card;
+}
+function onPlayReactorFingerprint(state) {
+  const parts = [];
+  for (const p of state.players.values()) {
+    parts.push(p.hand.length, p.inPlay.length, p.discardPile.length, p.deck.length, p.magiQueue.length);
+    parts.push(p.activeMagi?.currentEnergy ?? -1);
+    for (const c2 of p.inPlay) parts.push(c2.currentEnergy ?? -1);
+  }
+  return parts.join(",");
+}
+function isProtectionSuppressed(state, cardDb, protectedCard, protector, kind) {
+  for (const effect of effectsFor(state, cardDb, protectedCard)) {
+    if (effect.suppressesProtectionFrom?.(state, cardDb, protectedCard, protector, kind) === true) return true;
+  }
+  return false;
+}
+function protectionTagActive(state, cardDb, instance, tag, kind) {
+  return remoteProtectionTagActive(state, cardDb, instance, instance, tag, kind);
+}
+function remoteProtectionTagActive(state, cardDb, protectedCard, tagHolder, tag, kind) {
+  const entry = tagHolder.durationTags.find((dt) => dt.tag === tag);
+  if (!entry) return false;
+  if (entry.sourceInstanceId === void 0) return true;
+  const source = findCard(state, entry.sourceInstanceId)?.instance;
+  if (!source) return true;
+  return !isProtectionSuppressed(state, cardDb, protectedCard, source, kind);
+}
+function burrowProtectionSuppressed(state, cardDb, target, kind) {
+  if (!isBurrowed(state, cardDb, target)) return false;
+  if (target.tags.has(BURROWED)) return false;
+  for (const effect of effectsFor(state, cardDb, target)) {
+    if (effect.isConditionallyBurrowed?.(state, cardDb, target)) return false;
+  }
+  const entry = target.durationTags.find((dt) => dt.tag === BURROWED);
+  if (entry) {
+    if (entry.sourceInstanceId === void 0) return false;
+    const source = findCard(state, entry.sourceInstanceId)?.instance;
+    if (!source) return false;
+    if (!isProtectionSuppressed(state, cardDb, target, source, kind)) return false;
+  }
+  for (const player of state.players.values()) {
+    const contributors = player.activeMagi ? [player.activeMagi, ...player.inPlay] : [...player.inPlay];
+    for (const contributor of contributors) {
+      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+        if (contributorEffect.grantsBurrowedTo?.(state, cardDb, contributor, target)) {
+          if (!isProtectionSuppressed(state, cardDb, target, contributor, kind)) return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+function cardLocalCombatReductionBlocked(state, cardDb, attacker, defender, direction, self) {
+  if (combatEffectReductionBlocked(state, cardDb, attacker, defender, direction)) return true;
+  const protectedCard = direction === "attackerOutput" ? defender : attacker;
+  if (!protectedCard) return false;
+  return isProtectionSuppressed(state, cardDb, protectedCard, self, "combatEnergyLoss");
+}
+function resetPerTurnStateOnEnterPlay(card) {
+  card.usedPowerNames.clear();
+  card.usedPowerCounts.clear();
+  card.attacksThisTurn = 0;
+  card.attackedThisTurn = false;
+  card.attackedMagiDirectlyThisTurn = false;
+  card.oneShotBonusAttacks = 0;
+  card.wasAttackedThisTurn = false;
+  card.defeatedThisTurn = false;
+  card.energyLostToOpponentThisTurn = 0;
+}
+function broadcastCardEnteredPlay(state, cardDb, playerId, instance, rng = defaultRng) {
+  const def = cardDb.get(instance.definitionKey);
+  const previousCurrentAction = state.currentAction;
+  state.currentAction = { actorPlayerId: playerId, source: "effect" };
+  const seenReactorIds = /* @__PURE__ */ new Set();
+  const reactors = [instance];
+  seenReactorIds.add(instance.instanceId);
+  for (const p of state.players.values()) {
+    const candidates = p.activeMagi ? [...p.inPlay, p.activeMagi] : p.inPlay;
+    for (const c2 of candidates) {
+      if (!seenReactorIds.has(c2.instanceId)) {
+        seenReactorIds.add(c2.instanceId);
+        reactors.push(c2);
+      }
+    }
+  }
+  for (const reactor of reactors) {
+    const reactorDef = cardDb.get(reactor.definitionKey);
+    for (const reactorEffect of effectsFor(state, cardDb, reactor)) {
+      if (!reactorEffect.onPlay) continue;
+      const before = onPlayReactorFingerprint(state);
+      reactorEffect.onPlay(state, cardDb, instance, reactor, rng);
+      if (onPlayReactorFingerprint(state) !== before) {
+        logEvent(state, "onPlayHookFired", { cardName: reactorDef.name, instanceId: reactor.instanceId, reactingTo: def?.name });
+      }
+    }
+  }
+  if (def?.card_type === "Relic" && def.regions.includes("Cald")) {
+    const searingTouchKey = findSearingTouchDefKey(cardDb);
+    if (searingTouchKey !== void 0) {
+      for (const reactor of reactors) {
+        if (reactor.instanceId === instance.instanceId) continue;
+        if (reactor.controllerId !== instance.controllerId) continue;
+        if (!hasDurationTag(reactor, SEARING_TOUCH_FURNACE)) continue;
+        if (hasGrantFrom(state, reactor, searingTouchKey)) continue;
+        addGrantedEffect(reactor, searingTouchKey);
+      }
+    }
+  }
+  state.currentAction = previousCurrentAction;
+  if (def?.card_type === "Spell" || def?.card_type === "Relic") {
+    const reactionOpponents = getOpponents(state, playerId);
+    if (reactionOpponents.length > 0) {
+      state.reactiveWindow = {
+        kind: "opponentPlayOrPower",
+        reactingPlayerId: reactionOpponents[0].playerId,
+        actingPlayerId: playerId,
+        trigger: "spellOrRelic"
+      };
+    }
+  }
+  for (const p of state.players.values()) {
+    for (const handCard of [...p.hand]) {
+      const handDef = cardDb.get(handCard.definitionKey);
+      for (const handEffect of effectsFor(state, cardDb, handCard)) {
+        if (!handEffect.reactsToPlayFromHand) continue;
+        if (!handEffect.reactsToPlayFromHand(state, cardDb, handCard, instance, playerId)) continue;
+        const played = playFromZone(
+          state,
+          cardDb,
+          { owner: p, zone: "hand", instanceId: handCard.instanceId },
+          p,
+          // Entry energy again -- printed, same reasoning as forcePlayFromHand above.
+          printedStartingEnergy(cardDb, handCard.definitionKey),
+          rng
+        );
+        if (played) logEvent(state, "reactsToPlayFromHandFired", { cardName: handDef.name, instanceId: played.instanceId, reactingTo: def?.name });
+      }
+    }
+  }
+  {
+    const playingPlayer = [...state.players.values()].find((p) => p.playerId === playerId);
+    for (const reactor of [...playingPlayer.hand, ...playingPlayer.discardPile]) {
+      for (const reactorEffect of effectsFor(state, cardDb, reactor)) {
+        reactorEffect.reactsToOwnCardPlayFromHandOrDiscard?.(state, cardDb, reactor, instance, playerId);
+      }
+    }
+  }
+}
+function resolveDreamwarpDelta(state, cardDb, playerId, instance, printedCost, chosen) {
+  if (chosen === void 0) return 0;
+  const range = effectiveDreamwarpRange(state, cardDb, playerId, instance);
+  if (range === void 0) return 0;
+  const clamped = Math.max(-range, Math.min(range, Math.trunc(chosen)));
+  if (clamped === 0) return 0;
+  return Math.max(1, printedCost + clamped) - printedCost;
+}
+function commitDreamwarpDelta(state, cardDb, instance, printedCost, delta) {
+  if (delta === 0) return;
+  instance.dreamwarpAdjustment = delta;
+  instance.startingEnergyOverride = { value: printedCost + delta, expiresAfterTurnNumber: state.turnNumber };
+  for (const p of state.players.values()) {
+    const contributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
+    for (const contributor of contributors) {
+      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+        contributorEffect.onAnyDreamwarpUsed?.(state, cardDb, contributor, instance);
+      }
+    }
+  }
+}
+function spellPlayCostWithModifiers(state, cardDb, def, payerPlayerId, baseCost, instance) {
+  const cardEffect = getCardEffectByName(def.name);
+  if (instance) {
+    const override = cardEffect?.selfCostOverride?.(state, cardDb, payerPlayerId, instance);
+    if (override !== void 0) return override;
+  }
+  let workingBase = baseCost;
+  if (instance) {
+    const selfDelta = cardEffect?.selfCostAdjustment?.(state, cardDb, payerPlayerId, instance, void 0) ?? 0;
+    if (selfDelta !== 0) {
+      workingBase = selfDelta < 0 ? Math.max(1, workingBase + selfDelta) : workingBase + selfDelta;
+    }
+  }
+  let costModifierSum = 0;
+  for (const p of state.players.values()) {
+    const contributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
+    for (const contributor of contributors) {
+      for (const effect of effectsFor(state, cardDb, contributor)) {
+        if (effect.costModifier) costModifierSum += effect.costModifier(state, cardDb, def, payerPlayerId, contributor);
+      }
+    }
+  }
+  if (costModifierSum === 0) return workingBase;
+  return costModifierSum < 0 ? Math.max(1, workingBase + costModifierSum) : workingBase + costModifierSum;
+}
+function playFromZone(state, cardDb, source, destination, startingEnergy, rng = defaultRng, nestedChoices = {}, energyCost = 0) {
+  const list = source.owner[source.zone];
+  const index = list.findIndex((c2) => c2.instanceId === source.instanceId);
+  if (index === -1) return void 0;
+  const [card] = list.splice(index, 1);
+  if (energyCost > 0 && destination.activeMagi) {
+    const playedDef = cardDb.get(card.definitionKey);
+    const finalCost = playedDef ? spellPlayCostWithModifiers(state, cardDb, playedDef, destination.playerId, energyCost) : energyCost;
+    destination.activeMagi.currentEnergy = Math.max(0, (destination.activeMagi.currentEnergy ?? 0) - finalCost);
+    logEvent(state, "playFromZoneCostPaid", {
+      instanceId: card.instanceId,
+      name: playedDef?.name,
+      baseCost: energyCost,
+      cost: finalCost
+    });
+  }
+  card.controllerId = destination.playerId;
+  destination.cardsPlayedThisTurn += 1;
+  const def = cardDb.get(card.definitionKey);
+  if (def?.card_type === "Spell") {
+    card.currentEnergy = null;
+    if (nestedChoices.chosenXValue !== void 0) {
+      card.counters.startingX = nestedChoices.chosenXValue;
+    }
+    const spellEffect = getCardEffectByName(def.name);
+    if (spellEffect?.resolveSpell) {
+      const previousCurrentAction = state.currentAction;
+      state.currentAction = {
+        actorPlayerId: destination.playerId,
+        source: "spell",
+        sourceDefinitionKey: card.definitionKey,
+        sourceInstanceId: card.instanceId
+      };
+      const opposingBefore = /* @__PURE__ */ new Map();
+      for (const opponent of getOpponents(state, destination.playerId)) {
+        for (const c2 of opponent.inPlay) opposingBefore.set(c2.instanceId, c2.currentEnergy ?? 0);
+      }
+      const allBefore = /* @__PURE__ */ new Map();
+      for (const p of state.players.values()) {
+        for (const c2 of p.inPlay) allBefore.set(c2.instanceId, c2.currentEnergy ?? 0);
+      }
+      spellEffect.resolveSpell({ state, cardDb, source: card, controllingPlayer: destination, rng, ...nestedChoices });
+      logEvent(state, "spellResolved", { instanceId: card.instanceId, name: def.name, viaPlayFromZone: true });
+      broadcastSpellDiscardedOpposingEnergy(state, cardDb, destination.playerId, card, opposingBefore, allBefore);
+      broadcastSpellAddedEnergyToCreature(state, cardDb, card, allBefore);
+      checkMagiDefeats(state, cardDb, rng);
+      consumeIntensifyIfUsed(state);
+      state.currentAction = previousCurrentAction;
+      const placedSomewhere = [...state.players.values()].some(
+        (p) => p.inPlay.some((c2) => c2.instanceId === card.instanceId) || p.discardPile.some((c2) => c2.instanceId === card.instanceId)
+      );
+      if (!placedSomewhere) {
+        moveToDiscardPile(state, destination, card);
+      }
+    } else {
+      moveToDiscardPile(state, destination, card);
+    }
+  } else {
+    card.currentEnergy = startingEnergy;
+    resetPerTurnStateOnEnterPlay(card);
+    addToZone(destination, "inPlay", card);
+  }
+  logEvent(state, "effectPlayedFromZone", { instanceId: card.instanceId, name: def?.name, sourceZone: source.zone });
+  broadcastCardEnteredPlay(state, cardDb, destination.playerId, card, rng);
+  checkCreatureDefeats(state, cardDb);
+  return card;
+}
+function broadcastSpellDiscardedOpposingEnergy(state, cardDb, actingPlayerId, sourceCard, opposingBefore, allBefore) {
+  const stillInPlayAfter = /* @__PURE__ */ new Map();
+  for (const opponent of getOpponents(state, actingPlayerId)) {
+    for (const c2 of opponent.inPlay) stillInPlayAfter.set(c2.instanceId, c2);
+  }
+  const actingPlayer = getPlayer(state, actingPlayerId);
+  const contributors = actingPlayer.activeMagi ? [actingPlayer.activeMagi, ...actingPlayer.inPlay] : [...actingPlayer.inPlay];
+  const perCreatureOpposingDiscarded = /* @__PURE__ */ new Map();
+  for (const [instanceId, before] of opposingBefore) {
+    const afterInstance = stillInPlayAfter.get(instanceId);
+    if (!afterInstance) continue;
+    const lost = before - (afterInstance.currentEnergy ?? 0);
+    if (lost > 0) perCreatureOpposingDiscarded.set(instanceId, lost);
+  }
+  const amplificationBlocked = getCardEffectByName(cardDb.get(sourceCard.definitionKey)?.name ?? "")?.spellBlocksOwnEnergyAmplification === true;
+  if (perCreatureOpposingDiscarded.size > 0 && !amplificationBlocked) {
+    for (const [instanceId, amount] of perCreatureOpposingDiscarded) {
+      const targetInstance = stillInPlayAfter.get(instanceId);
+      for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          contributorEffect.onOwnPowerDiscardedOpposingEnergyFromCreature?.(
+            state,
+            cardDb,
+            contributor,
+            sourceCard,
+            targetInstance,
+            amount,
+            perCreatureOpposingDiscarded.size
+          );
+        }
+      }
+    }
+  }
+  const opposingAfterBonuses = /* @__PURE__ */ new Map();
+  for (const opponent of getOpponents(state, actingPlayerId)) {
+    for (const c2 of opponent.inPlay) opposingAfterBonuses.set(c2.instanceId, c2);
+  }
+  let opposingEnergyDiscarded = 0;
+  for (const [instanceId, before] of opposingBefore) {
+    const after = opposingAfterBonuses.get(instanceId)?.currentEnergy ?? 0;
+    opposingEnergyDiscarded += Math.max(0, before - after);
+  }
+  if (opposingEnergyDiscarded > 0) {
+    for (const contributor of contributors) {
+      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+        contributorEffect.onOwnPowerDiscardedOpposingEnergy?.(state, cardDb, contributor, sourceCard, opposingEnergyDiscarded);
+      }
+    }
+  }
+  if (allBefore) {
+    const allAfter = /* @__PURE__ */ new Map();
+    for (const p of state.players.values()) {
+      for (const c2 of p.inPlay) allAfter.set(c2.instanceId, c2);
+    }
+    const perCreatureAnyDiscarded = /* @__PURE__ */ new Map();
+    for (const [instanceId, before] of allBefore) {
+      const afterInstance = allAfter.get(instanceId);
+      if (!afterInstance) continue;
+      const lost = before - (afterInstance.currentEnergy ?? 0);
+      if (lost > 0) perCreatureAnyDiscarded.set(instanceId, lost);
+    }
+    if (perCreatureAnyDiscarded.size === 1) {
+      const [instanceId, amount] = [...perCreatureAnyDiscarded][0];
+      const targetInstance = allAfter.get(instanceId);
+      for (const p of state.players.values()) {
+        const allContributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
+        for (const contributor of allContributors) {
+          for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+            contributorEffect.onAnySpellDiscardedEnergyFromSingleCreature?.(state, cardDb, contributor, sourceCard, targetInstance, amount);
+          }
+        }
+      }
+    }
+  }
+}
+function broadcastSpellAddedEnergyToCreature(state, cardDb, sourceCard, allBefore) {
+  let anyCreatureEnergyAdded = 0;
+  const perCreatureGains = [];
+  for (const p of state.players.values()) {
+    for (const c2 of p.inPlay) {
+      const before = allBefore.get(c2.instanceId);
+      if (before === void 0) continue;
+      const gained = Math.max(0, (c2.currentEnergy ?? 0) - before);
+      anyCreatureEnergyAdded += gained;
+      if (gained > 0) perCreatureGains.push({ instance: c2, amount: gained });
+    }
+  }
+  if (anyCreatureEnergyAdded > 0) {
+    for (const p of state.players.values()) {
+      const contributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
+      for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          contributorEffect.onAnyPowerAddedEnergyToCreature?.(state, cardDb, contributor, sourceCard, anyCreatureEnergyAdded);
+        }
+      }
+    }
+  }
+  if (perCreatureGains.length > 0) {
+    for (const p of state.players.values()) {
+      const contributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
+      for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          contributorEffect.onPowerAddedEnergyToCreatures?.(state, cardDb, contributor, sourceCard, perCreatureGains);
+        }
+      }
+    }
+  }
+}
+function broadcastOwnRelicChosenAsTargetByOpponent(state, cardDb, target, actorPlayerId) {
+  if (cardDb.get(target.definitionKey)?.card_type !== "Relic") return;
+  if (target.controllerId === actorPlayerId) return;
+  const owner = state.players.get(target.controllerId);
+  if (!owner) return;
+  const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
+  for (const contributor of contributors) {
+    for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+      contributorEffect.onOwnRelicChosenAsTargetByOpponent?.(state, cardDb, contributor, target, actorPlayerId);
+    }
+  }
+}
+function discardEnergyFromSpellPostHoc(state, cardDb, actingPlayerId, self, target, amount, rng) {
+  const opposingBefore = /* @__PURE__ */ new Map();
+  for (const opponent of getOpponents(state, actingPlayerId)) {
+    for (const c2 of opponent.inPlay) opposingBefore.set(c2.instanceId, c2.currentEnergy ?? 0);
+  }
+  const allBefore = /* @__PURE__ */ new Map();
+  for (const p of state.players.values()) {
+    for (const c2 of p.inPlay) allBefore.set(c2.instanceId, c2.currentEnergy ?? 0);
+  }
+  discardEnergy(state, cardDb, target, amount, "spell", void 0, rng);
+  broadcastSpellDiscardedOpposingEnergy(state, cardDb, actingPlayerId, self, opposingBefore, allBefore);
+}
+
+// src/energy.ts
+function addEnergy2(state, cardDb, instance, amount) {
+  if (amount < 0) {
+    throw new Error("addEnergy amount must be non-negative; use discardEnergy to remove energy");
+  }
+  instance.currentEnergy = (instance.currentEnergy ?? 0) + amount;
+  logEvent(state, "energyAdded", {
+    instanceId: instance.instanceId,
+    amount,
+    newTotal: instance.currentEnergy
+  });
+  checkForDefeats(state, cardDb);
+}
+function discardEnergy2(state, cardDb, instance, amount) {
+  if (amount < 0) {
+    throw new Error("discardEnergy amount must be non-negative");
+  }
+  const current = instance.currentEnergy ?? 0;
+  instance.currentEnergy = Math.max(0, current - amount);
+  logEvent(state, "energyDiscarded", {
+    instanceId: instance.instanceId,
+    amount,
+    newTotal: instance.currentEnergy
+  });
+  checkForDefeats(state, cardDb);
+}
+function rearrangeEnergy2(state, cardDb, from, to, amount) {
+  if (amount < 0) {
+    throw new Error("rearrangeEnergy amount must be non-negative");
+  }
+  const available = from.currentEnergy ?? 0;
+  const moved = Math.min(available, amount);
+  from.currentEnergy = available - moved;
+  to.currentEnergy = (to.currentEnergy ?? 0) + moved;
+  logEvent(state, "energyRearranged", {
+    fromInstanceId: from.instanceId,
+    toInstanceId: to.instanceId,
+    amount: moved
+  });
+  checkForDefeats(state, cardDb);
+}
+function restoreEnergy2(state, cardDb, instance, targetEnergy) {
+  instance.currentEnergy = Math.max(0, targetEnergy);
+  logEvent(state, "energyRestored", {
+    instanceId: instance.instanceId,
+    newTotal: instance.currentEnergy
+  });
+  checkForDefeats(state, cardDb);
+}
+function checkCreatureDefeats(state, cardDb, source, causedByPlayerId, rng = defaultRng) {
+  const actor = causedByPlayerId ?? state.currentAction?.actorPlayerId ?? state.activePlayerId;
+  const newlyDiscarded = [];
+  for (const player of state.players.values()) {
+    const survivingInPlay = [];
+    for (const card of [...player.inPlay]) {
+      if (!player.inPlay.some((c2) => c2.instanceId === card.instanceId)) continue;
+      const def = cardDb.get(card.definitionKey);
+      const isCreature3 = effectiveCardType(cardDb, card) === "Creature";
+      if (isCreature3 && (card.currentEnergy ?? 0) <= 0) {
+        let prevented = false;
+        for (const p of state.players.values()) {
+          const contributors = p.activeMagi ? [...p.inPlay, p.activeMagi] : p.inPlay;
+          for (const contributor of contributors) {
+            if (contributor.instanceId === card.instanceId) continue;
+            for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+              if (contributorEffect.preventsDiscardOf?.(state, cardDb, card, contributor, "zero-energy", rng)) {
+                prevented = true;
+                break;
+              }
+            }
+            if (prevented) break;
+          }
+          if (prevented) break;
+        }
+        if (prevented) {
+          survivingInPlay.push(card);
+          continue;
+        }
+        const redirectsToRelic = effectsFor(state, cardDb, card).some(
+          (cardEffect) => cardEffect.redirectsCombatDefeatToRelic?.(state, cardDb, card, source) ?? false
+        );
+        if (redirectsToRelic) {
+          setCardTypeOverride(state, cardDb, card, { asType: "Relic", expiresAfterTurnNumber: null });
+          survivingInPlay.push(card);
+          continue;
+        }
+        if (kybarsEchoApplies(state, cardDb, player, card)) {
+          card.currentEnergy = null;
+          addToZone(player, "hand", card);
+          releaseAttachedOnLeavePlay(state, cardDb, card);
+          logEvent(state, "effectReturnedToHand", { instanceId: card.instanceId, name: def?.name });
+          continue;
+        }
+        moveToDiscardPile(state, player, card, "zero-energy", source, actor);
+        releaseAttachedOnLeavePlay(state, cardDb, card);
+        logEvent(state, "creatureDefeated", { instanceId: card.instanceId, name: def?.name });
+        newlyDiscarded.push({ card, ownerId: player.playerId });
+      } else {
+        survivingInPlay.push(card);
+      }
+    }
+    const liveInPlayIds = new Set(player.inPlay.map((c2) => c2.instanceId));
+    player.inPlay = survivingInPlay.filter((c2) => liveInPlayIds.has(c2.instanceId));
+  }
+  for (const { card, ownerId } of newlyDiscarded) {
+    const cardOwner = state.players.get(ownerId);
+    if (cardOwner) checkEternalVigor(state, cardDb, card, cardOwner, actor, source === "combat");
+    const reactorSets = [[card]];
+    for (const reactingPlayer of state.players.values()) {
+      reactorSets.push(reactingPlayer.activeMagi ? [...reactingPlayer.inPlay, reactingPlayer.activeMagi] : reactingPlayer.inPlay);
+    }
+    for (const reactors of reactorSets) {
+      for (const instance of reactors) {
+        for (const effect of effectsFor(state, cardDb, instance)) {
+          if (!effect.onCardDiscardedFromPlay) continue;
+          effect.onCardDiscardedFromPlay(state, cardDb, card, ownerId, instance, "zero-energy", source, actor, rng);
+          logEvent(state, "onCardDiscardedFromPlayHookFired", { cardName: cardDb.get(instance.definitionKey).name, instanceId: instance.instanceId, reactingTo: cardDb.get(card.definitionKey)?.name });
+        }
+      }
+    }
+    for (const instance of cardOwner ? cardOwner.hand : []) {
+      for (const effect of effectsFor(state, cardDb, instance)) {
+        if (!effect.onCardDiscardedFromPlayWhileInHand) continue;
+        effect.onCardDiscardedFromPlayWhileInHand(state, cardDb, card, ownerId, instance);
+        logEvent(state, "onCardDiscardedFromPlayHookFired", { cardName: cardDb.get(instance.definitionKey).name, instanceId: instance.instanceId, reactingTo: cardDb.get(card.definitionKey)?.name });
+      }
+    }
+    broadcastDiscardPileReactors(state, cardDb, card);
+  }
+  if (newlyDiscarded.length > 0) {
+    sweepStandingConditions(state, cardDb, rng);
+  }
+}
+function checkMagiDefeats(state, cardDb, rng = defaultRng) {
+  for (const player of state.players.values()) {
+    if (player.activeMagi) {
+      const magi = player.activeMagi;
+      const contributors = player.activeMagi ? [player.activeMagi, ...player.inPlay] : [...player.inPlay];
+      const illusionsCount = contributors.some(
+        (c2) => effectsFor(state, cardDb, c2).some(
+          (contributorEffect) => contributorEffect.grantsIllusionsCountForOwnDefeat?.(state, cardDb, c2) ?? false
+        )
+      );
+      const ownCreatures4 = player.inPlay.filter(
+        (c2) => effectiveCardType(cardDb, c2) === "Creature" && (illusionsCount || !isIllusion(c2))
+      );
+      const magiEffects = effectsFor(state, cardDb, magi);
+      const customCondition = magiEffects.find((effect) => effect.customDefeatCondition !== void 0)?.customDefeatCondition;
+      const isDefeated = customCondition ? customCondition(state, cardDb, magi, ownCreatures4) : (magi.currentEnergy ?? 0) <= 0 && ownCreatures4.length === 0;
+      if (isDefeated) {
+        let prevented = false;
+        for (const contributor of contributors) {
+          for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+            if (!contributorEffect.offersDefeatPrevention?.(state, cardDb, contributor, magi)) continue;
+            contributorEffect.resolveDefeatPrevention?.(state, cardDb, contributor, magi, rng);
+            prevented = true;
+            break;
+          }
+          if (prevented) break;
+        }
+        if (!prevented && canOfferDefeatInterrupt(state, cardDb, player, magi)) {
+          player.pendingDefeatInterrupt = { magiInstanceId: magi.instanceId };
+          continue;
+        }
+        if (!prevented) {
+          defeatMagi(state, cardDb, player, rng);
+          if (state.tutorialMode && !state.tutorialEnded) {
+            const totalDefeats = [...state.players.values()].reduce(
+              (sum, p) => sum + p.defeatedMagi.length,
+              0
+            );
+            if (totalDefeats === 1) {
+              state.tutorialEnded = {
+                defeatedPlayerId: player.playerId,
+                magiInstanceId: magi.instanceId,
+                magiName: cardDb.get(magi.definitionKey)?.name ?? magi.instanceId
+              };
+              return;
+            }
+          }
+        }
+      }
+    }
+  }
+  checkForGameEnd(state);
+}
+function checkForDefeats(state, cardDb, source, rng = defaultRng) {
+  checkCreatureDefeats(state, cardDb, source, void 0, rng);
+  checkMagiDefeats(state, cardDb);
+}
+function defeatMagi(state, cardDb, player, rng = defaultRng) {
+  const magi = player.activeMagi;
+  const magiDef = cardDb.get(magi.definitionKey);
+  const magiEffects = effectsFor(state, cardDb, magi);
+  const preWipeInPlay = player.inPlay;
+  const survivingInPlay = [];
+  for (const card of player.inPlay) {
+    if (magiEffects.some((magiEffect) => magiEffect.survivesOwnMagiDefeat?.(state, cardDb, magi, card, magi) ?? false)) {
+      survivingInPlay.push(card);
+      continue;
+    }
+    const grantedBySibling = player.inPlay.some(
+      (contributor) => effectsFor(state, cardDb, contributor).some(
+        (contributorEffect) => contributorEffect.survivesOwnMagiDefeat?.(state, cardDb, magi, card, contributor) ?? false
+      )
+    );
+    if (grantedBySibling) {
+      survivingInPlay.push(card);
+      continue;
+    }
+    moveToDiscardPile(state, player, card);
+    releaseAttachedOnLeavePlay(state, cardDb, card);
+  }
+  player.inPlay = survivingInPlay;
+  player.defeatedMagi.push(magi);
+  player.activeMagi = null;
+  releaseAttachedOnLeavePlay(state, cardDb, magi);
+  player.handDiscardImmuneUntilMagiDefeated = false;
+  if (state.activePlayerId !== player.playerId && magiDef) {
+    for (const region of magiDef.regions) player.pendingSpiritSpellRegions.push(region);
+  }
+  logEvent(state, "magiDefeated", {
+    playerId: player.playerId,
+    instanceId: magi.instanceId,
+    name: cardDb.get(magi.definitionKey)?.name
+  });
+  for (const magiEffect of magiEffects) {
+    if (!magiEffect.onOwnMagiDefeated) continue;
+    magiEffect.onOwnMagiDefeated(state, cardDb, magi, magi, rng);
+    logEvent(state, "onOwnMagiDefeatedHookFired", { cardName: magiDef.name, instanceId: magi.instanceId });
+  }
+  for (const card of preWipeInPlay) {
+    for (const cardEffect of effectsFor(state, cardDb, card)) {
+      if (cardEffect.onOwnMagiDefeated) {
+        cardEffect.onOwnMagiDefeated(state, cardDb, card, magi, rng);
+        logEvent(state, "onOwnMagiDefeatedHookFired", { cardName: cardDb.get(card.definitionKey).name, instanceId: card.instanceId });
+      }
+    }
+  }
+  for (const p of state.players.values()) {
+    const contributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
+    for (const contributor of contributors) {
+      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+        contributorEffect.onAnyMagiDefeated?.(state, cardDb, contributor, magi, player.playerId, rng);
+      }
+    }
+  }
+  if (state.activePlayerId !== player.playerId) {
+    const activePlayer = state.players.get(state.activePlayerId);
+    if (activePlayer) {
+      const contributors = activePlayer.activeMagi ? [activePlayer.activeMagi, ...activePlayer.inPlay] : [...activePlayer.inPlay];
+      for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          if (contributorEffect.onOpponentMagiDefeatedByActivePlayer) {
+            contributorEffect.onOpponentMagiDefeatedByActivePlayer(state, cardDb, contributor);
+            logEvent(state, "onOpponentMagiDefeatedByActivePlayerHookFired", { cardName: cardDb.get(contributor.definitionKey).name, instanceId: contributor.instanceId });
+          }
+        }
+      }
+    }
+  }
+}
+function checkForGameEnd(state) {
+  if (state.winnerId || state.isDraw) return;
+  const stillIn = state.turnOrder.filter((id) => {
+    const p = getPlayer(state, id);
+    return !(p.magiQueue.length === 0 && p.activeMagi === null);
+  });
+  if (stillIn.length === 1) {
+    state.winnerId = stillIn[0];
+    logEvent(state, "gameOver", { winnerId: state.winnerId });
+  } else if (stillIn.length === 0) {
+    state.isDraw = true;
+    logEvent(state, "gameOverSimultaneousDefeat", { playerIds: state.turnOrder });
+  }
+}
+function forfeitGame(state, forfeitingPlayerId) {
+  if (state.winnerId || state.isDraw) return;
+  const winnerId = state.turnOrder.find((id) => id !== forfeitingPlayerId);
+  if (!winnerId) return;
+  state.winnerId = winnerId;
+  logEvent(state, "gameOverByForfeit", { winnerId, forfeitedBy: forfeitingPlayerId });
+}
+function canOfferDefeatInterrupt(state, cardDb, player, magi) {
+  if (player.spiritOfRayjeUsesRemaining <= 0) return false;
+  if (player.defeatInterruptDeclinedFor === magi.instanceId) return false;
+  return player.hand.some((c2) => cardDb.get(c2.definitionKey)?.name === "Spirit of Rayje");
+}
+function previewDefeatInterrupt(state, playerId) {
+  return state.players.get(playerId)?.pendingDefeatInterrupt ?? null;
+}
+function declineDefeatInterrupt(state, cardDb, playerId, rng = defaultRng) {
+  const player = state.players.get(playerId);
+  if (!player?.pendingDefeatInterrupt) return;
+  player.defeatInterruptDeclinedFor = player.pendingDefeatInterrupt.magiInstanceId;
+  player.pendingDefeatInterrupt = null;
+  checkMagiDefeats(state, cardDb, rng);
+}
+function previewDiscardOfPreventionOffers(state, cardDb, actingPlayerId) {
+  const preventers = [];
+  for (const [playerId, player] of state.players) {
+    if (playerId === actingPlayerId) continue;
+    const contributors = player.activeMagi ? [...player.inPlay, player.activeMagi] : player.inPlay;
+    for (const contributor of contributors) {
+      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+        if (contributorEffect.offersDiscardOfPrevention?.(state, cardDb, contributor)) {
+          preventers.push(contributor);
+          break;
+        }
+      }
+    }
+  }
+  return preventers;
+}
+
+// src/spiritSpells.ts
+function isSpiritSpell(def) {
+  return !!def && def.card_type === "Spell" && /only play one spirit spell per magi defeated/i.test(def.text ?? "");
+}
+function hasOpenSpiritSpellWindow(state, playerId, def) {
+  if (!isSpiritSpell(def)) return false;
+  const pending = state.players.get(playerId)?.pendingSpiritSpellRegions ?? [];
+  return def.regions.some((region) => pending.includes(region));
+}
+function closeSpiritSpellWindow(state, playerId) {
+  const player = state.players.get(playerId);
+  if (player) player.pendingSpiritSpellRegions = [];
+}
+function hasOpenDefeatInterruptWindow(state, playerId, def) {
+  if (def?.name !== "Spirit of Rayje") return false;
+  const player = state.players.get(playerId);
+  return !!player?.pendingDefeatInterrupt && player.spiritOfRayjeUsesRemaining > 0;
+}
+
+// src/energizeModifiers.ts
+function addEnergizeModifier(instance, amount, options) {
+  instance.energizeModifiers.push({
+    amount,
+    expiresAfterTurnNumber: options?.expiresAfterTurnNumber,
+    oneShot: options?.oneShot,
+    isGrant: options?.isGrant
+  });
+}
+function isEnergizeModifierActive(state, mod) {
+  if (mod.expiresAfterTurnNumber !== void 0 && state.turnNumber > mod.expiresAfterTurnNumber) {
+    return false;
+  }
+  return true;
+}
+function activeEnergizeModifiers(state, instance) {
+  return instance.energizeModifiers.filter((mod) => isEnergizeModifierActive(state, mod));
+}
+function consumeOneShotEnergizeModifiers(instance) {
+  instance.energizeModifiers = instance.energizeModifiers.filter((mod) => !mod.oneShot);
+}
+
+// src/regions.ts
+var UNIVERSAL = "Universal";
+var CORE = "Core";
+var ALL_REGIONS = ["Arderial", "Bograth", "Cald", "Core", "d'Resh", "Kybar's Teeth", "Naroom", "Nar", "Orothe", "Paradwyn", "Underneath", "Universal", "Weave"];
+function effectiveMagiDef(magiDef, magiInstance) {
+  const shadowOverride = magiInstance.magiIdentityOverride;
+  if (shadowOverride) {
+    return { ...magiDef, regions: [CORE], original_region: shadowOverride.asShadowOfOriginalRegion };
+  }
+  const regionOverride = magiInstance.effectiveRegionOverride;
+  if (regionOverride) {
+    return { ...magiDef, regions: [regionOverride.region] };
+  }
+  return magiDef;
+}
+function isUniversal(regions) {
+  return regions.includes(UNIVERSAL);
+}
+function isCoreRegion(regions) {
+  return regions.includes(CORE);
+}
+function regionsOverlap(a, b) {
+  return a.some((r) => b.includes(r));
+}
+function parseRegionList(value) {
+  if (!value) return [];
+  return value.split(",").map((r) => r.trim()).filter((r) => r.length > 0);
+}
+function qualifiesForShadowPlayGrant(magi, card, magiIsShadow) {
+  const grantRegions = parseRegionList(card.shadow_play);
+  if (grantRegions.length === 0) return false;
+  if (magiIsShadow) {
+    return magi.original_region !== null && grantRegions.includes(magi.original_region);
+  }
+  if (isCoreRegion(card.regions)) {
+    return regionsOverlap(magi.regions, grantRegions);
+  }
+  if (grantRegions.includes(CORE) && isCoreRegion(magi.regions)) {
+    return true;
+  }
+  return false;
+}
+function isExemptFromRestriction(magi, card, magiIsShadow) {
+  const anyShadowMagiOnly = card.shadow_play === null && isCoreRegion(card.regions);
+  if (anyShadowMagiOnly) {
+    return magiIsShadow;
+  }
+  const parsedShadowPlay = parseRegionList(card.shadow_play);
+  const restrictedRegions = parsedShadowPlay.length > 0 ? parsedShadowPlay : card.regions;
+  if (magiIsShadow) {
+    if (restrictedRegions.includes(CORE)) {
+      return true;
+    }
+    return magi.original_region !== null && restrictedRegions.includes(magi.original_region);
+  }
+  return regionsOverlap(magi.regions, restrictedRegions);
+}
+function checkRegionLegality(magi, card, effectiveCardRegions, originalRegionPlayPenaltyOverride) {
+  const magiRegions2 = magi.regions;
+  const cardRegions = effectiveCardRegions ?? card.regions;
+  const magiIsCoreOrShadow = isCoreRegion(magiRegions2);
+  const magiIsShadow = magiIsCoreOrShadow && magi.original_region !== null;
+  const isRelic2 = card.card_type === "Relic";
+  if (card.shadow_magi_excluded && magiIsShadow) {
+    return { legal: false, reason: `${magi.name} is a Shadow Magi and cannot play ${card.name}` };
+  }
+  let tier;
+  let reason = "";
+  if (isUniversal(cardRegions)) {
+    tier = 2;
+  } else if (magiIsCoreOrShadow) {
+    if (isCoreRegion(cardRegions) || regionsOverlap(magiRegions2, cardRegions)) {
+      tier = 2;
+    } else {
+      tier = 0;
+      reason = `${magi.name} is a ${magiIsShadow ? "Shadow" : "Core"} Magi and cannot play ${card.name}`;
+    }
+  } else {
+    const sharesRegion = regionsOverlap(magiRegions2, cardRegions);
+    if (isCoreRegion(cardRegions) && !sharesRegion) {
+      tier = 0;
+      reason = `${magi.name} is not a Core Magi and cannot play the Core card ${card.name}`;
+    } else if (isRelic2) {
+      tier = sharesRegion ? 2 : 0;
+      if (!sharesRegion) {
+        reason = `${card.name} does not share a region with ${magi.name}, and Relics have no off-region penalty option`;
+      }
+    } else {
+      tier = sharesRegion ? 2 : 1;
+    }
+  }
+  if (tier < 2 && qualifiesForShadowPlayGrant(magi, card, magiIsShadow)) {
+    tier = isRelic2 ? 2 : tier + 1;
+    reason = "";
+  }
+  if (card.region_restrictive && !isExemptFromRestriction(magi, card, magiIsShadow)) {
+    tier = 0;
+    reason = `Only ${card.shadow_play ?? "Shadow"} Magi can play ${card.name}`;
+  }
+  if (tier === 0 && originalRegionPlayPenaltyOverride !== void 0 && magiIsShadow && !isRelic2 && !card.region_restrictive && magi.original_region !== null && cardRegions.includes(magi.original_region)) {
+    return { legal: true, regionalPenalty: originalRegionPlayPenaltyOverride };
+  }
+  if (tier === 0) {
+    return { legal: false, reason: reason || `${magi.name} cannot play ${card.name}` };
+  }
+  return { legal: true, regionalPenalty: tier === 1 ? 1 : 0 };
+}
+var TEXT_LOCKED_CARD_NAMES = /* @__PURE__ */ new Set([
+  "Renegade Epik",
+  "Creeping Ainjer",
+  "Jakla Prowler",
+  "Slinking Greal",
+  "Olum Fiend",
+  "Crouching Xamf",
+  "Rask Deserter",
+  "Sneaky Weebo",
+  "Malevolent Corf",
+  "Lurking Minani",
+  "Venomous Korrit",
+  "Scurrying Weggit"
+]);
+function hasImmutableText(cardName) {
+  return TEXT_LOCKED_CARD_NAMES.has(cardName);
+}
+
+// src/costBreakdown.ts
+function noteAdjustment(into, label, delta) {
+  if (delta !== 0) into.push({ label, delta });
+}
+function frozenByLabel(state, cardDb, instance) {
+  if (hasDurationTag(instance, FROZEN) || instance.tags.has(FROZEN)) return "Frozen";
+  for (const player of state.players.values()) {
+    const contributors = player.activeMagi ? [player.activeMagi, ...player.inPlay] : [...player.inPlay];
+    for (const contributor of contributors) {
+      for (const { effect, sourceName } of effectsWithSourceFor(state, cardDb, contributor)) {
+        if (effect.grantsFrozenTo?.(state, cardDb, contributor, instance)) {
+          return `Frozen by ${sourceName}`;
+        }
+      }
+    }
+  }
+  return null;
+}
+function formatCostBreakdown(breakdown) {
+  if (breakdown.adjustments.length === 0) return String(breakdown.total);
+  const parts = breakdown.adjustments.map((a) => `${a.delta > 0 ? "+" : ""}${a.delta} ${a.label}`);
+  return `${breakdown.printed} (${parts.join(", ")}) = ${breakdown.total}`;
 }
 
 // src/copiedPowers.ts
@@ -2396,6 +4623,17 @@ function isLegalPowerUse(state, cardDb, playerId, sourceInstanceId, powerName, o
   if (!canAfford) {
     return { legal: false, reason: `Not enough energy: need ${cost}, have ${available}`, breakdown };
   }
+  if (options.chosenSlotIds === void 0 && dispatchEffect?.powerTargetSlots) {
+    const slots = dispatchEffect.powerTargetSlots(state, cardDb, playerId, powerName, source.instanceId);
+    if (slots.length > 0) {
+      const slot0 = slots[0];
+      const slot0Pool = slot0.pool(state, cardDb, playerId, [], source.instanceId);
+      const slot0Min = resolveSlotBound(slot0.min, []);
+      if (slot0Pool.length < slot0Min) {
+        return { legal: false, reason: `No legal target for "${powerName}"` };
+      }
+    }
+  }
   return {
     legal: true,
     cost,
@@ -2553,7 +4791,7 @@ function previewOpponentHandPickOffer(state, cardDb, playerId, sourceInstanceId,
     const decl = effect.opponentHandDiscardChoice;
     const pool3 = withRegionSwap(state, options.regionSwap, () => owner.hand.filter((c2) => !decl.filter || decl.filter(state, cardDb, playerId, c2)));
     if (pool3.length === 0) return void 0;
-    return { kind: "opponentHandDiscardChoice", pool: pool3, maxCount: decl.maxCount, owedToPlayerId: owner.playerId, handOwnerPlayerId: owner.playerId };
+    return { kind: "opponentHandDiscardChoice", pool: pool3, minCount: 0, maxCount: decl.maxCount, owedToPlayerId: owner.playerId, handOwnerPlayerId: owner.playerId };
   }
   if (effect.chooseFromOpponentHand && options.chosenFromOpponentHandIds === void 0) {
     const decl = effect.chooseFromOpponentHand;
@@ -2561,7 +4799,7 @@ function previewOpponentHandPickOffer(state, cardDb, playerId, sourceInstanceId,
     if (!owner) return void 0;
     const pool3 = withRegionSwap(state, options.regionSwap, () => owner.hand.filter((c2) => !decl.filter || decl.filter(state, cardDb, playerId, c2)));
     if (pool3.length === 0) return void 0;
-    return { kind: "chooseFromOpponentHand", pool: pool3, maxCount: decl.maxCount, owedToPlayerId: playerId, handOwnerPlayerId: owner.playerId };
+    return { kind: "chooseFromOpponentHand", pool: pool3, minCount: decl.minCount ?? 0, maxCount: decl.maxCount, owedToPlayerId: playerId, handOwnerPlayerId: owner.playerId };
   }
   return void 0;
 }
@@ -2956,7 +5194,9 @@ function usePower(state, cardDb, playerId, sourceInstanceId, powerName, hooks = 
     // Vault of Knowledge Key's Archive (Bucket D Batch C part 2, 2026-08-14) -- pre-collected
     // pre-Power answer, threaded through `state.currentAction` so `effects.ts#discardFromPlay`'s
     // intercept sees it. Same save-then-restore lifetime as the rest of `state.currentAction`.
-    ...options.archiveRedirect !== void 0 ? { archiveRedirect: options.archiveRedirect } : {}
+    ...options.archiveRedirect !== void 0 ? { archiveRedirect: options.archiveRedirect } : {},
+    ...options.energyLossRedirect !== void 0 ? { energyLossRedirect: options.energyLossRedirect } : {},
+    ...options.discardOfPrevention !== void 0 ? { discardOfPrevention: options.discardOfPrevention } : {}
   };
   const targetOwnerId = ctx.chosenTargetId ? findCreatureOrMagiById(state, ctx.chosenTargetId)?.controllerId : void 0;
   const targetPlayer = targetOwnerId && targetOwnerId !== playerId ? state.players.get(targetOwnerId) : void 0;
@@ -3224,2016 +5464,6 @@ function usePower(state, cardDb, playerId, sourceInstanceId, powerName, hooks = 
   state.activeRegionSwap = previousActiveRegionSwap;
 }
 
-// src/rollConsumers.ts
-var consumers = /* @__PURE__ */ new Map();
-function registerRollConsumer(key, fn) {
-  consumers.set(key, fn);
-}
-function getRollConsumer(key) {
-  return consumers.get(key);
-}
-
-// src/effects.ts
-var searingTouchDefKeyCache = null;
-function findSearingTouchDefKey(cardDb) {
-  if (searingTouchDefKeyCache !== null) return searingTouchDefKeyCache;
-  for (const [key, def] of cardDb) {
-    if (def.name === "Searing Touch") {
-      searingTouchDefKeyCache = key;
-      return key;
-    }
-  }
-  searingTouchDefKeyCache = void 0;
-  return void 0;
-}
-function ownControllerEnergyChangeLocked(state, cardDb, instance, actor) {
-  if (actor !== instance.controllerId) return false;
-  for (const effect of effectsFor(state, cardDb, instance)) {
-    if (effect.locksOwnControllerEnergyChange?.(state, cardDb, instance)) return true;
-  }
-  return false;
-}
-function blockedByAttachedProtection(state, cardDb, instance) {
-  for (const attached of instance.attachedCards) {
-    for (const attachedEffect of effectsFor(state, cardDb, attached)) {
-      if (attachedEffect.blocksEnergyChangeFromSource?.(state, cardDb, instance, attached)) return true;
-    }
-  }
-  return false;
-}
-function blockedByElementalShield(state, instance, actor) {
-  const shields = state.players.get(instance.controllerId)?.elementalShields;
-  if (!shields || shields.length === 0) return false;
-  if (actor === void 0) return false;
-  const actingMagiId = state.players.get(actor)?.activeMagi?.instanceId;
-  if (actingMagiId === void 0) return false;
-  return shields.some((s) => s.magiInstanceId === actingMagiId && s.untilTurn >= state.turnNumber);
-}
-function consumeIntensifyIfUsed(state) {
-  if (state.pendingIntensify?.used) state.pendingIntensify = null;
-}
-function addEnergy(state, cardDb, instance, amount, cause = "power", causedByPlayerId, rng = defaultRng) {
-  if (amount < 0) throw new Error("addEnergy amount must be non-negative");
-  if (hasDurationTag(instance, NO_ENERGY_GAIN)) return;
-  const actor = causedByPlayerId ?? state.currentAction?.actorPlayerId ?? state.activePlayerId;
-  if (ownControllerEnergyChangeLocked(state, cardDb, instance, actor)) return;
-  if (instance.controllerId !== actor) {
-    for (const reverseEffect of effectsFor(state, cardDb, instance)) {
-      if (reverseEffect.reversesOpposingEnergyChange?.(state, cardDb, instance)) {
-        const applied = Math.min(instance.currentEnergy ?? 0, amount);
-        instance.currentEnergy = (instance.currentEnergy ?? 0) - applied;
-        logEvent(state, "effectDiscardEnergy", { instanceId: instance.instanceId, amount: applied });
-        checkCreatureDefeats(state, cardDb, void 0, void 0, rng);
-        return;
-      }
-    }
-  }
-  if (cause === "power" && instance.controllerId !== actor) {
-    const owner = state.players.get(actor);
-    if (owner) {
-      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
-      for (const contributor of contributors) {
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          if (contributorEffect.substitutesEnergyGainForLoss?.(state, cardDb, instance, amount, actor, contributor)) {
-            return;
-          }
-        }
-      }
-    }
-  }
-  if (instance.controllerId === actor) {
-    const owner = state.players.get(instance.controllerId);
-    if (owner) {
-      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
-      for (const contributor of contributors) {
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          if (contributorEffect.blocksOwnCausedEnergyGainTo?.(state, cardDb, contributor, instance)) {
-            return;
-          }
-        }
-      }
-    }
-  }
-  if (cause === "power" && state.currentAction?.sourceInstanceId !== void 0) {
-    const sourceInstanceId = state.currentAction.sourceInstanceId;
-    const sourceDef = state.currentAction.sourceDefinitionKey !== void 0 ? cardDb.get(state.currentAction.sourceDefinitionKey) : void 0;
-    const targetIsOtherCreature = instance.instanceId !== sourceInstanceId && cardDb.get(instance.definitionKey)?.card_type === "Creature";
-    if (sourceDef?.card_type === "Creature" && targetIsOtherCreature) {
-      const actingPlayer = state.players.get(actor);
-      if (actingPlayer) {
-        const contributors = actingPlayer.activeMagi ? [actingPlayer.activeMagi, ...actingPlayer.inPlay] : [...actingPlayer.inPlay];
-        for (const contributor of contributors) {
-          for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-            if (contributorEffect.blocksOwnCreaturePowersFromEnergizingOtherCreatures?.(state, cardDb, contributor)) {
-              return;
-            }
-          }
-        }
-      }
-    }
-  }
-  let actualAmount = amount;
-  if (cause === "effect" && actualAmount > 0) {
-    for (const p of state.players.values()) {
-      const contributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
-      for (const contributor of contributors) {
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          const reduction = contributorEffect.reducesEnergyGainFrom?.(state, cardDb, instance, contributor);
-          if (reduction) actualAmount = Math.max(0, actualAmount - reduction);
-        }
-      }
-    }
-  }
-  if (cause === "power" && actualAmount > 0) {
-    for (const p of state.players.values()) {
-      const contributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
-      for (const contributor of contributors) {
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          const increase = contributorEffect.increasesEnergyGainFrom?.(state, cardDb, instance, contributor);
-          if (increase) actualAmount += increase;
-        }
-      }
-    }
-  }
-  if (cause === "effect" && actualAmount > 0 && instance.controllerId !== actor && grantsEffectImmunity(state, cardDb, instance)) {
-    actualAmount = 0;
-  }
-  if (actualAmount > 0 && blockedByElementalShield(state, instance, actor)) {
-    actualAmount = 0;
-  }
-  if ((cause === "power" || cause === "spell") && actualAmount > 0) {
-    if (blockedByShadowCloakProtection(state, cardDb, instance) || blockedByFirdStoneProtection(instance) || blockedByThreeLeafCloverProtection(instance) || blockedByAttachedProtection(state, cardDb, instance)) {
-      actualAmount = 0;
-    } else {
-      for (const selfEffect of effectsFor(state, cardDb, instance)) {
-        if (selfEffect.blocksPowerEffectBySourceRegion?.(state, cardDb, instance)) {
-          actualAmount = 0;
-          break;
-        }
-      }
-    }
-  }
-  if (cause === "spell" && actualAmount > 0) {
-    const owner = state.players.get(instance.controllerId);
-    if (owner) {
-      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
-      outer: for (const contributor of contributors) {
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          if (contributorEffect.grantsNonCaldSpellImmunityTo?.(state, cardDb, contributor, instance)) {
-            actualAmount = 0;
-            break outer;
-          }
-        }
-      }
-    }
-  }
-  if (cause === "spell" && actualAmount > 0 && instance.controllerId !== actor) {
-    const owner = state.players.get(instance.controllerId);
-    if (owner) {
-      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
-      outer: for (const contributor of contributors) {
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          if (contributorEffect.grantsOpposingSpellImmunityTo?.(state, cardDb, contributor, instance)) {
-            actualAmount = 0;
-            break outer;
-          }
-        }
-      }
-    }
-  }
-  if ((cause === "spell" || cause === "power") && actualAmount > 0 && instance.controllerId !== actor && protectionTagActive(state, cardDb, instance, SHELL_PROTECTED, "energyLoss")) {
-    actualAmount = 0;
-  }
-  if (cause === "spell" && actualAmount > 0) {
-    const owner = state.players.get(instance.controllerId);
-    if (owner) {
-      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
-      outer: for (const contributor of contributors) {
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          const multiplier = contributorEffect.multipliesOwnSpellCausedEnergyGainTo?.(state, cardDb, contributor, instance);
-          if (multiplier !== void 0) {
-            actualAmount *= multiplier;
-            break outer;
-          }
-        }
-      }
-    }
-  }
-  instance.currentEnergy = (instance.currentEnergy ?? 0) + actualAmount;
-  outer: for (const p of state.players.values()) {
-    const contributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
-    for (const contributor of contributors) {
-      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-        if (contributorEffect.capsEnergyGainAt?.(state, cardDb, instance, contributor)) {
-          const cap = effectiveStartingEnergy(state, cardDb, instance);
-          if ((instance.currentEnergy ?? 0) > cap) instance.currentEnergy = cap;
-          break outer;
-        }
-      }
-    }
-  }
-  logEvent(state, "effectAddEnergy", { instanceId: instance.instanceId, amount: actualAmount });
-  checkCreatureDefeats(state, cardDb, void 0, void 0, rng);
-  broadcastMagiEnergyGainOutsideEnergize(state, cardDb, instance, actualAmount);
-  if (cause === "effect" && actualAmount > 0) {
-    for (const gainedEffect of effectsFor(state, cardDb, instance)) {
-      gainedEffect.onEffectEnergyAdded?.(state, cardDb, instance, actualAmount);
-    }
-  }
-  if (actualAmount > 0) discardIfTopHeavy(state, cardDb, instance);
-}
-function discardIfTopHeavy(state, cardDb, instance, rng) {
-  if (!instance.attachedCards.some((c2) => cardDb.get(c2.definitionKey)?.name === "Top Heavy")) return;
-  const owner = state.players.get(instance.controllerId);
-  if (owner) discardFromPlay(state, cardDb, owner, instance.instanceId, void 0, "effect", rng);
-}
-function printsShifty(cardDb, instance) {
-  return cardDb.get(instance.definitionKey)?.effects?.some((e) => e.name === "Shifty") ?? false;
-}
-function printsSuperInvulnerability(cardDb, instance) {
-  return cardDb.get(instance.definitionKey)?.effects?.some((e) => e.name === "Super Invulnerability") ?? false;
-}
-function grantsEffectImmunity(state, cardDb, instance) {
-  const owner = state.players.get(instance.controllerId);
-  if (!owner) return false;
-  const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
-  for (const contributor of contributors) {
-    for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-      if (contributorEffect.grantsEffectImmunityTo?.(state, cardDb, contributor, instance)) return true;
-    }
-  }
-  return false;
-}
-function discardEnergy(state, cardDb, instance, amount, cause = "power", causedByPlayerId, rng) {
-  if (amount < 0) throw new Error("discardEnergy amount must be non-negative");
-  const actor = causedByPlayerId ?? state.currentAction?.actorPlayerId ?? state.activePlayerId;
-  if (ownControllerEnergyChangeLocked(state, cardDb, instance, actor)) return;
-  if (instance.controllerId !== actor) {
-    for (const reverseEffect of effectsFor(state, cardDb, instance)) {
-      if (reverseEffect.reversesOpposingEnergyChange?.(state, cardDb, instance)) {
-        instance.currentEnergy = (instance.currentEnergy ?? 0) + amount;
-        logEvent(state, "effectAddEnergy", { instanceId: instance.instanceId, amount });
-        checkCreatureDefeats(state, cardDb, void 0, void 0, rng);
-        broadcastMagiEnergyGainOutsideEnergize(state, cardDb, instance, amount);
-        return;
-      }
-    }
-  }
-  if (cause === "power" && instance.controllerId === actor) {
-    const owner = state.players.get(instance.controllerId);
-    if (owner) {
-      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
-      for (const contributor of contributors) {
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          if (contributorEffect.substitutesEnergyLossForGain?.(state, cardDb, instance, amount, actor, contributor)) {
-            return;
-          }
-        }
-      }
-    }
-  }
-  let actualAmount = amount;
-  if (state.pendingIntensify !== null && (cause === "power" || cause === "spell") && cardDb.get(instance.definitionKey)?.card_type === "Magi") {
-    actualAmount = amount * 2;
-    state.pendingIntensify.used = true;
-  }
-  if (instance.controllerId !== actor && cardDb.get(instance.definitionKey)?.card_type === "Magi") {
-    const actingPlayer = state.players.get(actor);
-    const contributors = actingPlayer?.activeMagi ? [actingPlayer.activeMagi, ...actingPlayer.inPlay] : actingPlayer?.inPlay ?? [];
-    outer: for (const contributor of contributors) {
-      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-        if (contributorEffect.blocksOwnEnergyLossToOpposingMagi?.(state, cardDb, contributor)) {
-          actualAmount = 0;
-          break outer;
-        }
-      }
-    }
-  }
-  if (actualAmount > 0 && blockedByElementalShield(state, instance, actor)) {
-    actualAmount = 0;
-  }
-  if (actualAmount > 0 && (cause === "power" || cause === "spell")) {
-    if (blockedByShadowCloakProtection(state, cardDb, instance) || blockedByFirdStoneProtection(instance) || blockedByThreeLeafCloverProtection(instance) || blockedByAttachedProtection(state, cardDb, instance)) {
-      actualAmount = 0;
-    } else {
-      for (const selfEffect of effectsFor(state, cardDb, instance)) {
-        if (selfEffect.blocksPowerEffectBySourceRegion?.(state, cardDb, instance)) {
-          actualAmount = 0;
-          break;
-        }
-      }
-    }
-  }
-  if (actualAmount > 0 && cause === "spell") {
-    const owner = state.players.get(instance.controllerId);
-    if (owner) {
-      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
-      outer: for (const contributor of contributors) {
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          if (contributorEffect.grantsNonCaldSpellImmunityTo?.(state, cardDb, contributor, instance)) {
-            actualAmount = 0;
-            break outer;
-          }
-        }
-      }
-    }
-  }
-  if (actualAmount > 0 && cause === "spell" && instance.controllerId !== actor) {
-    const owner = state.players.get(instance.controllerId);
-    if (owner) {
-      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
-      outer: for (const contributor of contributors) {
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          if (contributorEffect.grantsOpposingSpellImmunityTo?.(state, cardDb, contributor, instance)) {
-            actualAmount = 0;
-            break outer;
-          }
-        }
-      }
-    }
-  }
-  if ((cause === "spell" || cause === "power") && actualAmount > 0 && instance.controllerId !== actor && protectionTagActive(state, cardDb, instance, SHELL_PROTECTED, "energyLoss")) {
-    actualAmount = 0;
-  }
-  if (actualAmount === 0) {
-  } else if (isEnergyLossReductionBlocked(state, cardDb, { scope: "general", instance, cause })) {
-  } else if (cause === "effect" && state.phase === "attack" && printsSuperInvulnerability(cardDb, instance)) {
-    actualAmount = 0;
-  } else if (instance.controllerId !== actor) {
-    if (tryConsumeFirstOpposingLossShield(state, cardDb, instance)) {
-      actualAmount = 0;
-    } else if (cause === "effect" && printsShifty(cardDb, instance)) {
-      actualAmount = 0;
-    } else if (cause === "effect" && grantsEffectImmunity(state, cardDb, instance)) {
-      actualAmount = 0;
-    } else if ((cause === "power" || cause === "spell") && (state.players.get(instance.controllerId)?.oasisEnergyImmunityUntilTurn ?? -1) >= state.turnNumber) {
-      actualAmount = 0;
-    } else if ((cause === "power" || cause === "spell") && hasDurationTag(instance, NO_ENERGY_LOST_FROM_OPPOSING_POWER)) {
-      actualAmount = 0;
-    } else {
-      if (cause === "power" || cause === "spell") {
-        actualAmount = burrowCappedLoss(state, cardDb, instance, actualAmount);
-      }
-      for (const effect of effectsFor(state, cardDb, instance)) {
-        const cap = effect.opposingEnergyLossCap?.(state, cardDb, instance);
-        if (cap !== void 0) actualAmount = Math.min(actualAmount, cap);
-        const reduction = effect.opposingEnergyLossReduction?.(state, cardDb, instance);
-        if (reduction !== void 0) actualAmount = Math.max(0, actualAmount - reduction);
-      }
-      if (instance.grantedEnergyLossReduction) {
-        actualAmount = Math.max(0, actualAmount - instance.grantedEnergyLossReduction);
-      }
-      const owner = state.players.get(instance.controllerId);
-      if (owner) {
-        const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
-        for (const contributor of contributors) {
-          if (isProtectionSuppressed(state, cardDb, instance, contributor, "energyLoss")) continue;
-          for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-            const grantedReduction = contributorEffect.grantsOpposingEnergyLossReductionTo?.(state, cardDb, contributor, instance, cause);
-            if (grantedReduction !== void 0) actualAmount = Math.max(0, actualAmount - grantedReduction);
-          }
-        }
-      }
-      if ((cause === "power" || cause === "spell") && owner) {
-        const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
-        for (const contributor of contributors) {
-          for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-            const floor = contributorEffect.grantsEnergyFloorTo?.(state, cardDb, contributor, instance);
-            if (floor !== void 0) {
-              const resultingEnergy = (instance.currentEnergy ?? 0) - actualAmount;
-              if (resultingEnergy < floor) {
-                actualAmount = Math.max(0, (instance.currentEnergy ?? 0) - floor);
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  let target = instance;
-  if ((cause === "power" || cause === "spell") && instance.controllerId !== actor) {
-    const owner = state.players.get(instance.controllerId);
-    if (owner) {
-      outer: for (const contributor of owner.inPlay) {
-        if (contributor.instanceId === instance.instanceId) continue;
-        if (isProtectionSuppressed(state, cardDb, instance, contributor, "energyLoss")) continue;
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          if (contributorEffect.redirectsEnergyLossFrom?.(state, cardDb, instance, contributor)) {
-            target = contributor;
-            break outer;
-          }
-        }
-      }
-    }
-  }
-  if (instance.controllerId !== actor && actualAmount > 0 && target.instanceId === instance.instanceId) {
-    const owner = state.players.get(instance.controllerId);
-    if (owner) {
-      outer: for (const contributor of owner.inPlay) {
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          const redirected = contributorEffect.redirectsEnergyLossToOpponent?.(state, cardDb, instance, contributor, rng);
-          if (redirected) {
-            target = redirected;
-            break outer;
-          }
-        }
-      }
-    }
-  }
-  if ((cause === "power" || cause === "spell") && actualAmount > 0 && hasDurationTag(target, CONDEMNED)) {
-    actualAmount += 3;
-  }
-  if (actualAmount > 0 && target.attachedCards.length > 0) {
-    for (const attached of target.attachedCards) {
-      for (const attachedEffect of effectsFor(state, cardDb, attached)) {
-        const amplification = attachedEffect.amplifiesOwnEnergyLoss?.(state, cardDb, target);
-        if (amplification) actualAmount += amplification;
-      }
-    }
-  }
-  target.currentEnergy = Math.max(0, (target.currentEnergy ?? 0) - actualAmount);
-  if (target.controllerId !== actor && actualAmount > 0 && cardDb.get(target.definitionKey)?.card_type === "Magi") {
-    const owner = state.players.get(target.controllerId);
-    if (owner) {
-      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
-      for (const contributor of contributors) {
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          contributorEffect.onOwnMagiLostEnergyFromOpposingCard?.(state, cardDb, contributor, target, actualAmount, rng);
-        }
-      }
-    }
-  }
-  if (target.controllerId !== actor && actualAmount > 0 && cardDb.get(target.definitionKey)?.card_type === "Creature") {
-    const owner = state.players.get(target.controllerId);
-    if (owner) {
-      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
-      for (const contributor of contributors) {
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          contributorEffect.onOwnCreatureLostEnergy?.(state, cardDb, contributor, target, actualAmount, rng);
-        }
-      }
-    }
-  }
-  logEvent(state, "effectDiscardEnergy", { instanceId: target.instanceId, amount: actualAmount });
-  checkCreatureDefeats(state, cardDb, cause, void 0, rng);
-  if (actualAmount > 0) discardIfTopHeavy(state, cardDb, target, rng);
-}
-function rearrangeEnergy(state, cardDb, from, to, amount, rng) {
-  if (amount < 0) throw new Error("rearrangeEnergy amount must be non-negative");
-  const rearrangeActor = state.currentAction?.actorPlayerId ?? state.activePlayerId;
-  if (ownControllerEnergyChangeLocked(state, cardDb, from, rearrangeActor) || ownControllerEnergyChangeLocked(state, cardDb, to, rearrangeActor)) return;
-  if (to.controllerId === rearrangeActor) {
-    const owner = state.players.get(to.controllerId);
-    if (owner) {
-      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
-      for (const contributor of contributors) {
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          if (contributorEffect.blocksOwnCausedEnergyGainTo?.(state, cardDb, contributor, to)) return;
-        }
-      }
-    }
-  }
-  if (from.controllerId === to.controllerId && cardDb.get(from.definitionKey)?.card_type === "Creature" && cardDb.get(to.definitionKey)?.card_type === "Creature") {
-    const owner = state.players.get(to.controllerId);
-    if (owner) {
-      const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
-      outer: for (const contributor of contributors) {
-        if (contributor.instanceId === from.instanceId || contributor.instanceId === to.instanceId) continue;
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          if (contributorEffect.redirectsRearrangeEnergyTo?.(state, cardDb, from, to, contributor)) {
-            to = contributor;
-            break outer;
-          }
-        }
-      }
-    }
-  }
-  const available = from.currentEnergy ?? 0;
-  const moved = Math.min(available, amount);
-  from.currentEnergy = available - moved;
-  to.currentEnergy = (to.currentEnergy ?? 0) + moved;
-  logEvent(state, "effectRearrangeEnergy", {
-    fromInstanceId: from.instanceId,
-    toInstanceId: to.instanceId,
-    amount: moved
-  });
-  checkCreatureDefeats(state, cardDb, void 0, void 0, rng);
-  broadcastMagiEnergyGainOutsideEnergize(state, cardDb, to, moved);
-  checkMagiDefeats(state, cardDb, rng);
-}
-function broadcastMagiEnergyGainOutsideEnergize(state, cardDb, magi, amount) {
-  if (amount <= 0) return;
-  const owner = state.players.get(magi.controllerId);
-  if (!owner || owner.activeMagi?.instanceId !== magi.instanceId) return;
-  if (state.phase === "energize" && state.activePlayerId === magi.controllerId) return;
-  for (const p of state.players.values()) {
-    const reactors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
-    for (const reactor of reactors) {
-      for (const effect of effectsFor(state, cardDb, reactor)) {
-        effect.onMagiGainedEnergyOutsideOwnEnergizeStep?.(state, cardDb, magi, reactor, amount);
-      }
-    }
-  }
-}
-function restoreEnergy(state, cardDb, instance, targetEnergy) {
-  const before = instance.currentEnergy ?? 0;
-  instance.currentEnergy = Math.max(0, targetEnergy);
-  logEvent(state, "effectRestoreEnergy", { instanceId: instance.instanceId, newTotal: instance.currentEnergy });
-  broadcastMagiEnergyGainOutsideEnergize(state, cardDb, instance, instance.currentEnergy - before);
-  checkCreatureDefeats(state, cardDb);
-}
-function applyReactiveDreamwarp(state, cardDb, target, chosenEnergy) {
-  target.currentEnergy = chosenEnergy;
-  target.startingEnergyOverride = { value: chosenEnergy, expiresAfterTurnNumber: state.turnNumber };
-  logEvent(state, "effectReactiveDreamwarp", { instanceId: target.instanceId, newTotal: chosenEnergy });
-  checkCreatureDefeats(state, cardDb);
-}
-function drawCards(state, cardDb, player, count) {
-  if (player.cannotDrawThisTurn) return [];
-  const drawn = drawCardsRaw(player, count);
-  logEvent(state, "effectDrewCards", { playerId: player.playerId, count: drawn.length });
-  for (let i = 0; i < drawn.length; i += 1) {
-    for (const p of state.players.values()) {
-      const inPlayContributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
-      for (const contributor of inPlayContributors) {
-        for (const effect of effectsFor(state, cardDb, contributor)) {
-          effect.onAnyCardDrawn?.(state, cardDb, contributor, player.playerId, drawn[i]);
-        }
-        for (const attached of activeAttachedCards(cardDb, contributor)) {
-          for (const attachedEffect of effectsFor(state, cardDb, attached)) {
-            attachedEffect.onAnyCardDrawn?.(state, cardDb, attached, player.playerId, drawn[i]);
-          }
-        }
-      }
-      for (const handCard of p.hand) {
-        for (const effect of effectsFor(state, cardDb, handCard)) {
-          effect.onAnyCardDrawnWhileInHand?.(state, cardDb, handCard, player.playerId, drawn[i]);
-        }
-      }
-    }
-  }
-  if (state.phase === "draw") {
-    for (const drawnCard of drawn) {
-      for (const effect of effectsFor(state, cardDb, drawnCard)) {
-        effect.onSelfDrawnDuringDrawStep?.(state, cardDb, drawnCard);
-      }
-    }
-  }
-  return drawn;
-}
-function revealHandToAll(state, cardDb, revealedPlayerId, sourceInstanceId) {
-  const player = getPlayer(state, revealedPlayerId);
-  const cards = player.hand.map((c2) => ({ instanceId: c2.instanceId, definitionKey: c2.definitionKey }));
-  logEvent(state, "handRevealed", { revealedPlayerId, sourceInstanceId, cards });
-}
-function riptideBanActiveFor(state, playerId) {
-  const player = state.players.get(playerId);
-  if (!player || player.riptideBanExpiresAfterTurnNumber === null) return false;
-  return state.turnNumber <= player.riptideBanExpiresAfterTurnNumber;
-}
-function discardFromHand(state, cardDb, player, instanceIds2, causedByPlayerId, rng = defaultRng) {
-  const actor = causedByPlayerId ?? state.currentAction?.actorPlayerId ?? state.activePlayerId;
-  if (player.playerId !== actor) {
-    if (player.handDiscardImmuneUntilMagiDefeated) return;
-    const contributors = player.activeMagi ? [player.activeMagi, ...player.inPlay] : [...player.inPlay];
-    for (const contributor of contributors) {
-      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-        if (contributorEffect.blocksHostileHandDiscard?.(state, cardDb, contributor)) return;
-      }
-    }
-    const actingPlayer = state.players.get(actor);
-    const actorContributors = actingPlayer ? actingPlayer.activeMagi ? [actingPlayer.activeMagi, ...actingPlayer.inPlay] : [...actingPlayer.inPlay] : [];
-    for (const contributor of actorContributors) {
-      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-        if (contributorEffect.preventsOwnHostileHandDiscard?.(state, cardDb, contributor)) return;
-      }
-    }
-    for (const candidate of [...player.hand, ...player.inPlay]) {
-      for (const candidateEffect of effectsFor(state, cardDb, candidate)) {
-        if (candidateEffect.substitutesForHostileHandDiscard?.(state, cardDb, candidate)) {
-          const zone = player.hand.includes(candidate) ? "hand" : "inPlay";
-          const card = removeFromZone(player, zone, candidate.instanceId);
-          moveToDiscardPile(state, player, card);
-          player.handDiscardImmuneUntilMagiDefeated = true;
-          logEvent(state, "effectDiscardedFromHand", { playerId: player.playerId, count: 0 });
-          candidateEffect.onSubstitutedForHostileHandDiscard?.(state, cardDb, card, actor, rng);
-          return;
-        }
-      }
-    }
-  }
-  let actuallyDiscarded = 0;
-  const discardedCards = [];
-  outerDiscard: for (const id of instanceIds2) {
-    if (player.playerId !== actor) {
-      const pending = player.hand.find((c2) => c2.instanceId === id);
-      if (pending) {
-        let skipToNextId = false;
-        for (const pendingEffect of effectsFor(state, cardDb, pending)) {
-          if (pendingEffect.redirectsHostileHandDiscardToPlay?.(state, cardDb, pending)) {
-            forcePlayFromHand(state, cardDb, player, id, rng);
-            continue outerDiscard;
-          }
-          if (pendingEffect.preventsOwnDiscardFromHand?.(state, cardDb, pending)) {
-            skipToNextId = true;
-            break;
-          }
-        }
-        if (skipToNextId) continue;
-      }
-    }
-    const card = removeFromZone(player, "hand", id);
-    moveToDiscardPile(state, player, card);
-    actuallyDiscarded += 1;
-    discardedCards.push({ instanceId: card.instanceId, definitionKey: card.definitionKey });
-    if (player.playerId !== actor) {
-      for (const cardEffect of effectsFor(state, cardDb, card)) {
-        cardEffect.onOwnHandDiscardedByOpponent?.(state, cardDb, card, actor, rng);
-      }
-    }
-  }
-  logEvent(state, "effectDiscardedFromHand", { playerId: player.playerId, count: actuallyDiscarded, cards: discardedCards });
-  if (player.playerId !== actor && actuallyDiscarded > 0) {
-    const reactors = player.activeMagi ? [player.activeMagi, ...player.inPlay] : [...player.inPlay];
-    for (const reactor of reactors) {
-      for (const reactorEffect of effectsFor(state, cardDb, reactor)) {
-        reactorEffect.onForcedToDiscardFromHand?.(state, cardDb, reactor, actuallyDiscarded, rng);
-      }
-    }
-  }
-  checkHandEmptied(state, cardDb, rng);
-}
-function checkHandEmptied(state, cardDb, rng = defaultRng) {
-  for (const player of state.players.values()) {
-    if (player.hand.length !== 0) continue;
-    const candidates = player.activeMagi ? [...player.inPlay, player.activeMagi] : [...player.inPlay];
-    for (const candidate of candidates) {
-      for (const effect of effectsFor(state, cardDb, candidate)) {
-        effect.onOwnHandEmptied?.(state, cardDb, candidate, rng);
-      }
-    }
-  }
-}
-function kybarsEchoApplies(state, cardDb, owner, target) {
-  return owner.kybarsEchoUntilTurn !== null && state.turnNumber <= owner.kybarsEchoUntilTurn && cardDb.get(target.definitionKey)?.card_type === "Creature" && effectiveRegions(state, cardDb, target).includes("Kybar's Teeth");
-}
-function checkEternalVigor(state, cardDb, card, owner, actor, viaCombatDamage) {
-  if (!owner.activeMagi?.hasEternalVigor) return;
-  if (cardDb.get(card.definitionKey)?.card_type !== "Creature") return;
-  if (!effectiveRegions(state, cardDb, card).includes("Naroom")) return;
-  if (!viaCombatDamage && owner.playerId === actor) return;
-  addEnergy(state, cardDb, owner.activeMagi, 1, "effect");
-}
-function findEligibleYrichoCandidatesForDiscard(state, cardDb, owner, target) {
-  if (cardDb.get(target.definitionKey)?.card_type !== "Creature") return [];
-  const magi = owner.activeMagi;
-  if (!magi || (magi.currentEnergy ?? 0) < 1) return [];
-  const candidates = [];
-  for (const inPlayCard of owner.inPlay) {
-    if (inPlayCard.instanceId === target.instanceId) continue;
-    if (cardDb.get(inPlayCard.definitionKey)?.name !== "Yricho's Staff") continue;
-    if (isProtectionSuppressed(state, cardDb, target, inPlayCard, "specificDiscard")) continue;
-    if (isCardEffectLockedDown(state, cardDb, inPlayCard)) continue;
-    candidates.push(inPlayCard.instanceId);
-  }
-  return candidates;
-}
-function resumeDiscardFromPlay(state, cardDb, pending, rng = defaultRng) {
-  const owner = state.players.get(pending.ownerId);
-  if (!owner) return;
-  const stillInPlay = owner.inPlay.find((c2) => c2.instanceId === pending.targetInstanceId);
-  if (!stillInPlay) return;
-  discardFromPlay(
-    state,
-    cardDb,
-    owner,
-    pending.targetInstanceId,
-    pending.causedByPlayerId,
-    pending.source,
-    rng,
-    { skipPreventionChain: true }
-  );
-}
-function drainPendingDiscardQueue(state, cardDb, rng = defaultRng) {
-  while (state.pendingDiscardFromPlay === null && state.pendingDieRoll === null && state.pendingDiscardFromPlayQueue.length > 0) {
-    const next = state.pendingDiscardFromPlayQueue.shift();
-    const owner = state.players.get(next.ownerId);
-    if (!owner) continue;
-    discardFromPlay(state, cardDb, owner, next.targetInstanceId, next.causedByPlayerId, next.source, rng);
-  }
-}
-function discardFromPlay(state, cardDb, owner, instanceId, causedByPlayerId, source, rng = defaultRng, internalOptions) {
-  const target = owner.inPlay.find((c2) => c2.instanceId === instanceId);
-  if (!target) return;
-  const actor = causedByPlayerId ?? state.currentAction?.actorPlayerId ?? state.activePlayerId;
-  const resolvedSource = source ?? state.currentAction?.source;
-  const skipPrevention = internalOptions?.skipPreventionChain === true;
-  if (!skipPrevention && owner.playerId !== actor && blockedByShadowCloakFromNonCorePowerOrSpell(state, cardDb, target)) return;
-  if (!skipPrevention && owner.playerId !== actor) {
-    const def = cardDb.get(target.definitionKey);
-    for (const effect of effectsFor(state, cardDb, target)) {
-      if (effect.canBeDiscardedFromPlay?.(state, cardDb, target) === false) return;
-    }
-    if (blockedByUmmmNoProtection(target)) {
-      logEvent(state, "discardPreventedByUmmmNo", { instanceId, name: def?.name });
-      return;
-    }
-    if (blockedByThreeLeafCloverProtection(target)) {
-      logEvent(state, "discardPreventedByThreeLeafClover", { instanceId, name: def?.name });
-      return;
-    }
-    for (const p of state.players.values()) {
-      const contributors = p.activeMagi ? [...p.inPlay, p.activeMagi] : p.inPlay;
-      for (const contributor of contributors) {
-        if (contributor.instanceId === target.instanceId) continue;
-        if (isProtectionSuppressed(state, cardDb, target, contributor, "specificDiscard")) continue;
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          if (contributorEffect.preventsDiscardOf?.(state, cardDb, target, contributor, "explicit", rng)) return;
-        }
-      }
-    }
-    if (resolvedSource === "power" || resolvedSource === "spell") {
-      for (const p of state.players.values()) {
-        const contributors = p.activeMagi ? [...p.inPlay, p.activeMagi] : p.inPlay;
-        for (const contributor of contributors) {
-          if (contributor.instanceId === target.instanceId) continue;
-          if (isProtectionSuppressed(state, cardDb, target, contributor, "specificDiscard")) continue;
-          for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-            if (contributorEffect.preventsDiscardOfViaOwnCost?.(state, cardDb, target, contributor, rng)) return;
-          }
-        }
-      }
-    }
-    if (resolvedSource === "power" || resolvedSource === "spell") {
-      const yrichoCandidates = findEligibleYrichoCandidatesForDiscard(state, cardDb, owner, target);
-      if (yrichoCandidates.length > 0) {
-        if (state.pendingDiscardFromPlay === null && state.pendingDieRoll === null) {
-          state.pendingDiscardFromPlay = {
-            ownerId: owner.playerId,
-            targetInstanceId: target.instanceId,
-            causedByPlayerId: actor,
-            source: resolvedSource,
-            remainingYrichoCandidateInstanceIds: yrichoCandidates.slice(1)
-          };
-          const firstYricho = owner.inPlay.find((c2) => c2.instanceId === yrichoCandidates[0]);
-          requestDieRoll(
-            state,
-            cardDb,
-            firstYricho,
-            owner.playerId,
-            6,
-            "yrichoStaff:safe",
-            { yrichoStaffInstanceId: firstYricho.instanceId, ownerId: owner.playerId, targetInstanceId: target.instanceId },
-            rng
-          );
-          return;
-        }
-        state.pendingDiscardFromPlayQueue.push({
-          ownerId: owner.playerId,
-          targetInstanceId: target.instanceId,
-          causedByPlayerId: actor,
-          source: resolvedSource
-        });
-        return;
-      }
-    }
-  }
-  if (owner.playerId === actor && cardDb.get(target.definitionKey)?.card_type === "Relic" && state.currentAction?.sourceInstanceId === target.instanceId && state.currentAction.archiveRedirect) {
-    const redirectChoice = state.currentAction.archiveRedirect;
-    if (typeof redirectChoice === "object") {
-      const substitute = owner.inPlay.find((c2) => c2.instanceId === redirectChoice.substituteInstanceId);
-      const vault = owner.inPlay.find((c2) => cardDb.get(c2.definitionKey)?.name === "Vault of Knowledge Key");
-      const magi = owner.activeMagi;
-      const substituteValid = !!substitute && substitute.instanceId !== target.instanceId && cardDb.get(substitute.definitionKey)?.card_type === "Relic";
-      const vaultUsable = !!vault && !hasDurationTag(vault, "archiveUsedThisTurn");
-      const magiCanPay = !!magi && (magi.currentEnergy ?? 0) >= 1;
-      if (substituteValid && vaultUsable && magiCanPay) {
-        magi.currentEnergy = Math.max(0, (magi.currentEnergy ?? 0) - 1);
-        vault.durationTags.push({ tag: "archiveUsedThisTurn", expiresAfterTurnNumber: state.turnNumber + state.turnOrder.length });
-        logEvent(state, "archiveRedirect", {
-          vaultInstanceId: vault.instanceId,
-          originalInstanceId: target.instanceId,
-          originalName: cardDb.get(target.definitionKey)?.name,
-          substituteInstanceId: substitute.instanceId,
-          substituteName: cardDb.get(substitute.definitionKey)?.name
-        });
-        state.currentAction.archiveRedirect = void 0;
-        discardFromPlay(state, cardDb, owner, substitute.instanceId, actor, resolvedSource, rng);
-        return;
-      }
-    }
-  }
-  if (kybarsEchoApplies(state, cardDb, owner, target)) {
-    const card2 = removeFromZone(owner, "inPlay", instanceId);
-    card2.currentEnergy = null;
-    addToZone(owner, "hand", card2);
-    releaseAttachedOnLeavePlay(state, cardDb, card2);
-    logEvent(state, "effectReturnedToHand", { instanceId, name: cardDb.get(card2.definitionKey)?.name });
-    return;
-  }
-  const stillInPlay = owner.inPlay.find((c2) => c2.instanceId === instanceId);
-  const wasFrozen = stillInPlay ? isFrozen(state, cardDb, stillInPlay) : false;
-  const card = removeFromZone(owner, "inPlay", instanceId);
-  if (wasFrozen) addPermanentTagRaw(card, FROZEN);
-  moveToDiscardPile(state, owner, card, "explicit", resolvedSource, actor);
-  logEvent(state, "effectDiscardedFromPlay", { instanceId, name: cardDb.get(card.definitionKey)?.name });
-  const trueOwner = state.players.get(card.ownerId) ?? owner;
-  checkEternalVigor(state, cardDb, card, trueOwner, actor, false);
-  const reactorSets = [[card]];
-  for (const player of state.players.values()) {
-    reactorSets.push(player.activeMagi ? [...player.inPlay, player.activeMagi] : player.inPlay);
-  }
-  for (const reactors of reactorSets) {
-    for (const instance of reactors) {
-      const def = cardDb.get(instance.definitionKey);
-      for (const effect of effectsFor(state, cardDb, instance)) {
-        if (!effect.onCardDiscardedFromPlay) continue;
-        const energyBefore = instance.currentEnergy;
-        effect.onCardDiscardedFromPlay(state, cardDb, card, trueOwner.playerId, instance, "explicit", resolvedSource, actor, rng);
-        logEvent(state, "onCardDiscardedFromPlayHookFired", {
-          cardName: def.name,
-          instanceId: instance.instanceId,
-          reactingTo: cardDb.get(card.definitionKey)?.name,
-          // Deliberately narrow: only this reactor's OWN energy delta. A hook that moves energy
-          // elsewhere still logs `changedOwnEnergy: false` -- it means "Yaromant's own total moved",
-          // not "nothing happened at all".
-          changedOwnEnergy: instance.currentEnergy !== energyBefore
-        });
-      }
-    }
-  }
-  for (const instance of trueOwner.hand) {
-    const def = cardDb.get(instance.definitionKey);
-    for (const effect of effectsFor(state, cardDb, instance)) {
-      if (!effect.onCardDiscardedFromPlayWhileInHand) continue;
-      effect.onCardDiscardedFromPlayWhileInHand(state, cardDb, card, trueOwner.playerId, instance);
-      logEvent(state, "onCardDiscardedFromPlayHookFired", { cardName: def.name, instanceId: instance.instanceId, reactingTo: cardDb.get(card.definitionKey)?.name });
-    }
-  }
-  broadcastDiscardPileReactors(state, cardDb, card);
-  releaseAttachedOnLeavePlay(state, cardDb, card);
-  sweepStandingConditions(state, cardDb);
-}
-function broadcastDiscardPileReactors(state, cardDb, discardedCard) {
-  const discardedDef = cardDb.get(discardedCard.definitionKey);
-  if (!discardedDef) return;
-  for (const player of state.players.values()) {
-    for (const instance of player.discardPile) {
-      for (const effect of effectsFor(state, cardDb, instance)) {
-        effect.reactsFromDiscardPileToDiscard?.(state, cardDb, instance, discardedDef);
-      }
-    }
-  }
-}
-function sweepStandingConditions(state, cardDb, rng = defaultRng) {
-  for (const player of state.players.values()) {
-    for (const card of player.inPlay) {
-      for (const effect of effectsFor(state, cardDb, card)) {
-        if (effect.standingConditionMet?.(state, cardDb, card)) {
-          discardFromPlay(state, cardDb, player, card.instanceId, void 0, void 0, rng);
-          return;
-        }
-      }
-    }
-  }
-}
-function gainControl(state, cardDb, card, newControllerId) {
-  if (blockedByShadowCloakFromNonCorePowerOrSpell(state, cardDb, card)) return;
-  for (const effect of effectsFor(state, cardDb, card)) {
-    if (effect.canBeGainedControlOf?.(state, cardDb, card) === false) return;
-  }
-  for (const p of state.players.values()) {
-    const contributors = p.activeMagi ? [...p.inPlay, p.activeMagi] : p.inPlay;
-    for (const contributor of contributors) {
-      if (contributor.instanceId === card.instanceId) continue;
-      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-        if (contributorEffect.preventsGainControlOf?.(state, cardDb, card, contributor)) return;
-      }
-    }
-  }
-  const oldController = state.players.get(card.controllerId);
-  if (!oldController) return;
-  if (!oldController.inPlay.some((c2) => c2.instanceId === card.instanceId)) return;
-  removeFromZone(oldController, "inPlay", card.instanceId);
-  card.controllerId = newControllerId;
-  const newController = state.players.get(newControllerId);
-  addToZone(newController, "inPlay", card);
-  logEvent(state, "effectGainedControl", { instanceId: card.instanceId, name: cardDb.get(card.definitionKey)?.name, newControllerId });
-  for (const player of state.players.values()) {
-    for (const instance of player.inPlay) {
-      for (const effect of effectsFor(state, cardDb, instance)) {
-        effect.onGainControl?.(state, cardDb, card, newControllerId, instance);
-      }
-    }
-  }
-  checkCreatureDefeats(state, cardDb);
-}
-function returnToHand(state, cardDb, owner, instanceId, fromZone = "inPlay", causedByPlayerId) {
-  const list = owner[fromZone];
-  const target = list.find((c2) => c2.instanceId === instanceId);
-  if (!target) return;
-  if (blockedByShadowCloakFromNonCorePowerOrSpell(state, cardDb, target)) return;
-  const actor = causedByPlayerId ?? state.currentAction?.actorPlayerId ?? state.activePlayerId;
-  if (owner.playerId !== actor) {
-    for (const p of state.players.values()) {
-      const contributors = p.activeMagi ? [...p.inPlay, p.activeMagi] : p.inPlay;
-      for (const contributor of contributors) {
-        if (contributor.instanceId === target.instanceId) continue;
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          if (contributorEffect.redirectsOwnReturnToHandToMagiEnergy?.(state, cardDb, target, contributor)) {
-            const magi = p.activeMagi;
-            if (magi) {
-              const gain = Math.min(target.currentEnergy ?? 0, printedStartingEnergy(cardDb, target.definitionKey));
-              addEnergy(state, cardDb, magi, gain, "effect");
-            }
-            logEvent(state, "effectReturnToHandRedirected", { instanceId: target.instanceId, byInstanceId: contributor.instanceId });
-            return;
-          }
-          if (contributorEffect.preventsReturnToHand?.(state, cardDb, target, contributor)) return;
-        }
-      }
-    }
-  }
-  const card = removeFromZone(owner, fromZone, instanceId);
-  card.currentEnergy = null;
-  owner.hand.push(card);
-  releaseAttachedOnLeavePlay(state, cardDb, card);
-  logEvent(state, "effectReturnedToHand", { instanceId });
-}
-function returnToOwnersHand(state, cardDb, card) {
-  const currentController = state.players.get(card.controllerId);
-  const trueOwner = state.players.get(card.ownerId);
-  if (!currentController || !trueOwner) return;
-  if (!currentController.inPlay.some((c2) => c2.instanceId === card.instanceId)) return;
-  removeFromZone(currentController, "inPlay", card.instanceId);
-  card.currentEnergy = null;
-  card.controllerId = card.ownerId;
-  trueOwner.hand.push(card);
-  releaseAttachedOnLeavePlay(state, cardDb, card);
-  logEvent(state, "effectReturnedToHand", { instanceId: card.instanceId });
-}
-function shuffleFromPlayIntoOwnersDeck(state, cardDb, card, rng = defaultRng) {
-  const currentController = state.players.get(card.controllerId);
-  const trueOwner = state.players.get(card.ownerId);
-  if (!currentController || !trueOwner) return;
-  if (!currentController.inPlay.some((c2) => c2.instanceId === card.instanceId)) return;
-  removeFromZone(currentController, "inPlay", card.instanceId);
-  card.currentEnergy = null;
-  card.controllerId = card.ownerId;
-  releaseAttachedOnLeavePlay(state, cardDb, card);
-  trueOwner.deck.push(card);
-  shuffleDeck(trueOwner, rng);
-  logEvent(state, "effectShuffledIntoDeck", { instanceId: card.instanceId, ownerId: card.ownerId });
-}
-function setCardTypeOverride(state, cardDb, instance, override) {
-  const before = effectiveCardType(cardDb, instance);
-  instance.cardTypeOverride = override;
-  const after = effectiveCardType(cardDb, instance);
-  if (before === after) return;
-  const def = cardDb.get(instance.definitionKey);
-  for (const effect of effectsFor(state, cardDb, instance)) {
-    if (after === "Creature") effect.onBecameCreature?.(state, cardDb, instance);
-    if (after === "Relic") effect.onBecameRelic?.(state, cardDb, instance);
-  }
-  logEvent(state, "cardTypeOverrideChanged", { instanceId: instance.instanceId, name: def?.name, from: before, to: after });
-}
-function sweepExpiredControlThefts(state, cardDb) {
-  for (const player of state.players.values()) {
-    for (const card of [...player.inPlay]) {
-      const theft = card.temporaryControlTheft;
-      if (theft && theft.expiresAfterTurnNumber < state.turnNumber) {
-        card.temporaryControlTheft = null;
-        returnToOwnersHand(state, cardDb, card);
-      }
-    }
-  }
-}
-function sweepExpiredCardTypeOverrides(state, cardDb) {
-  for (const player of state.players.values()) {
-    const holders = [...player.inPlay];
-    if (player.activeMagi) holders.push(player.activeMagi);
-    for (const instance of holders) {
-      const override = instance.cardTypeOverride;
-      if (override && override.expiresAfterTurnNumber !== null && override.expiresAfterTurnNumber < state.turnNumber) {
-        setCardTypeOverride(state, cardDb, instance, null);
-      }
-    }
-  }
-}
-function discardTopOfDeck(state, player) {
-  const card = player.deck.shift();
-  if (!card) return void 0;
-  moveToDiscardPile(state, player, card);
-  logEvent(state, "effectDiscardedTopOfDeck", { playerId: player.playerId });
-  return card;
-}
-function searchDeck(state, player, instanceIds2, rng = defaultRng) {
-  const foundCards = [];
-  for (const id of instanceIds2) {
-    const index = player.deck.findIndex((c2) => c2.instanceId === id);
-    if (index === -1) continue;
-    const [card] = player.deck.splice(index, 1);
-    addPermanentTagRaw(card, KNOWN_HAND_CARD);
-    player.hand.push(card);
-    foundCards.push({ instanceId: card.instanceId, definitionKey: card.definitionKey });
-  }
-  shuffleDeck(player, rng);
-  logEvent(state, "effectSearchedDeck", { playerId: player.playerId, count: instanceIds2.length, cards: foundCards });
-}
-function dieRollBonus(state, cardDb, rollingPlayerId, rollingSource) {
-  const player = state.players.get(rollingPlayerId);
-  if (!player) return 0;
-  const contributors = player.activeMagi ? [player.activeMagi, ...player.inPlay] : [...player.inPlay];
-  let bonus = 0;
-  for (const contributor of contributors) {
-    for (const effect of effectsFor(state, cardDb, contributor)) {
-      bonus += effect.addsToOwnDieRolls?.(state, cardDb, contributor, rollingSource) ?? 0;
-    }
-  }
-  return bonus;
-}
-function rollDie(rng = defaultRng, sides = 6, luckContext) {
-  const raw = 1 + Math.floor(rng() * sides);
-  if (!luckContext) return raw;
-  return Math.min(sides, raw + dieRollBonus(luckContext.state, luckContext.cardDb, luckContext.rollingPlayerId, luckContext.source));
-}
-function rollDieWithRerolls(state, cardDb, roller, rng = defaultRng, sides = 6, prefer = "high") {
-  const luckContext = { state, cardDb, rollingPlayerId: roller.controllerId, source: roller };
-  const first = rollDie(rng, sides, luckContext);
-  let granted = false;
-  outer: for (const p of state.players.values()) {
-    const contributors = p.activeMagi ? [...p.inPlay, p.activeMagi] : p.inPlay;
-    for (const contributor of contributors) {
-      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-        if (contributorEffect.grantsDieReroll?.(state, cardDb, roller, contributor)) {
-          granted = true;
-          break outer;
-        }
-      }
-    }
-  }
-  if (!granted) return first;
-  const second = rollDie(rng, sides, luckContext);
-  return prefer === "high" ? Math.max(first, second) : Math.min(first, second);
-}
-function findFateWhimsyEligibleReactors(state, cardDb) {
-  const eligible4 = [];
-  const active = state.activePlayerId;
-  const orderedIds = [active, ...state.turnOrder.filter((id) => id !== active)];
-  for (const id of orderedIds) {
-    const player = state.players.get(id);
-    if (!player) continue;
-    if (!player.activeMagi || (player.activeMagi.currentEnergy ?? 0) < 1) continue;
-    if (player.hand.some((c2) => cardDb.get(c2.definitionKey)?.name === "Fate's Whimsy")) {
-      eligible4.push(id);
-    }
-  }
-  return eligible4;
-}
-function requestDieRoll(state, cardDb, source, rollerId, sides, consumerKey, consumerPayload, rng = defaultRng) {
-  const raw = rollDieWithRerolls(state, cardDb, source, rng, sides);
-  const sourceDef = cardDb.get(source.definitionKey);
-  const sourceEffect = sourceDef ? getCardEffectByName(sourceDef.name) : void 0;
-  if (sourceEffect?.dieRollCannotBeAltered) {
-    invokeRollConsumer(state, cardDb, source, consumerKey, consumerPayload, raw, rng);
-    return;
-  }
-  const eligible4 = findFateWhimsyEligibleReactors(state, cardDb);
-  if (eligible4.length === 0) {
-    invokeRollConsumer(state, cardDb, source, consumerKey, consumerPayload, raw, rng);
-    return;
-  }
-  recordOpportunity("dieRollWindow:fateWhimsy");
-  state.pendingDieRoll = {
-    currentValue: raw,
-    originalValue: raw,
-    sides,
-    rollerId,
-    sourceInstanceId: source.instanceId,
-    consumerKey,
-    consumerPayload,
-    eligibleReactorPlayerIds: eligible4,
-    pendingRerollChoice: null
-  };
-  logEvent(state, "dieRollAwaitingWhimsy", {
-    rollerId,
-    sourceInstanceId: source.instanceId,
-    value: raw,
-    eligibleReactorPlayerIds: eligible4
-  });
-}
-function invokeRollConsumer(state, cardDb, source, consumerKey, consumerPayload, finalRoll, rng) {
-  const consumer = getRollConsumer(consumerKey);
-  if (!consumer) throw new Error(`Unknown roll consumer key: ${consumerKey}`);
-  consumer(state, cardDb, source, consumerPayload, finalRoll, rng);
-}
-function getCounter(instance, key) {
-  return instance.counters[key] ?? 0;
-}
-function setCounter(instance, key, value) {
-  instance.counters[key] = value;
-}
-function spendCounter(instance, key, amount) {
-  const current = getCounter(instance, key);
-  if (current < amount) return false;
-  instance.counters[key] = current - amount;
-  return true;
-}
-var FIRST_OPPOSING_LOSS_SHIELD_KEY = "firstOpposingLossShieldConsumedTurn";
-function tryConsumeFirstOpposingLossShield(state, cardDb, instance) {
-  const marker = state.turnNumber + 1;
-  for (const effect of effectsFor(state, cardDb, instance)) {
-    if (effect.absorbsFirstOpposingLossPerTurn?.(state, cardDb, instance)) {
-      if (getCounter(instance, FIRST_OPPOSING_LOSS_SHIELD_KEY) !== marker) {
-        setCounter(instance, FIRST_OPPOSING_LOSS_SHIELD_KEY, marker);
-        return true;
-      }
-    }
-  }
-  const owner = state.players.get(instance.controllerId);
-  if (owner) {
-    const granters = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
-    for (const granter of granters) {
-      for (const granterEffect of effectsFor(state, cardDb, granter)) {
-        if (!granterEffect.grantsFirstOpposingLossShieldTo?.(state, cardDb, granter, instance)) continue;
-        if (getCounter(granter, FIRST_OPPOSING_LOSS_SHIELD_KEY) === marker) continue;
-        setCounter(granter, FIRST_OPPOSING_LOSS_SHIELD_KEY, marker);
-        return true;
-      }
-    }
-  }
-  return false;
-}
-function forcePlayFromHand(state, cardDb, player, instanceId, rng = defaultRng) {
-  const index = player.hand.findIndex((c2) => c2.instanceId === instanceId);
-  if (index === -1) return void 0;
-  const [card] = player.hand.splice(index, 1);
-  const def = cardDb.get(card.definitionKey);
-  if (def?.card_type === "Spell") {
-    card.currentEnergy = null;
-    const spellEffect = getCardEffectByName(def.name);
-    if (spellEffect?.spellStaysInPlay) {
-      addToZone(player, "inPlay", card);
-    } else if (spellEffect?.resolveSpell) {
-      const previousCurrentAction = state.currentAction;
-      state.currentAction = {
-        actorPlayerId: player.playerId,
-        source: "spell",
-        sourceDefinitionKey: card.definitionKey,
-        sourceInstanceId: card.instanceId
-      };
-      const opposingBefore = /* @__PURE__ */ new Map();
-      for (const opponent of getOpponents(state, player.playerId)) {
-        for (const c2 of opponent.inPlay) opposingBefore.set(c2.instanceId, c2.currentEnergy ?? 0);
-      }
-      const allBefore = /* @__PURE__ */ new Map();
-      for (const p of state.players.values()) {
-        for (const c2 of p.inPlay) allBefore.set(c2.instanceId, c2.currentEnergy ?? 0);
-      }
-      spellEffect.resolveSpell({ state, cardDb, source: card, controllingPlayer: player, rng });
-      logEvent(state, "spellResolved", { instanceId: card.instanceId, name: def.name, viaForcePlay: true });
-      broadcastSpellDiscardedOpposingEnergy(state, cardDb, player.playerId, card, opposingBefore, allBefore);
-      broadcastSpellAddedEnergyToCreature(state, cardDb, card, allBefore);
-      checkMagiDefeats(state, cardDb, rng);
-      consumeIntensifyIfUsed(state);
-      state.currentAction = previousCurrentAction;
-      moveToDiscardPile(state, player, card);
-    } else {
-      moveToDiscardPile(state, player, card);
-    }
-  } else {
-    card.currentEnergy = def?.card_type === "Creature" ? printedStartingEnergy(cardDb, card.definitionKey) : null;
-    card.controllerId = player.playerId;
-    resetPerTurnStateOnEnterPlay(card);
-    addToZone(player, "inPlay", card);
-  }
-  logEvent(state, "effectForcePlayedFromHand", { instanceId: card.instanceId, name: def?.name });
-  checkCreatureDefeats(state, cardDb);
-  checkHandEmptied(state, cardDb, rng);
-  return card;
-}
-function searchDeckIntoPlay(state, cardDb, player, instanceId, startingEnergy, broadcastAsPlayed = false, rng = defaultRng) {
-  const index = player.deck.findIndex((c2) => c2.instanceId === instanceId);
-  if (index === -1) return void 0;
-  const [card] = player.deck.splice(index, 1);
-  card.currentEnergy = startingEnergy;
-  resetPerTurnStateOnEnterPlay(card);
-  addToZone(player, "inPlay", card);
-  logEvent(state, "effectSearchedDeckIntoPlay", { playerId: player.playerId, instanceId, definitionKey: card.definitionKey });
-  if (broadcastAsPlayed) {
-    broadcastCardEnteredPlay(state, cardDb, player.playerId, card, rng);
-    checkCreatureDefeats(state, cardDb, void 0, void 0, rng);
-  }
-  return card;
-}
-function moveHandCardToDeck(state, cardDb, player, instanceId, position, rng) {
-  const card = removeFromZone(player, "hand", instanceId);
-  addToZone(player, "deck", card, position);
-  logEvent(state, "effectMovedHandCardToDeck", { playerId: player.playerId, instanceId, position });
-  checkHandEmptied(state, cardDb, rng);
-}
-function discardRandomFromHand(state, cardDb, player, count, rng = defaultRng) {
-  const discarded = [];
-  for (let i = 0; i < count && player.hand.length > 0; i += 1) {
-    const index = Math.floor(rng() * player.hand.length);
-    const [card] = player.hand.splice(index, 1);
-    moveToDiscardPile(state, player, card);
-    discarded.push(card);
-  }
-  logEvent(state, "effectDiscardedRandomFromHand", {
-    playerId: player.playerId,
-    count: discarded.length,
-    cards: discarded.map((card) => ({ instanceId: card.instanceId, definitionKey: card.definitionKey }))
-  });
-  checkHandEmptied(state, cardDb, rng);
-  return discarded;
-}
-function discardFromDeck(state, player, instanceIds2) {
-  for (const id of instanceIds2) {
-    const index = player.deck.findIndex((c2) => c2.instanceId === id);
-    if (index === -1) continue;
-    const [card] = player.deck.splice(index, 1);
-    moveToDiscardPile(state, player, card);
-  }
-  logEvent(state, "effectDiscardedFromDeck", { playerId: player.playerId, count: instanceIds2.length });
-}
-function retrieveFromDiscardPile(state, player, instanceId, destination, rng = defaultRng) {
-  const index = player.discardPile.findIndex((c2) => c2.instanceId === instanceId);
-  if (index === -1) return void 0;
-  const [card] = player.discardPile.splice(index, 1);
-  if (destination === "hand") {
-    addPermanentTagRaw(card, KNOWN_HAND_CARD);
-    player.hand.push(card);
-  } else if (destination === "deckTop") {
-    player.deck.unshift(card);
-  } else {
-    player.deck.push(card);
-    shuffleDeck(player, rng);
-  }
-  logEvent(state, "effectRetrievedFromDiscardPile", { playerId: player.playerId, instanceId, definitionKey: card.definitionKey, destination });
-  return card;
-}
-function onPlayReactorFingerprint(state) {
-  const parts = [];
-  for (const p of state.players.values()) {
-    parts.push(p.hand.length, p.inPlay.length, p.discardPile.length, p.deck.length, p.magiQueue.length);
-    parts.push(p.activeMagi?.currentEnergy ?? -1);
-    for (const c2 of p.inPlay) parts.push(c2.currentEnergy ?? -1);
-  }
-  return parts.join(",");
-}
-function isProtectionSuppressed(state, cardDb, protectedCard, protector, kind) {
-  for (const effect of effectsFor(state, cardDb, protectedCard)) {
-    if (effect.suppressesProtectionFrom?.(state, cardDb, protectedCard, protector, kind) === true) return true;
-  }
-  return false;
-}
-function protectionTagActive(state, cardDb, instance, tag, kind) {
-  return remoteProtectionTagActive(state, cardDb, instance, instance, tag, kind);
-}
-function remoteProtectionTagActive(state, cardDb, protectedCard, tagHolder, tag, kind) {
-  const entry = tagHolder.durationTags.find((dt) => dt.tag === tag);
-  if (!entry) return false;
-  if (entry.sourceInstanceId === void 0) return true;
-  const source = findCard(state, entry.sourceInstanceId)?.instance;
-  if (!source) return true;
-  return !isProtectionSuppressed(state, cardDb, protectedCard, source, kind);
-}
-function burrowProtectionSuppressed(state, cardDb, target, kind) {
-  if (!isBurrowed(state, cardDb, target)) return false;
-  if (target.tags.has(BURROWED)) return false;
-  for (const effect of effectsFor(state, cardDb, target)) {
-    if (effect.isConditionallyBurrowed?.(state, cardDb, target)) return false;
-  }
-  const entry = target.durationTags.find((dt) => dt.tag === BURROWED);
-  if (entry) {
-    if (entry.sourceInstanceId === void 0) return false;
-    const source = findCard(state, entry.sourceInstanceId)?.instance;
-    if (!source) return false;
-    if (!isProtectionSuppressed(state, cardDb, target, source, kind)) return false;
-  }
-  for (const player of state.players.values()) {
-    const contributors = player.activeMagi ? [player.activeMagi, ...player.inPlay] : [...player.inPlay];
-    for (const contributor of contributors) {
-      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-        if (contributorEffect.grantsBurrowedTo?.(state, cardDb, contributor, target)) {
-          if (!isProtectionSuppressed(state, cardDb, target, contributor, kind)) return false;
-        }
-      }
-    }
-  }
-  return true;
-}
-function cardLocalCombatReductionBlocked(state, cardDb, attacker, defender, direction, self) {
-  if (combatEffectReductionBlocked(state, cardDb, attacker, defender, direction)) return true;
-  const protectedCard = direction === "attackerOutput" ? defender : attacker;
-  if (!protectedCard) return false;
-  return isProtectionSuppressed(state, cardDb, protectedCard, self, "combatEnergyLoss");
-}
-function resetPerTurnStateOnEnterPlay(card) {
-  card.usedPowerNames.clear();
-  card.usedPowerCounts.clear();
-}
-function broadcastCardEnteredPlay(state, cardDb, playerId, instance, rng = defaultRng) {
-  const def = cardDb.get(instance.definitionKey);
-  const previousCurrentAction = state.currentAction;
-  state.currentAction = { actorPlayerId: playerId, source: "effect" };
-  const seenReactorIds = /* @__PURE__ */ new Set();
-  const reactors = [instance];
-  seenReactorIds.add(instance.instanceId);
-  for (const p of state.players.values()) {
-    const candidates = p.activeMagi ? [...p.inPlay, p.activeMagi] : p.inPlay;
-    for (const c2 of candidates) {
-      if (!seenReactorIds.has(c2.instanceId)) {
-        seenReactorIds.add(c2.instanceId);
-        reactors.push(c2);
-      }
-    }
-  }
-  for (const reactor of reactors) {
-    const reactorDef = cardDb.get(reactor.definitionKey);
-    for (const reactorEffect of effectsFor(state, cardDb, reactor)) {
-      if (!reactorEffect.onPlay) continue;
-      const before = onPlayReactorFingerprint(state);
-      reactorEffect.onPlay(state, cardDb, instance, reactor, rng);
-      if (onPlayReactorFingerprint(state) !== before) {
-        logEvent(state, "onPlayHookFired", { cardName: reactorDef.name, instanceId: reactor.instanceId, reactingTo: def?.name });
-      }
-    }
-  }
-  if (def?.card_type === "Relic" && def.regions.includes("Cald")) {
-    const searingTouchKey = findSearingTouchDefKey(cardDb);
-    if (searingTouchKey !== void 0) {
-      for (const reactor of reactors) {
-        if (reactor.instanceId === instance.instanceId) continue;
-        if (reactor.controllerId !== instance.controllerId) continue;
-        if (!hasDurationTag(reactor, SEARING_TOUCH_FURNACE)) continue;
-        if (hasGrantFrom(state, reactor, searingTouchKey)) continue;
-        addGrantedEffect(reactor, searingTouchKey);
-      }
-    }
-  }
-  state.currentAction = previousCurrentAction;
-  if (def?.card_type === "Spell" || def?.card_type === "Relic") {
-    const reactionOpponents = getOpponents(state, playerId);
-    if (reactionOpponents.length > 0) {
-      state.reactiveWindow = {
-        kind: "opponentPlayOrPower",
-        reactingPlayerId: reactionOpponents[0].playerId,
-        actingPlayerId: playerId,
-        trigger: "spellOrRelic"
-      };
-    }
-  }
-  for (const p of state.players.values()) {
-    for (const handCard of [...p.hand]) {
-      const handDef = cardDb.get(handCard.definitionKey);
-      for (const handEffect of effectsFor(state, cardDb, handCard)) {
-        if (!handEffect.reactsToPlayFromHand) continue;
-        if (!handEffect.reactsToPlayFromHand(state, cardDb, handCard, instance, playerId)) continue;
-        const played = playFromZone(
-          state,
-          cardDb,
-          { owner: p, zone: "hand", instanceId: handCard.instanceId },
-          p,
-          // Entry energy again -- printed, same reasoning as forcePlayFromHand above.
-          printedStartingEnergy(cardDb, handCard.definitionKey),
-          rng
-        );
-        if (played) logEvent(state, "reactsToPlayFromHandFired", { cardName: handDef.name, instanceId: played.instanceId, reactingTo: def?.name });
-      }
-    }
-  }
-  {
-    const playingPlayer = [...state.players.values()].find((p) => p.playerId === playerId);
-    for (const reactor of [...playingPlayer.hand, ...playingPlayer.discardPile]) {
-      for (const reactorEffect of effectsFor(state, cardDb, reactor)) {
-        reactorEffect.reactsToOwnCardPlayFromHandOrDiscard?.(state, cardDb, reactor, instance, playerId);
-      }
-    }
-  }
-}
-function resolveDreamwarpDelta(state, cardDb, playerId, instance, printedCost, chosen) {
-  if (chosen === void 0) return 0;
-  const range = effectiveDreamwarpRange(state, cardDb, playerId, instance);
-  if (range === void 0) return 0;
-  const clamped = Math.max(-range, Math.min(range, Math.trunc(chosen)));
-  if (clamped === 0) return 0;
-  return Math.max(1, printedCost + clamped) - printedCost;
-}
-function commitDreamwarpDelta(state, cardDb, instance, printedCost, delta) {
-  if (delta === 0) return;
-  instance.dreamwarpAdjustment = delta;
-  instance.startingEnergyOverride = { value: printedCost + delta, expiresAfterTurnNumber: state.turnNumber };
-  for (const p of state.players.values()) {
-    const contributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
-    for (const contributor of contributors) {
-      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-        contributorEffect.onAnyDreamwarpUsed?.(state, cardDb, contributor, instance);
-      }
-    }
-  }
-}
-function spellPlayCostWithModifiers(state, cardDb, def, payerPlayerId, baseCost) {
-  let costModifierSum = 0;
-  for (const p of state.players.values()) {
-    const contributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
-    for (const contributor of contributors) {
-      for (const effect of effectsFor(state, cardDb, contributor)) {
-        if (effect.costModifier) costModifierSum += effect.costModifier(state, cardDb, def, payerPlayerId, contributor);
-      }
-    }
-  }
-  if (costModifierSum === 0) return baseCost;
-  return costModifierSum < 0 ? Math.max(1, baseCost + costModifierSum) : baseCost + costModifierSum;
-}
-function playFromZone(state, cardDb, source, destination, startingEnergy, rng = defaultRng, nestedChoices = {}, energyCost = 0) {
-  const list = source.owner[source.zone];
-  const index = list.findIndex((c2) => c2.instanceId === source.instanceId);
-  if (index === -1) return void 0;
-  const [card] = list.splice(index, 1);
-  if (energyCost > 0 && destination.activeMagi) {
-    const playedDef = cardDb.get(card.definitionKey);
-    const finalCost = playedDef ? spellPlayCostWithModifiers(state, cardDb, playedDef, destination.playerId, energyCost) : energyCost;
-    destination.activeMagi.currentEnergy = Math.max(0, (destination.activeMagi.currentEnergy ?? 0) - finalCost);
-    logEvent(state, "playFromZoneCostPaid", {
-      instanceId: card.instanceId,
-      name: playedDef?.name,
-      baseCost: energyCost,
-      cost: finalCost
-    });
-  }
-  card.controllerId = destination.playerId;
-  destination.cardsPlayedThisTurn += 1;
-  const def = cardDb.get(card.definitionKey);
-  if (def?.card_type === "Spell") {
-    card.currentEnergy = null;
-    if (nestedChoices.chosenXValue !== void 0) {
-      card.counters.startingX = nestedChoices.chosenXValue;
-    }
-    const spellEffect = getCardEffectByName(def.name);
-    if (spellEffect?.resolveSpell) {
-      const previousCurrentAction = state.currentAction;
-      state.currentAction = {
-        actorPlayerId: destination.playerId,
-        source: "spell",
-        sourceDefinitionKey: card.definitionKey,
-        sourceInstanceId: card.instanceId
-      };
-      const opposingBefore = /* @__PURE__ */ new Map();
-      for (const opponent of getOpponents(state, destination.playerId)) {
-        for (const c2 of opponent.inPlay) opposingBefore.set(c2.instanceId, c2.currentEnergy ?? 0);
-      }
-      const allBefore = /* @__PURE__ */ new Map();
-      for (const p of state.players.values()) {
-        for (const c2 of p.inPlay) allBefore.set(c2.instanceId, c2.currentEnergy ?? 0);
-      }
-      spellEffect.resolveSpell({ state, cardDb, source: card, controllingPlayer: destination, rng, ...nestedChoices });
-      logEvent(state, "spellResolved", { instanceId: card.instanceId, name: def.name, viaPlayFromZone: true });
-      broadcastSpellDiscardedOpposingEnergy(state, cardDb, destination.playerId, card, opposingBefore, allBefore);
-      broadcastSpellAddedEnergyToCreature(state, cardDb, card, allBefore);
-      checkMagiDefeats(state, cardDb, rng);
-      consumeIntensifyIfUsed(state);
-      state.currentAction = previousCurrentAction;
-      const placedSomewhere = [...state.players.values()].some(
-        (p) => p.inPlay.some((c2) => c2.instanceId === card.instanceId) || p.discardPile.some((c2) => c2.instanceId === card.instanceId)
-      );
-      if (!placedSomewhere) {
-        moveToDiscardPile(state, destination, card);
-      }
-    } else {
-      moveToDiscardPile(state, destination, card);
-    }
-  } else {
-    card.currentEnergy = startingEnergy;
-    resetPerTurnStateOnEnterPlay(card);
-    addToZone(destination, "inPlay", card);
-  }
-  logEvent(state, "effectPlayedFromZone", { instanceId: card.instanceId, name: def?.name, sourceZone: source.zone });
-  broadcastCardEnteredPlay(state, cardDb, destination.playerId, card, rng);
-  checkCreatureDefeats(state, cardDb);
-  return card;
-}
-function broadcastSpellDiscardedOpposingEnergy(state, cardDb, actingPlayerId, sourceCard, opposingBefore, allBefore) {
-  const stillInPlayAfter = /* @__PURE__ */ new Map();
-  for (const opponent of getOpponents(state, actingPlayerId)) {
-    for (const c2 of opponent.inPlay) stillInPlayAfter.set(c2.instanceId, c2);
-  }
-  const actingPlayer = getPlayer(state, actingPlayerId);
-  const contributors = actingPlayer.activeMagi ? [actingPlayer.activeMagi, ...actingPlayer.inPlay] : [...actingPlayer.inPlay];
-  const perCreatureOpposingDiscarded = /* @__PURE__ */ new Map();
-  for (const [instanceId, before] of opposingBefore) {
-    const afterInstance = stillInPlayAfter.get(instanceId);
-    if (!afterInstance) continue;
-    const lost = before - (afterInstance.currentEnergy ?? 0);
-    if (lost > 0) perCreatureOpposingDiscarded.set(instanceId, lost);
-  }
-  const amplificationBlocked = getCardEffectByName(cardDb.get(sourceCard.definitionKey)?.name ?? "")?.spellBlocksOwnEnergyAmplification === true;
-  if (perCreatureOpposingDiscarded.size > 0 && !amplificationBlocked) {
-    for (const [instanceId, amount] of perCreatureOpposingDiscarded) {
-      const targetInstance = stillInPlayAfter.get(instanceId);
-      for (const contributor of contributors) {
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          contributorEffect.onOwnPowerDiscardedOpposingEnergyFromCreature?.(
-            state,
-            cardDb,
-            contributor,
-            sourceCard,
-            targetInstance,
-            amount,
-            perCreatureOpposingDiscarded.size
-          );
-        }
-      }
-    }
-  }
-  const opposingAfterBonuses = /* @__PURE__ */ new Map();
-  for (const opponent of getOpponents(state, actingPlayerId)) {
-    for (const c2 of opponent.inPlay) opposingAfterBonuses.set(c2.instanceId, c2);
-  }
-  let opposingEnergyDiscarded = 0;
-  for (const [instanceId, before] of opposingBefore) {
-    const after = opposingAfterBonuses.get(instanceId)?.currentEnergy ?? 0;
-    opposingEnergyDiscarded += Math.max(0, before - after);
-  }
-  if (opposingEnergyDiscarded > 0) {
-    for (const contributor of contributors) {
-      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-        contributorEffect.onOwnPowerDiscardedOpposingEnergy?.(state, cardDb, contributor, sourceCard, opposingEnergyDiscarded);
-      }
-    }
-  }
-  if (allBefore) {
-    const allAfter = /* @__PURE__ */ new Map();
-    for (const p of state.players.values()) {
-      for (const c2 of p.inPlay) allAfter.set(c2.instanceId, c2);
-    }
-    const perCreatureAnyDiscarded = /* @__PURE__ */ new Map();
-    for (const [instanceId, before] of allBefore) {
-      const afterInstance = allAfter.get(instanceId);
-      if (!afterInstance) continue;
-      const lost = before - (afterInstance.currentEnergy ?? 0);
-      if (lost > 0) perCreatureAnyDiscarded.set(instanceId, lost);
-    }
-    if (perCreatureAnyDiscarded.size === 1) {
-      const [instanceId, amount] = [...perCreatureAnyDiscarded][0];
-      const targetInstance = allAfter.get(instanceId);
-      for (const p of state.players.values()) {
-        const allContributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
-        for (const contributor of allContributors) {
-          for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-            contributorEffect.onAnySpellDiscardedEnergyFromSingleCreature?.(state, cardDb, contributor, sourceCard, targetInstance, amount);
-          }
-        }
-      }
-    }
-  }
-}
-function broadcastSpellAddedEnergyToCreature(state, cardDb, sourceCard, allBefore) {
-  let anyCreatureEnergyAdded = 0;
-  const perCreatureGains = [];
-  for (const p of state.players.values()) {
-    for (const c2 of p.inPlay) {
-      const before = allBefore.get(c2.instanceId);
-      if (before === void 0) continue;
-      const gained = Math.max(0, (c2.currentEnergy ?? 0) - before);
-      anyCreatureEnergyAdded += gained;
-      if (gained > 0) perCreatureGains.push({ instance: c2, amount: gained });
-    }
-  }
-  if (anyCreatureEnergyAdded > 0) {
-    for (const p of state.players.values()) {
-      const contributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
-      for (const contributor of contributors) {
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          contributorEffect.onAnyPowerAddedEnergyToCreature?.(state, cardDb, contributor, sourceCard, anyCreatureEnergyAdded);
-        }
-      }
-    }
-  }
-  if (perCreatureGains.length > 0) {
-    for (const p of state.players.values()) {
-      const contributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
-      for (const contributor of contributors) {
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          contributorEffect.onPowerAddedEnergyToCreatures?.(state, cardDb, contributor, sourceCard, perCreatureGains);
-        }
-      }
-    }
-  }
-}
-function broadcastOwnRelicChosenAsTargetByOpponent(state, cardDb, target, actorPlayerId) {
-  if (cardDb.get(target.definitionKey)?.card_type !== "Relic") return;
-  if (target.controllerId === actorPlayerId) return;
-  const owner = state.players.get(target.controllerId);
-  if (!owner) return;
-  const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
-  for (const contributor of contributors) {
-    for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-      contributorEffect.onOwnRelicChosenAsTargetByOpponent?.(state, cardDb, contributor, target, actorPlayerId);
-    }
-  }
-}
-function discardEnergyFromSpellPostHoc(state, cardDb, actingPlayerId, self, target, amount, rng) {
-  const opposingBefore = /* @__PURE__ */ new Map();
-  for (const opponent of getOpponents(state, actingPlayerId)) {
-    for (const c2 of opponent.inPlay) opposingBefore.set(c2.instanceId, c2.currentEnergy ?? 0);
-  }
-  const allBefore = /* @__PURE__ */ new Map();
-  for (const p of state.players.values()) {
-    for (const c2 of p.inPlay) allBefore.set(c2.instanceId, c2.currentEnergy ?? 0);
-  }
-  discardEnergy(state, cardDb, target, amount, "spell", void 0, rng);
-  broadcastSpellDiscardedOpposingEnergy(state, cardDb, actingPlayerId, self, opposingBefore, allBefore);
-}
-function castSpellFromOpponentZone(state, cardDb, caster, owner, sourceZone, spellInstanceId, postPlayDestination, rng = defaultRng, nestedChoices = {}) {
-  const list = owner[sourceZone];
-  const index = list.findIndex((c2) => c2.instanceId === spellInstanceId);
-  if (index === -1) return void 0;
-  const def = cardDb.get(list[index].definitionKey);
-  if (def?.card_type !== "Spell") return void 0;
-  const [spell] = list.splice(index, 1);
-  spell.controllerId = caster.playerId;
-  const baseCost = isVariableCostPower(def.cost) ? resolveVariableCost(def.cost, nestedChoices.chosenXValue ?? 0) : typeof def.cost === "number" ? def.cost : 0;
-  const cost = spellPlayCostWithModifiers(state, cardDb, def, caster.playerId, baseCost);
-  const magi = caster.activeMagi;
-  if ((magi?.currentEnergy ?? 0) < cost) {
-    list.splice(index, 0, spell);
-    return void 0;
-  }
-  if (magi) magi.currentEnergy = (magi.currentEnergy ?? 0) - cost;
-  spell.currentEnergy = null;
-  if (nestedChoices.chosenXValue !== void 0) {
-    spell.counters.startingX = nestedChoices.chosenXValue;
-  }
-  const spellEffect = getCardEffectByName(def.name);
-  if (spellEffect?.resolveSpell) {
-    const previousCurrentAction = state.currentAction;
-    state.currentAction = {
-      actorPlayerId: caster.playerId,
-      source: "spell",
-      sourceDefinitionKey: spell.definitionKey,
-      sourceInstanceId: spell.instanceId
-    };
-    spellEffect.resolveSpell({ state, cardDb, source: spell, controllingPlayer: caster, rng, ...nestedChoices });
-    logEvent(state, "spellResolved", { instanceId: spell.instanceId, name: def.name, stolenFromPlayerId: owner.playerId });
-    checkMagiDefeats(state, cardDb, rng);
-    consumeIntensifyIfUsed(state);
-    state.currentAction = previousCurrentAction;
-  }
-  const placedSomewhere = [...state.players.values()].some(
-    (p) => p.inPlay.some((c2) => c2.instanceId === spell.instanceId) || p.discardPile.some((c2) => c2.instanceId === spell.instanceId)
-  );
-  if (!placedSomewhere) {
-    if (postPlayDestination === "ownersDeckShuffled") {
-      owner.deck.push(spell);
-      shuffleDeck(owner, rng);
-    } else {
-      moveToDiscardPile(state, owner, spell);
-    }
-  }
-  return spell;
-}
-
-// src/energy.ts
-function addEnergy2(state, cardDb, instance, amount) {
-  if (amount < 0) {
-    throw new Error("addEnergy amount must be non-negative; use discardEnergy to remove energy");
-  }
-  instance.currentEnergy = (instance.currentEnergy ?? 0) + amount;
-  logEvent(state, "energyAdded", {
-    instanceId: instance.instanceId,
-    amount,
-    newTotal: instance.currentEnergy
-  });
-  checkForDefeats(state, cardDb);
-}
-function discardEnergy2(state, cardDb, instance, amount) {
-  if (amount < 0) {
-    throw new Error("discardEnergy amount must be non-negative");
-  }
-  const current = instance.currentEnergy ?? 0;
-  instance.currentEnergy = Math.max(0, current - amount);
-  logEvent(state, "energyDiscarded", {
-    instanceId: instance.instanceId,
-    amount,
-    newTotal: instance.currentEnergy
-  });
-  checkForDefeats(state, cardDb);
-}
-function rearrangeEnergy2(state, cardDb, from, to, amount) {
-  if (amount < 0) {
-    throw new Error("rearrangeEnergy amount must be non-negative");
-  }
-  const available = from.currentEnergy ?? 0;
-  const moved = Math.min(available, amount);
-  from.currentEnergy = available - moved;
-  to.currentEnergy = (to.currentEnergy ?? 0) + moved;
-  logEvent(state, "energyRearranged", {
-    fromInstanceId: from.instanceId,
-    toInstanceId: to.instanceId,
-    amount: moved
-  });
-  checkForDefeats(state, cardDb);
-}
-function restoreEnergy2(state, cardDb, instance, targetEnergy) {
-  instance.currentEnergy = Math.max(0, targetEnergy);
-  logEvent(state, "energyRestored", {
-    instanceId: instance.instanceId,
-    newTotal: instance.currentEnergy
-  });
-  checkForDefeats(state, cardDb);
-}
-function checkCreatureDefeats(state, cardDb, source, causedByPlayerId, rng = defaultRng) {
-  const actor = causedByPlayerId ?? state.currentAction?.actorPlayerId ?? state.activePlayerId;
-  const newlyDiscarded = [];
-  for (const player of state.players.values()) {
-    const survivingInPlay = [];
-    for (const card of [...player.inPlay]) {
-      if (!player.inPlay.some((c2) => c2.instanceId === card.instanceId)) continue;
-      const def = cardDb.get(card.definitionKey);
-      const isCreature3 = effectiveCardType(cardDb, card) === "Creature";
-      if (isCreature3 && (card.currentEnergy ?? 0) <= 0) {
-        let prevented = false;
-        for (const p of state.players.values()) {
-          const contributors = p.activeMagi ? [...p.inPlay, p.activeMagi] : p.inPlay;
-          for (const contributor of contributors) {
-            if (contributor.instanceId === card.instanceId) continue;
-            for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-              if (contributorEffect.preventsDiscardOf?.(state, cardDb, card, contributor, "zero-energy", rng)) {
-                prevented = true;
-                break;
-              }
-            }
-            if (prevented) break;
-          }
-          if (prevented) break;
-        }
-        if (prevented) {
-          survivingInPlay.push(card);
-          continue;
-        }
-        const redirectsToRelic = effectsFor(state, cardDb, card).some(
-          (cardEffect) => cardEffect.redirectsCombatDefeatToRelic?.(state, cardDb, card, source) ?? false
-        );
-        if (redirectsToRelic) {
-          setCardTypeOverride(state, cardDb, card, { asType: "Relic", expiresAfterTurnNumber: null });
-          survivingInPlay.push(card);
-          continue;
-        }
-        if (kybarsEchoApplies(state, cardDb, player, card)) {
-          card.currentEnergy = null;
-          addToZone(player, "hand", card);
-          releaseAttachedOnLeavePlay(state, cardDb, card);
-          logEvent(state, "effectReturnedToHand", { instanceId: card.instanceId, name: def?.name });
-          continue;
-        }
-        moveToDiscardPile(state, player, card, "zero-energy", source, actor);
-        releaseAttachedOnLeavePlay(state, cardDb, card);
-        logEvent(state, "creatureDefeated", { instanceId: card.instanceId, name: def?.name });
-        newlyDiscarded.push({ card, ownerId: player.playerId });
-      } else {
-        survivingInPlay.push(card);
-      }
-    }
-    player.inPlay = survivingInPlay;
-  }
-  for (const { card, ownerId } of newlyDiscarded) {
-    const cardOwner = state.players.get(ownerId);
-    if (cardOwner) checkEternalVigor(state, cardDb, card, cardOwner, actor, source === "combat");
-    const reactorSets = [[card]];
-    for (const reactingPlayer of state.players.values()) {
-      reactorSets.push(reactingPlayer.activeMagi ? [...reactingPlayer.inPlay, reactingPlayer.activeMagi] : reactingPlayer.inPlay);
-    }
-    for (const reactors of reactorSets) {
-      for (const instance of reactors) {
-        for (const effect of effectsFor(state, cardDb, instance)) {
-          if (!effect.onCardDiscardedFromPlay) continue;
-          effect.onCardDiscardedFromPlay(state, cardDb, card, ownerId, instance, "zero-energy", source, actor, rng);
-          logEvent(state, "onCardDiscardedFromPlayHookFired", { cardName: cardDb.get(instance.definitionKey).name, instanceId: instance.instanceId, reactingTo: cardDb.get(card.definitionKey)?.name });
-        }
-      }
-    }
-    for (const instance of cardOwner ? cardOwner.hand : []) {
-      for (const effect of effectsFor(state, cardDb, instance)) {
-        if (!effect.onCardDiscardedFromPlayWhileInHand) continue;
-        effect.onCardDiscardedFromPlayWhileInHand(state, cardDb, card, ownerId, instance);
-        logEvent(state, "onCardDiscardedFromPlayHookFired", { cardName: cardDb.get(instance.definitionKey).name, instanceId: instance.instanceId, reactingTo: cardDb.get(card.definitionKey)?.name });
-      }
-    }
-    broadcastDiscardPileReactors(state, cardDb, card);
-  }
-  if (newlyDiscarded.length > 0) {
-    sweepStandingConditions(state, cardDb, rng);
-  }
-}
-function checkMagiDefeats(state, cardDb, rng = defaultRng) {
-  for (const player of state.players.values()) {
-    if (player.activeMagi) {
-      const magi = player.activeMagi;
-      const contributors = player.activeMagi ? [player.activeMagi, ...player.inPlay] : [...player.inPlay];
-      const illusionsCount = contributors.some(
-        (c2) => effectsFor(state, cardDb, c2).some(
-          (contributorEffect) => contributorEffect.grantsIllusionsCountForOwnDefeat?.(state, cardDb, c2) ?? false
-        )
-      );
-      const ownCreatures3 = player.inPlay.filter(
-        (c2) => effectiveCardType(cardDb, c2) === "Creature" && (illusionsCount || !isIllusion(c2))
-      );
-      const magiEffects = effectsFor(state, cardDb, magi);
-      const customCondition = magiEffects.find((effect) => effect.customDefeatCondition !== void 0)?.customDefeatCondition;
-      const isDefeated = customCondition ? customCondition(state, cardDb, magi, ownCreatures3) : (magi.currentEnergy ?? 0) <= 0 && ownCreatures3.length === 0;
-      if (isDefeated) {
-        let prevented = false;
-        for (const contributor of contributors) {
-          for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-            if (!contributorEffect.offersDefeatPrevention?.(state, cardDb, contributor, magi)) continue;
-            contributorEffect.resolveDefeatPrevention?.(state, cardDb, contributor, magi, rng);
-            prevented = true;
-            break;
-          }
-          if (prevented) break;
-        }
-        if (!prevented && canOfferDefeatInterrupt(state, cardDb, player, magi)) {
-          player.pendingDefeatInterrupt = { magiInstanceId: magi.instanceId };
-          continue;
-        }
-        if (!prevented) {
-          defeatMagi(state, cardDb, player, rng);
-          if (state.tutorialMode && !state.tutorialEnded) {
-            const totalDefeats = [...state.players.values()].reduce(
-              (sum, p) => sum + p.defeatedMagi.length,
-              0
-            );
-            if (totalDefeats === 1) {
-              state.tutorialEnded = {
-                defeatedPlayerId: player.playerId,
-                magiInstanceId: magi.instanceId,
-                magiName: cardDb.get(magi.definitionKey)?.name ?? magi.instanceId
-              };
-              return;
-            }
-          }
-        }
-      }
-    }
-  }
-  checkForGameEnd(state);
-}
-function checkForDefeats(state, cardDb, source, rng = defaultRng) {
-  checkCreatureDefeats(state, cardDb, source, void 0, rng);
-  checkMagiDefeats(state, cardDb);
-}
-function defeatMagi(state, cardDb, player, rng = defaultRng) {
-  const magi = player.activeMagi;
-  const magiDef = cardDb.get(magi.definitionKey);
-  const magiEffects = effectsFor(state, cardDb, magi);
-  const preWipeInPlay = player.inPlay;
-  const survivingInPlay = [];
-  for (const card of player.inPlay) {
-    if (magiEffects.some((magiEffect) => magiEffect.survivesOwnMagiDefeat?.(state, cardDb, magi, card, magi) ?? false)) {
-      survivingInPlay.push(card);
-      continue;
-    }
-    const grantedBySibling = player.inPlay.some(
-      (contributor) => effectsFor(state, cardDb, contributor).some(
-        (contributorEffect) => contributorEffect.survivesOwnMagiDefeat?.(state, cardDb, magi, card, contributor) ?? false
-      )
-    );
-    if (grantedBySibling) {
-      survivingInPlay.push(card);
-      continue;
-    }
-    moveToDiscardPile(state, player, card);
-    releaseAttachedOnLeavePlay(state, cardDb, card);
-  }
-  player.inPlay = survivingInPlay;
-  player.defeatedMagi.push(magi);
-  player.activeMagi = null;
-  releaseAttachedOnLeavePlay(state, cardDb, magi);
-  player.handDiscardImmuneUntilMagiDefeated = false;
-  if (state.activePlayerId !== player.playerId && magiDef) {
-    for (const region of magiDef.regions) player.pendingSpiritSpellRegions.push(region);
-  }
-  logEvent(state, "magiDefeated", {
-    playerId: player.playerId,
-    instanceId: magi.instanceId,
-    name: cardDb.get(magi.definitionKey)?.name
-  });
-  for (const magiEffect of magiEffects) {
-    if (!magiEffect.onOwnMagiDefeated) continue;
-    magiEffect.onOwnMagiDefeated(state, cardDb, magi, magi, rng);
-    logEvent(state, "onOwnMagiDefeatedHookFired", { cardName: magiDef.name, instanceId: magi.instanceId });
-  }
-  for (const card of preWipeInPlay) {
-    for (const cardEffect of effectsFor(state, cardDb, card)) {
-      if (cardEffect.onOwnMagiDefeated) {
-        cardEffect.onOwnMagiDefeated(state, cardDb, card, magi, rng);
-        logEvent(state, "onOwnMagiDefeatedHookFired", { cardName: cardDb.get(card.definitionKey).name, instanceId: card.instanceId });
-      }
-    }
-  }
-  for (const p of state.players.values()) {
-    const contributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
-    for (const contributor of contributors) {
-      for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-        contributorEffect.onAnyMagiDefeated?.(state, cardDb, contributor, magi, player.playerId, rng);
-      }
-    }
-  }
-  if (state.activePlayerId !== player.playerId) {
-    const activePlayer = state.players.get(state.activePlayerId);
-    if (activePlayer) {
-      const contributors = activePlayer.activeMagi ? [activePlayer.activeMagi, ...activePlayer.inPlay] : [...activePlayer.inPlay];
-      for (const contributor of contributors) {
-        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-          if (contributorEffect.onOpponentMagiDefeatedByActivePlayer) {
-            contributorEffect.onOpponentMagiDefeatedByActivePlayer(state, cardDb, contributor);
-            logEvent(state, "onOpponentMagiDefeatedByActivePlayerHookFired", { cardName: cardDb.get(contributor.definitionKey).name, instanceId: contributor.instanceId });
-          }
-        }
-      }
-    }
-  }
-}
-function checkForGameEnd(state) {
-  if (state.winnerId || state.isDraw) return;
-  const stillIn = state.turnOrder.filter((id) => {
-    const p = getPlayer(state, id);
-    return !(p.magiQueue.length === 0 && p.activeMagi === null);
-  });
-  if (stillIn.length === 1) {
-    state.winnerId = stillIn[0];
-    logEvent(state, "gameOver", { winnerId: state.winnerId });
-  } else if (stillIn.length === 0) {
-    state.isDraw = true;
-    logEvent(state, "gameOverSimultaneousDefeat", { playerIds: state.turnOrder });
-  }
-}
-function forfeitGame(state, forfeitingPlayerId) {
-  if (state.winnerId || state.isDraw) return;
-  const winnerId = state.turnOrder.find((id) => id !== forfeitingPlayerId);
-  if (!winnerId) return;
-  state.winnerId = winnerId;
-  logEvent(state, "gameOverByForfeit", { winnerId, forfeitedBy: forfeitingPlayerId });
-}
-function canOfferDefeatInterrupt(state, cardDb, player, magi) {
-  if (player.spiritOfRayjeUsesRemaining <= 0) return false;
-  if (player.defeatInterruptDeclinedFor === magi.instanceId) return false;
-  return player.hand.some((c2) => cardDb.get(c2.definitionKey)?.name === "Spirit of Rayje");
-}
-function previewDefeatInterrupt(state, playerId) {
-  return state.players.get(playerId)?.pendingDefeatInterrupt ?? null;
-}
-function declineDefeatInterrupt(state, cardDb, playerId, rng = defaultRng) {
-  const player = state.players.get(playerId);
-  if (!player?.pendingDefeatInterrupt) return;
-  player.defeatInterruptDeclinedFor = player.pendingDefeatInterrupt.magiInstanceId;
-  player.pendingDefeatInterrupt = null;
-  checkMagiDefeats(state, cardDb, rng);
-}
-
-// src/spiritSpells.ts
-function isSpiritSpell(def) {
-  return !!def && def.card_type === "Spell" && /only play one spirit spell per magi defeated/i.test(def.text ?? "");
-}
-function hasOpenSpiritSpellWindow(state, playerId, def) {
-  if (!isSpiritSpell(def)) return false;
-  const pending = state.players.get(playerId)?.pendingSpiritSpellRegions ?? [];
-  return def.regions.some((region) => pending.includes(region));
-}
-function closeSpiritSpellWindow(state, playerId) {
-  const player = state.players.get(playerId);
-  if (player) player.pendingSpiritSpellRegions = [];
-}
-function hasOpenDefeatInterruptWindow(state, playerId, def) {
-  if (def?.name !== "Spirit of Rayje") return false;
-  const player = state.players.get(playerId);
-  return !!player?.pendingDefeatInterrupt && player.spiritOfRayjeUsesRemaining > 0;
-}
-
-// src/energizeModifiers.ts
-function addEnergizeModifier(instance, amount, options) {
-  instance.energizeModifiers.push({
-    amount,
-    expiresAfterTurnNumber: options?.expiresAfterTurnNumber,
-    oneShot: options?.oneShot,
-    isGrant: options?.isGrant
-  });
-}
-function isEnergizeModifierActive(state, mod) {
-  if (mod.expiresAfterTurnNumber !== void 0 && state.turnNumber > mod.expiresAfterTurnNumber) {
-    return false;
-  }
-  return true;
-}
-function activeEnergizeModifiers(state, instance) {
-  return instance.energizeModifiers.filter((mod) => isEnergizeModifierActive(state, mod));
-}
-function consumeOneShotEnergizeModifiers(instance) {
-  instance.energizeModifiers = instance.energizeModifiers.filter((mod) => !mod.oneShot);
-}
-
 // src/play.ts
 var PHASES_FOR_CARD_TYPE = {
   Relic: ["prs1", "prs2"],
@@ -5261,6 +5491,24 @@ function previewHandDiscardCostReductionOffer(state, cardDb, playerId, handInsta
   if (!def || !magi) return void 0;
   return findHandDiscardCostReductionOffer(state, cardDb, playerId, instance, def, magi, player);
 }
+function previewPlayPreventionOffers(state, cardDb, playedDef, playerId) {
+  if (getCardEffectByName(playedDef.name)?.preventsInterception === true) return [];
+  const preventers = [];
+  for (const p of state.players.values()) {
+    const contributors = p.activeMagi ? [...p.inPlay, p.activeMagi] : p.inPlay;
+    for (const contributor of contributors) {
+      for (const effect of effectsFor(state, cardDb, contributor)) {
+        if (!effect.preventsPlayOf) continue;
+        if (!effect.confirmPreventedPlay) continue;
+        if (effect.preventsPlayOf(state, cardDb, playedDef, playerId, contributor)) {
+          preventers.push(contributor);
+          break;
+        }
+      }
+    }
+  }
+  return preventers;
+}
 function findPlayPreventer(state, cardDb, playedDef, playerId, { passiveOnly = false } = {}) {
   if (getCardEffectByName(playedDef.name)?.preventsInterception === true) return void 0;
   for (const p of state.players.values()) {
@@ -5287,7 +5535,10 @@ function isLegalToPlay(state, cardDb, playerId, handInstanceId, options = {}) {
   );
   const isSpiritSpellCandidate = state.activePlayerId !== playerId && (hasOpenSpiritSpellWindow(state, playerId, spiritSpellDef) || hasOpenDefeatInterruptWindow(state, playerId, spiritSpellDef));
   const isFateWhimsyCandidate = state.pendingDieRoll !== null && state.pendingDieRoll.pendingRerollChoice === null && state.pendingDieRoll.eligibleReactorPlayerIds.includes(playerId) && spiritSpellDef?.name === "Fate's Whimsy";
-  if (state.activePlayerId !== playerId && !isReactiveWindowCandidate && !isImpendingMagiAttackCandidate && !isImpendingCreatureAttackCandidate && !isBloomBonusCandidate && !isSpiritSpellCandidate && !isFateWhimsyCandidate) {
+  if (state.activePlayerId !== playerId && !isReactiveWindowCandidate && !isImpendingMagiAttackCandidate && !isImpendingCreatureAttackCandidate && !isBloomBonusCandidate && !isSpiritSpellCandidate && !isFateWhimsyCandidate && // D7 (2026-08-28): PlayCardOptions.viaReactiveSpellPlay -- the reactive-Spell-play stages
+  // (`ashgarSpellPlay` / `tempestHyrenSpellPlay` on `attemptDeclareAttack`) authorize an
+  // off-turn Spell play by the reactor's controller. See that option field's own doc comment.
+  !options.viaReactiveSpellPlay) {
     return { legal: false, reason: "Only the active player may play cards" };
   }
   const player = getPlayer(state, playerId);
@@ -5346,7 +5597,16 @@ function isLegalToPlay(state, cardDb, playerId, handInstanceId, options = {}) {
       options.impendingCreatureAttackCandidate.defendingInstanceId
     ) === true
   );
-  if ((isReactiveWindowCandidate || isImpendingMagiAttackCandidate || isImpendingCreatureAttackCandidate) && !qualifiesViaReactiveWindow && !qualifiesViaMagiAttack && !qualifiesViaCreatureAttack && !isBloomBonusCandidate && !isSpiritSpellCandidate && !isFateWhimsyCandidate) {
+  if ((isReactiveWindowCandidate || isImpendingMagiAttackCandidate || isImpendingCreatureAttackCandidate) && !qualifiesViaReactiveWindow && !qualifiesViaMagiAttack && !qualifiesViaCreatureAttack && !isBloomBonusCandidate && !isSpiritSpellCandidate && !isFateWhimsyCandidate && // D7 landing miss (fixed 2026-09-01, Fix B): the same `viaReactiveSpellPlay` escape wired
+  // into the "only active player" gate above at line 726 was missed here. The reactive-Spell-
+  // play stages (`ashgarSpellPlay` / `tempestHyrenSpellPlay` on `attemptDeclareAttack`, and
+  // Dream Steal's `playSpellFromOpponentZone`) authorize an off-turn Spell play by the
+  // reactor's controller and set `reactiveWindow.kind = 'opponentAttackStepBegan'` throughout
+  // the Attack step, so `isReactiveWindowCandidate` is true; a plain Fire Spell has no
+  // `reactsToWindow` hook, all `qualifiesVia*` are false, and this gate threw
+  // "X cannot be played reactively right now" -- contradicting the D7 doc comment 400-odd
+  // lines up that explicitly claims the reactive Spell "has already cleared its own gate."
+  !options.viaReactiveSpellPlay) {
     return { legal: false, reason: `${def.name} cannot be played reactively right now` };
   }
   if (state.blockedCardNamesThisTurn.has(def.name)) {
@@ -5373,7 +5633,7 @@ function isLegalToPlay(state, cardDb, playerId, handInstanceId, options = {}) {
   const declaredSpellPhases = def.card_type === "Spell" ? getCardEffectByName(def.name)?.spellLegalPhases : void 0;
   const allowedPhases = declaredSpellPhases ?? PHASES_FOR_CARD_TYPE[def.card_type];
   const viaSpiritOfParadwyn = def.card_type === "Creature" && state.phase === "prs1" && player.spiritOfParadwynTurn === state.turnNumber && effectiveRegions(state, cardDb, instance).includes(regionForTargetFilter(state, "Paradwyn"));
-  if (!options.ignorePhaseGate && !isReactiveWindowCandidate && !isImpendingMagiAttackCandidate && !isImpendingCreatureAttackCandidate && !isBloomBonusCandidate && !isSpiritSpellCandidate && !isFateWhimsyCandidate && !viaSpiritOfParadwyn && !allowedPhases.includes(state.phase)) {
+  if (!options.ignorePhaseGate && !options.viaReactiveSpellPlay && !isReactiveWindowCandidate && !isImpendingMagiAttackCandidate && !isImpendingCreatureAttackCandidate && !isBloomBonusCandidate && !isSpiritSpellCandidate && !isFateWhimsyCandidate && !viaSpiritOfParadwyn && !allowedPhases.includes(state.phase)) {
     return {
       legal: false,
       reason: `${def.card_type} cards cannot be played during the ${state.phase} phase`
@@ -5403,7 +5663,15 @@ function isLegalToPlay(state, cardDb, playerId, handInstanceId, options = {}) {
     return { legal: false, reason: "No active Magi" };
   }
   const magiDef = magi ? effectiveMagiDef(cardDb.get(magi.definitionKey), magi) : void 0;
-  let regionCheck = magi && magiDef ? checkRegionLegality(magiDef, def, effectiveRegions(state, cardDb, instance)) : { legal: true, regionalPenalty: 0 };
+  let regionCheck = options.bypassRegionLegality ? { legal: true, regionalPenalty: 0 } : magi && magiDef ? checkRegionLegality(
+    magiDef,
+    def,
+    effectiveRegions(state, cardDb, instance),
+    // Hrada's Tainted Touch exception (2026-08-27) -- forwards the per-Magi override so
+    // `checkRegionLegality` can promote a would-be tier-0 blocked play of an
+    // original-region Creature/Spell to a legal tier-1 play with the printed penalty.
+    magi.magiIdentityOverride?.originalRegionPlayPenalty
+  ) : { legal: true, regionalPenalty: 0 };
   if (magi && (!regionCheck.legal || regionCheck.regionalPenalty > 0)) {
     for (const effect of effectsFor(state, cardDb, instance)) {
       if (effect.waivesOwnRegionalPenalty?.(state, cardDb, instance, playerId, magi)) {
@@ -5601,12 +5869,18 @@ function isLegalToPlay(state, cardDb, playerId, handInstanceId, options = {}) {
     baseCost += 2;
     noteAdjustment(costAdjustments, "Spirit of Paradwyn (cannot be reduced)", 2);
   }
+  if (options.costOverride !== void 0 && options.costOverride !== baseCost) {
+    const before = baseCost;
+    baseCost = options.costOverride;
+    noteAdjustment(costAdjustments, "reactive cost override", baseCost - before);
+  }
   const totalCost = baseCost + regionCheck.regionalPenalty;
   noteAdjustment(costAdjustments, "regional penalty", regionCheck.regionalPenalty);
-  const magiEnergy = magi?.currentEnergy ?? 0;
+  const paidByInstance = options.paidByInstanceId ? magi && magi.instanceId === options.paidByInstanceId ? magi : player.inPlay.find((c2) => c2.instanceId === options.paidByInstanceId) : void 0;
+  const magiEnergy = paidByInstance ? paidByInstance.currentEnergy ?? 0 : magi?.currentEnergy ?? 0;
   const breakdown = { printed: printedCost, total: totalCost, adjustments: costAdjustments };
   const canAffordViaAlternateCost = anyAlternateCostAvailable(state, cardDb, instance);
-  const canAfford = magiEnergy >= totalCost || anyPlayCostRedirectorCanAfford(state, cardDb, player, def, playerId, totalCost) || canAffordViaAlternateCost;
+  const canAfford = paidByInstance ? magiEnergy >= totalCost : magiEnergy >= totalCost || anyPlayCostRedirectorCanAfford(state, cardDb, player, def, playerId, totalCost) || canAffordViaAlternateCost;
   if (!canAfford) {
     return { legal: false, reason: `Not enough energy: need ${totalCost}, have ${magiEnergy}`, breakdown };
   }
@@ -5820,9 +6094,17 @@ function previewOpponentHandPickOfferForSpell(state, cardDb, playerId, handInsta
     return target ? state.players.get(target.controllerId) : void 0;
   })();
   if (!owner) return void 0;
-  const pool3 = withRegionSwap(state, options.regionSwap, () => owner.hand.filter((c2) => !decl.filter || decl.filter(state, cardDb, playerId, c2)));
+  const pool3 = withRegionSwap(state, options.regionSwap, () => {
+    const baseHand = owner.hand.filter((c2) => !decl.filter || decl.filter(state, cardDb, playerId, c2));
+    if (!decl.includesBouncedTarget || !options.chosenTargetId) return baseHand;
+    const target = findCreatureOrMagiById(state, options.chosenTargetId);
+    if (!target || target.controllerId !== owner.playerId) return baseHand;
+    if (baseHand.some((c2) => c2.instanceId === target.instanceId)) return baseHand;
+    if (decl.filter && !decl.filter(state, cardDb, playerId, target)) return baseHand;
+    return [...baseHand, target];
+  });
   if (pool3.length === 0) return void 0;
-  return { kind: "chooseFromOpponentHand", pool: pool3, maxCount: decl.maxCount, owedToPlayerId: playerId, handOwnerPlayerId: owner.playerId };
+  return { kind: "chooseFromOpponentHand", pool: pool3, minCount: decl.minCount ?? 0, maxCount: decl.maxCount, owedToPlayerId: playerId, handOwnerPlayerId: owner.playerId };
 }
 function previewRegionSwapOffersForSpell(state, cardDb, playerId, handInstanceId) {
   const player = getPlayer(state, playerId);
@@ -5995,19 +6277,37 @@ function playCard(state, cardDb, playerId, handInstanceId, options = {}, rng = d
   const player = getPlayer(state, playerId);
   const handInstance = player.hand.find((c2) => c2.instanceId === handInstanceId);
   const handDef = cardDb.get(handInstance.definitionKey);
-  const preventer = findPlayPreventer(state, cardDb, handDef, playerId);
-  if (preventer) {
-    const preventerDef = cardDb.get(preventer.definitionKey);
-    const preventerEffect = preventerDef ? getCardEffectByName(preventerDef.name) : void 0;
-    preventerEffect?.confirmPreventedPlay?.(state, cardDb, handDef, playerId, preventer, rng);
-    return handInstance;
+  const preAnswer = options.playPrevention;
+  if (preAnswer !== "skip") {
+    let preventer;
+    if (preAnswer && typeof preAnswer === "object") {
+      for (const p of state.players.values()) {
+        const contributors = p.activeMagi ? [...p.inPlay, p.activeMagi] : p.inPlay;
+        const match = contributors.find((c2) => c2.instanceId === preAnswer.chosenPreventerInstanceId);
+        if (match) {
+          preventer = match;
+          break;
+        }
+      }
+    } else {
+      preventer = findPlayPreventer(state, cardDb, handDef, playerId);
+    }
+    if (preventer) {
+      const preventerDef = cardDb.get(preventer.definitionKey);
+      const preventerEffect = preventerDef ? getCardEffectByName(preventerDef.name) : void 0;
+      preventerEffect?.confirmPreventedPlay?.(state, cardDb, handDef, playerId, preventer, rng);
+      return handInstance;
+    }
   }
   player.cardsPlayedThisTurn += 1;
   const instance = removeFromZone(player, "hand", handInstanceId);
   const def = cardDb.get(instance.definitionKey);
   const magi = player.activeMagi;
   let payer = magi;
-  if (options.chosenCostRedirectInstanceId !== void 0) {
+  if (options.paidByInstanceId) {
+    const designated = magi && magi.instanceId === options.paidByInstanceId ? magi : player.inPlay.find((c2) => c2.instanceId === options.paidByInstanceId);
+    if (designated) payer = designated;
+  } else if (options.chosenCostRedirectInstanceId !== void 0) {
     const chosen = options.chosenCostRedirectInstanceId;
     if (chosen !== null) {
       const contributor = player.inPlay.find((c2) => c2.instanceId === chosen);
@@ -6154,7 +6454,9 @@ function playCard(state, cardDb, playerId, handInstanceId, options = {}, rng = d
       // Vault of Knowledge Key's Archive (Bucket D Batch C part 2, 2026-08-14) -- Spell-side twin
       // of the same field on usePower's `state.currentAction`. Threaded here so any future Spell
       // whose body self-discards a same-source in-play Relic falls under Archive too.
-      ...options.archiveRedirect !== void 0 ? { archiveRedirect: options.archiveRedirect } : {}
+      ...options.archiveRedirect !== void 0 ? { archiveRedirect: options.archiveRedirect } : {},
+      ...options.energyLossRedirect !== void 0 ? { energyLossRedirect: options.energyLossRedirect } : {},
+      ...options.discardOfPrevention !== void 0 ? { discardOfPrevention: options.discardOfPrevention } : {}
     };
     const chargeableTargetIds = /* @__PURE__ */ new Set();
     if (effectiveChosenTargetId) chargeableTargetIds.add(effectiveChosenTargetId);
@@ -6311,8 +6613,10 @@ function playCard(state, cardDb, playerId, handInstanceId, options = {}, rng = d
         } : {},
         ...describeZoneChanges(state, zonesBeforeResolve)
       });
-      broadcastSpellDiscardedOpposingEnergy(state, cardDb, playerId, instance, opposingBefore, allBefore);
-      broadcastSpellAddedEnergyToCreature(state, cardDb, instance, allBefore);
+      if (!options.suppressSpellBroadcasts) {
+        broadcastSpellDiscardedOpposingEnergy(state, cardDb, playerId, instance, opposingBefore, allBefore);
+        broadcastSpellAddedEnergyToCreature(state, cardDb, instance, allBefore);
+      }
       spellEffect?.afterSpellDefeatCheck?.(state, cardDb, instance, effectiveChosenTargetId);
       checkMagiDefeats(state, cardDb, rng);
       if (firdStoneProtectedTargetId) {
@@ -6696,6 +7000,47 @@ function declineFateWhimsyOffer(state, cardDb, playerId, rng = defaultRng) {
     finalizePendingDieRoll(state, cardDb, rng);
   }
   return { ok: true };
+}
+function previewDieRerollGrantOffer(state, playerId) {
+  const p = state.pendingDieRerollGrantOffer;
+  if (!p) return null;
+  if (p.owedToPlayerId !== playerId) return null;
+  return {
+    rollerId: p.rollerId,
+    sourceInstanceId: p.sourceInstanceId,
+    sides: p.sides,
+    eligibleGrantorInstanceIds: p.eligibleGrantorInstanceIds
+  };
+}
+function resolveDieRerollGrantOffer(state, cardDb, chosenGrantorInstanceId, rng = defaultRng) {
+  const offer = state.pendingDieRerollGrantOffer;
+  if (!offer) return { ok: false, reason: "No reroll-grant offer is open" };
+  state.pendingDieRerollGrantOffer = null;
+  logEvent(state, "dieRerollGrantOfferResolved", {
+    rollerId: offer.rollerId,
+    sourceInstanceId: offer.sourceInstanceId,
+    chosenGrantorInstanceId: chosenGrantorInstanceId ?? null
+  });
+  state.dieRerollGrantAnswer = chosenGrantorInstanceId ? { chosenGrantorInstanceId } : "skip";
+  const source = findCardAnywhereById(state, offer.sourceInstanceId);
+  if (!source) {
+    state.dieRerollGrantAnswer = void 0;
+    logEvent(state, "dieRollFinalized", {
+      sourceInstanceId: offer.sourceInstanceId,
+      originalValue: 0,
+      finalValue: 0
+    });
+    invokeRollConsumer(state, cardDb, null, offer.consumerKey, offer.consumerPayload, 0, rng);
+    return { ok: true };
+  }
+  requestDieRoll(state, cardDb, source, offer.rollerId, offer.sides, offer.consumerKey, offer.consumerPayload, rng);
+  state.dieRerollGrantAnswer = void 0;
+  return { ok: true };
+}
+function declineStalePendingDieRerollGrantOffer(state, cardDb, rng = defaultRng) {
+  if (state.pendingDieRerollGrantOffer) {
+    resolveDieRerollGrantOffer(state, cardDb, void 0, rng);
+  }
 }
 function finalizePendingDieRoll(state, cardDb, rng = defaultRng) {
   const p = state.pendingDieRoll;
@@ -8061,7 +8406,7 @@ function declareAttack(state, cardDb, attackingPlayerId, declaration, hooks = {}
     const siphon = Math.floor(magiEnergyLost / 2);
     if (ownMagi && siphon > 0) addEnergy(state, cardDb, ownMagi, siphon, "effect");
   }
-  checkForDefeats(state, cardDb, "combat", rng);
+  checkCreatureDefeats(state, cardDb, "combat", void 0, rng);
   if (attackingPlayer.sabertoothTauntUntilTurn !== null && state.turnNumber <= attackingPlayer.sabertoothTauntUntilTurn && (attacker.currentEnergy ?? 0) > 0) {
     addEnergy(state, cardDb, attacker, 1, "effect");
   }
@@ -8108,6 +8453,8 @@ function declareAttack(state, cardDb, attackingPlayerId, declaration, hooks = {}
       effect.afterCombat?.(ctx, outcome, instance);
     }
   }
+  checkCreatureDefeats(state, cardDb, "combat", void 0, rng);
+  checkMagiDefeats(state, cardDb, rng);
   const windowSubject = defender ?? defendingPlayer.activeMagi;
   state.reactiveWindow = windowSubject ? {
     kind: "cardAttacked",
@@ -8179,6 +8526,55 @@ function previewIdentityOverrideOffersForCombat(state, cardDb) {
   return { pool: pool3, specifiedRegions: regionsArr, specifiedCreatureTypes: typesArr, triggerSourceInstanceId };
 }
 
+// src/cardEffects/goodOlAshgar.ts
+var COMBAT_REFLEXES_USED_THIS_TURN = "ashgarCombatReflexesUsedThisTurn";
+function goodOlAshgarSpellCost(cardDb, card, chosenXValue) {
+  const printedCost = cardDb.get(card.definitionKey)?.cost;
+  const base = typeof printedCost === "number" ? printedCost : typeof printedCost === "string" ? resolveVariableCost(printedCost, chosenXValue ?? 0) : 0;
+  return Math.max(0, base - 2);
+}
+registerCardEffect("Good Ol' Ashgar", {
+  offersOnDefendingMagiAttackSpellPlay: (state, cardDb, self, defendingPlayerId) => {
+    if (hasDurationTag(self, COMBAT_REFLEXES_USED_THIS_TURN)) return void 0;
+    const player = state.players.get(defendingPlayerId);
+    if (!player) return void 0;
+    const available = self.currentEnergy ?? 0;
+    const pool3 = player.hand.filter((c2) => {
+      const def = cardDb.get(c2.definitionKey);
+      if (def?.card_type !== "Spell" || !def.regions.includes("Cald")) return false;
+      return goodOlAshgarSpellCost(cardDb, c2) <= available;
+    });
+    return pool3.length > 0 ? pool3 : void 0;
+  },
+  // D7 (2026-08-28): once-per-turn tag stamped when the ashgarSpellPlay reactive-offer stage is
+  // committed (right before the nested `attemptPlayCard`), whether the reactive Spell later
+  // resolves normally or gets negated. Called from `armPendingDeclareAttackResumeAndPlaySpell`
+  // in reactiveOffers.ts; the offer hook above reads the same tag to skip a second offer this
+  // turn. Tempest Hyren has no once-per-turn clause and does NOT implement this hook.
+  onReactiveSpellPlayConsumed: (state, cardDb, self) => {
+    addDurationTag(state, cardDb, self, COMBAT_REFLEXES_USED_THIS_TURN, state.turnNumber);
+  }
+});
+
+// src/cardEffects/tempestHyren.ts
+function tempestHyrenSpellCost(cardDb, card, chosenXValue) {
+  const printedCost = cardDb.get(card.definitionKey)?.cost;
+  const base = typeof printedCost === "number" ? printedCost : typeof printedCost === "string" ? resolveVariableCost(printedCost, chosenXValue ?? 0) : 0;
+  return Math.max(1, base - 2);
+}
+registerCardEffect("Tempest Hyren", {
+  offersOnAttackSpellPlay: (state, cardDb, self, attackingPlayerId) => {
+    const player = state.players.get(attackingPlayerId);
+    if (!player) return void 0;
+    const available = self.currentEnergy ?? 0;
+    return player.hand.filter((c2) => {
+      const def = cardDb.get(c2.definitionKey);
+      if (def?.card_type !== "Spell" || !def.regions.includes("Arderial")) return false;
+      return tempestHyrenSpellCost(cardDb, c2) <= available;
+    });
+  }
+});
+
 // src/reactiveOffers.ts
 var USE_POWER_STAGE_FIELD = {
   negation: "negatedByInstanceId",
@@ -8192,6 +8588,13 @@ var PLAY_CARD_STAGE_FIELD = {
   furokProtection: "firdStoneProtectedByInstanceId",
   discardSave: "discardSavedByHandInstanceId"
 };
+function bakeHandDiscardAnswer(prior, stage, chosenInstanceId) {
+  if (!chosenInstanceId) {
+    if (prior?.substitutedByInstanceId || prior?.blockedByInstanceId) return prior;
+    return { declined: true };
+  }
+  return stage === "hostileHandDiscardBlock" ? { blockedByInstanceId: chosenInstanceId } : { substitutedByInstanceId: chosenInstanceId };
+}
 function nextUsePowerStage(state, cardDb, playerId, sourceInstanceId, powerName, options, checkedStages) {
   if (!checkedStages.includes("targetProtection") && options.chosenTargetId) {
     const offer = previewIdentityOverrideOfferForPowerTargetProtection(state, cardDb, options.chosenTargetId);
@@ -8214,6 +8617,35 @@ function nextUsePowerStage(state, cardDb, playerId, sourceInstanceId, powerName,
   if (!checkedStages.includes("furokProtection") && options.chosenTargetId) {
     const pool3 = previewFurokProtectionOffers(state, cardDb, playerId, sourceInstanceId, powerName, options.chosenTargetId);
     if (pool3.length > 0) return { stage: "furokProtection", pool: pool3.map((c2) => c2.instanceId) };
+  }
+  if (!checkedStages.includes("energyLossRedirect") && options.chosenTargetId) {
+    const pool3 = previewEnergyLossRedirectOffers(state, cardDb, playerId, options.chosenTargetId);
+    if (pool3.length > 0) {
+      return { stage: "energyLossRedirect", pool: pool3.map((c2) => c2.instanceId), owedToPlayerId: pool3[0].controllerId };
+    }
+  }
+  if (!checkedStages.includes("discardOfPrevention")) {
+    const pool3 = previewDiscardOfPreventionOffers(state, cardDb, playerId);
+    if (pool3.length > 0) {
+      return { stage: "discardOfPrevention", pool: pool3.map((c2) => c2.instanceId), owedToPlayerId: pool3[0].controllerId };
+    }
+  }
+  if (!checkedStages.includes("hostileHandDiscardBlock") || !checkedStages.includes("hostileHandDiscardSubstitute")) {
+    const actor = getPlayer(state, playerId).activeMagi?.instanceId === sourceInstanceId ? getPlayer(state, playerId).activeMagi : getPlayer(state, playerId).inPlay.find((c2) => c2.instanceId === sourceInstanceId);
+    if (actor && actorCausesHostileHandDiscard(state, cardDb, actor, options)) {
+      if (!checkedStages.includes("hostileHandDiscardBlock")) {
+        const pool3 = previewHostileHandDiscardBlockOffers(state, cardDb, playerId);
+        if (pool3.length > 0) {
+          return { stage: "hostileHandDiscardBlock", pool: pool3.map((c2) => c2.instanceId), owedToPlayerId: pool3[0].controllerId };
+        }
+      }
+      if (!checkedStages.includes("hostileHandDiscardSubstitute")) {
+        const pool3 = previewHostileHandDiscardSubstitutionOffers(state, cardDb, playerId);
+        if (pool3.length > 0) {
+          return { stage: "hostileHandDiscardSubstitute", pool: pool3.map((c2) => c2.instanceId), owedToPlayerId: pool3[0].controllerId };
+        }
+      }
+    }
   }
   return null;
 }
@@ -8269,6 +8701,7 @@ function attemptUsePower(state, cardDb, playerId, sourceInstanceId, powerName, o
       owedToPlayerId: handPick.owedToPlayerId,
       handOwnerPlayerId: handPick.handOwnerPlayerId,
       pool: handPick.pool.map((c2) => c2.instanceId),
+      minCount: handPick.minCount ?? 0,
       maxCount: handPick.maxCount,
       actingPlayerId: playerId,
       sourceInstanceId,
@@ -8307,6 +8740,7 @@ function attemptUsePower(state, cardDb, playerId, sourceInstanceId, powerName, o
   }
   usePower(state, cardDb, playerId, sourceInstanceId, powerName, {}, options, rng);
   record("usePower", [playerId, sourceInstanceId, powerName, options]);
+  state.acceptedHandDiscardOffer = null;
 }
 function resolveOpponentHandChoice(state, cardDb, chosenInstanceIds, rng = defaultRng, record = () => {
 }, nestedSpellChoices) {
@@ -8341,6 +8775,14 @@ function declineStalePendingOpponentSubChoice(state, cardDb, rng = defaultRng) {
   }
 }
 function nextPlayCardStage(state, cardDb, playerId, handInstanceId, options, checkedStages) {
+  if (!checkedStages.includes("playPrevention")) {
+    const handCard = getPlayer(state, playerId).hand.find((c2) => c2.instanceId === handInstanceId);
+    const handDef = handCard && cardDb.get(handCard.definitionKey);
+    const pool3 = handDef ? previewPlayPreventionOffers(state, cardDb, handDef, playerId) : [];
+    if (pool3.length > 0) {
+      return { stage: "playPrevention", pool: pool3, owedToPlayerId: pool3[0].controllerId };
+    }
+  }
   if (!checkedStages.includes("targetRedirectOffer") && options.chosenTargetId) {
     const pool3 = previewSpellTargetRedirectOffers(state, cardDb, playerId, handInstanceId, options.chosenTargetId);
     if (pool3.length > 0) return { stage: "targetRedirectOffer", pool: pool3 };
@@ -8366,6 +8808,37 @@ function nextPlayCardStage(state, cardDb, playerId, handInstanceId, options, che
   if (!checkedStages.includes("discardSave") && options.chosenTargetId) {
     const pool3 = previewDiscardSaveOffersForSpell(state, cardDb, playerId, handInstanceId, options.chosenTargetId);
     if (pool3.length > 0) return { stage: "discardSave", pool: pool3 };
+  }
+  if (!checkedStages.includes("energyLossRedirect") && options.chosenTargetId) {
+    const pool3 = previewEnergyLossRedirectOffers(state, cardDb, playerId, options.chosenTargetId);
+    if (pool3.length > 0) {
+      return { stage: "energyLossRedirect", pool: pool3, owedToPlayerId: pool3[0].controllerId };
+    }
+  }
+  if (!checkedStages.includes("discardOfPrevention")) {
+    const pool3 = previewDiscardOfPreventionOffers(state, cardDb, playerId);
+    if (pool3.length > 0) {
+      return { stage: "discardOfPrevention", pool: pool3, owedToPlayerId: pool3[0].controllerId };
+    }
+  }
+  if (!checkedStages.includes("hostileHandDiscardBlock") || !checkedStages.includes("hostileHandDiscardSubstitute")) {
+    const actor = getPlayer(state, playerId).hand.find(
+      (c2) => "instanceId" in c2 && c2.instanceId === handInstanceId
+    );
+    if (actor && actorCausesHostileHandDiscard(state, cardDb, actor, options)) {
+      if (!checkedStages.includes("hostileHandDiscardBlock")) {
+        const pool3 = previewHostileHandDiscardBlockOffers(state, cardDb, playerId);
+        if (pool3.length > 0) {
+          return { stage: "hostileHandDiscardBlock", pool: pool3, owedToPlayerId: pool3[0].controllerId };
+        }
+      }
+      if (!checkedStages.includes("hostileHandDiscardSubstitute")) {
+        const pool3 = previewHostileHandDiscardSubstitutionOffers(state, cardDb, playerId);
+        if (pool3.length > 0) {
+          return { stage: "hostileHandDiscardSubstitute", pool: pool3, owedToPlayerId: pool3[0].controllerId };
+        }
+      }
+    }
   }
   return null;
 }
@@ -8395,6 +8868,7 @@ function attemptPlayCard(state, cardDb, playerId, handInstanceId, options = {}, 
       owedToPlayerId: handPick.owedToPlayerId,
       handOwnerPlayerId: handPick.handOwnerPlayerId,
       pool: handPick.pool.map((c2) => c2.instanceId),
+      minCount: handPick.minCount ?? 0,
       maxCount: handPick.maxCount,
       actingPlayerId: playerId,
       sourceInstanceId: handInstanceId,
@@ -8406,6 +8880,8 @@ function attemptPlayCard(state, cardDb, playerId, handInstanceId, options = {}, 
   }
   playCard(state, cardDb, playerId, handInstanceId, options, rng);
   record("playCard", [playerId, handInstanceId, options]);
+  state.acceptedHandDiscardOffer = null;
+  resumePendingSpellStealCleanup(state, cardDb, rng);
 }
 function nextDeclareAttackStage(state, cardDb, attackingPlayerId, declaration, checkedStages) {
   if (!checkedStages.includes("defenderHide")) {
@@ -8424,13 +8900,86 @@ function nextDeclareAttackStage(state, cardDb, attackingPlayerId, declaration, c
     const pool3 = previewCoDefenseOffers(state, cardDb, attackingPlayerId, declaration.attackerInstanceId, declaration.defenderInstanceId);
     if (pool3.length > 0) return { stage: "coDefense", pool: pool3.map((c2) => c2.instanceId) };
   }
+  if (!checkedStages.includes("ashgarSpellPlay") && declaration.defenderInstanceId === "magi") {
+    const defendingPlayerId = getOpponents(state, attackingPlayerId)[0]?.playerId;
+    if (defendingPlayerId) {
+      const defender = getPlayer(state, defendingPlayerId);
+      const magi = defender.activeMagi;
+      const magiDef = magi && cardDb.get(magi.definitionKey);
+      const rawPool = magi && magiDef ? getCardEffectByName(magiDef.name)?.offersOnDefendingMagiAttackSpellPlay?.(state, cardDb, magi, defendingPlayerId, declaration.attackerInstanceId) : void 0;
+      const pool3 = rawPool?.filter((spell) => isLegalToPlay(state, cardDb, defendingPlayerId, spell.instanceId, {
+        viaReactiveSpellPlay: true,
+        paidByInstanceId: magi.instanceId,
+        costOverride: goodOlAshgarSpellCost(cardDb, spell),
+        bypassRegionLegality: true
+      }).legal);
+      if (pool3 && pool3.length > 0) {
+        return {
+          stage: "ashgarSpellPlay",
+          pool: pool3.map((c2) => c2.instanceId),
+          selfInstanceId: magi.instanceId,
+          owedToPlayerId: defendingPlayerId
+        };
+      }
+    }
+  }
+  if (!checkedStages.includes("tempestHyrenSpellPlay")) {
+    const attacker = findCreatureOrMagiById(state, declaration.attackerInstanceId);
+    const attackerDef = attacker && cardDb.get(attacker.definitionKey);
+    const rawPool = attacker && attackerDef ? getCardEffectByName(attackerDef.name)?.offersOnAttackSpellPlay?.(state, cardDb, attacker, attackingPlayerId) : void 0;
+    const pool3 = rawPool?.filter((spell) => isLegalToPlay(state, cardDb, attackingPlayerId, spell.instanceId, {
+      viaReactiveSpellPlay: true,
+      paidByInstanceId: attacker.instanceId,
+      costOverride: tempestHyrenSpellCost(cardDb, spell),
+      bypassRegionLegality: true
+    }).legal);
+    if (pool3 && pool3.length > 0) {
+      return {
+        stage: "tempestHyrenSpellPlay",
+        pool: pool3.map((c2) => c2.instanceId),
+        selfInstanceId: attacker.instanceId,
+        owedToPlayerId: attackingPlayerId
+      };
+    }
+  }
+  const weavePrompts = previewWeaveChoices(state, cardDb, attackingPlayerId, declaration.attackerInstanceId, declaration.defenderInstanceId);
+  for (const prompt of weavePrompts) {
+    const stageKey = `weaveChoice:${prompt.selfInstanceId}`;
+    if (checkedStages.includes(stageKey)) continue;
+    if (declaration.weaveChoices?.[prompt.selfInstanceId] !== void 0) continue;
+    const self = findCreatureOrMagiById(state, prompt.selfInstanceId);
+    if (!self) continue;
+    return {
+      stage: "weaveChoice",
+      pool: prompt.options.map((o) => o.partnerInstanceId),
+      selfInstanceId: prompt.selfInstanceId,
+      owedToPlayerId: self.controllerId,
+      weaveDirections: prompt.options.map((o) => ({ canGiveToSelf: o.canGiveToSelf, canTakeFromSelf: o.canTakeFromSelf }))
+    };
+  }
+  const targetPrompts = previewPreCombatTargetChoices(state, cardDb, attackingPlayerId, declaration.attackerInstanceId, declaration.defenderInstanceId);
+  for (const prompt of targetPrompts) {
+    const key = preCombatChoiceKey(prompt.selfInstanceId, prompt.clauseName);
+    const stageKey = `preCombatTargetChoice:${key}`;
+    if (checkedStages.includes(stageKey)) continue;
+    if (declaration.preCombatTargetChoices?.[key] !== void 0) continue;
+    const self = findCreatureOrMagiById(state, prompt.selfInstanceId);
+    if (!self) continue;
+    return {
+      stage: "preCombatTargetChoice",
+      pool: prompt.pool.map((c2) => c2.instanceId),
+      selfInstanceId: prompt.selfInstanceId,
+      clauseName: prompt.clauseName,
+      owedToPlayerId: self.controllerId
+    };
+  }
   return null;
 }
 function attemptDeclareAttack(state, cardDb, attackingPlayerId, declaration, rng = defaultRng, record = () => {
 }, checkedStages = [], onReady) {
   const next = nextDeclareAttackStage(state, cardDb, attackingPlayerId, declaration, checkedStages);
   if (next) {
-    const owedToPlayerId = getOpponents(state, attackingPlayerId)[0]?.playerId;
+    const owedToPlayerId = next.owedToPlayerId ?? getOpponents(state, attackingPlayerId)[0]?.playerId;
     if (owedToPlayerId) {
       state.pendingReactiveOffer = {
         attemptKind: "declareAttack",
@@ -8440,10 +8989,35 @@ function attemptDeclareAttack(state, cardDb, attackingPlayerId, declaration, rng
         actingPlayerId: attackingPlayerId,
         declaration,
         selfInstanceId: next.selfInstanceId,
+        clauseName: next.clauseName,
+        weaveDirections: next.weaveDirections,
         checkedStages
       };
       return;
     }
+  }
+  const preCombatCards = previewPreCombatDieRolls(
+    state,
+    cardDb,
+    attackingPlayerId,
+    declaration.attackerInstanceId,
+    declaration.defenderInstanceId,
+    declaration.preCombatTargetChoices
+  );
+  for (const card of preCombatCards) {
+    const already = declaration.preCombatDieRolls?.[card.instanceId] !== void 0;
+    const stageDone = checkedStages.includes(`preCombatDieRoll:${card.instanceId}`);
+    if (already || stageDone) continue;
+    state.pendingDeclareAttackAfterDieRoll = {
+      attackingPlayerId,
+      declaration,
+      checkedStages,
+      currentCardInstanceId: card.instanceId
+    };
+    record("startPreCombatDieRoll", [card.instanceId]);
+    startPreCombatDieRoll(state, cardDb, card, rng);
+    resumePendingDeclareAttackAfterDieRoll(state, cardDb, rng, record, onReady);
+    return;
   }
   if (onReady) {
     onReady(declaration);
@@ -8464,6 +9038,7 @@ function resolveReactiveOffer(state, cardDb, chosenInstanceId, rng = defaultRng,
       if (offer.stage === "targetProtection") {
         if (chosenInstanceId) {
           confirmIdentityOverrideForPower(state, cardDb, offer.targetInstanceId, "creatureType", chosenInstanceId);
+          record("confirmPowerTargetProtection", [offer.targetInstanceId, chosenInstanceId]);
           return;
         }
         attemptUsePower(state, cardDb, offer.actingPlayerId, offer.sourceInstanceId, offer.powerName, offer.options, rng, record, nextCheckedStages);
@@ -8514,6 +9089,27 @@ function resolveReactiveOffer(state, cardDb, chosenInstanceId, rng = defaultRng,
         attemptUsePower(state, cardDb, offer.actingPlayerId, offer.sourceInstanceId, offer.powerName, options2, rng, record, nextCheckedStages);
         return;
       }
+      if (offer.stage === "energyLossRedirect") {
+        const options2 = {
+          ...offer.options,
+          energyLossRedirect: chosenInstanceId ? { chosenRedirectorInstanceId: chosenInstanceId } : "skip"
+        };
+        attemptUsePower(state, cardDb, offer.actingPlayerId, offer.sourceInstanceId, offer.powerName, options2, rng, record, nextCheckedStages);
+        return;
+      }
+      if (offer.stage === "discardOfPrevention") {
+        const options2 = {
+          ...offer.options,
+          discardOfPrevention: chosenInstanceId ? { chosenPreventerInstanceId: chosenInstanceId } : "skip"
+        };
+        attemptUsePower(state, cardDb, offer.actingPlayerId, offer.sourceInstanceId, offer.powerName, options2, rng, record, nextCheckedStages);
+        return;
+      }
+      if (offer.stage === "hostileHandDiscardBlock" || offer.stage === "hostileHandDiscardSubstitute") {
+        state.acceptedHandDiscardOffer = bakeHandDiscardAnswer(state.acceptedHandDiscardOffer, offer.stage, chosenInstanceId);
+        attemptUsePower(state, cardDb, offer.actingPlayerId, offer.sourceInstanceId, offer.powerName, offer.options, rng, record, nextCheckedStages);
+        return;
+      }
       const field = USE_POWER_STAGE_FIELD[offer.stage];
       const options = { ...offer.options, ...chosenInstanceId ? { [field]: chosenInstanceId } : {} };
       attemptUsePower(state, cardDb, offer.actingPlayerId, offer.sourceInstanceId, offer.powerName, options, rng, record, nextCheckedStages);
@@ -8560,6 +9156,60 @@ function resolveReactiveOffer(state, cardDb, chosenInstanceId, rng = defaultRng,
           redirectedByInstanceId: offer.redirectorInstanceId,
           redirectChosenTargetId: chosenInstanceId
         } : { ...offer.options, targetRedirectDeclined: true };
+        attemptPlayCard(state, cardDb, offer.actingPlayerId, offer.handInstanceId, options2, rng, record, nextCheckedStages);
+        return;
+      }
+      if (offer.stage === "energyLossRedirect") {
+        const options2 = {
+          ...offer.options,
+          energyLossRedirect: chosenInstanceId ? { chosenRedirectorInstanceId: chosenInstanceId } : "skip"
+        };
+        attemptPlayCard(state, cardDb, offer.actingPlayerId, offer.handInstanceId, options2, rng, record, nextCheckedStages);
+        return;
+      }
+      if (offer.stage === "discardOfPrevention") {
+        const options2 = {
+          ...offer.options,
+          discardOfPrevention: chosenInstanceId ? { chosenPreventerInstanceId: chosenInstanceId } : "skip"
+        };
+        attemptPlayCard(state, cardDb, offer.actingPlayerId, offer.handInstanceId, options2, rng, record, nextCheckedStages);
+        return;
+      }
+      if (offer.stage === "hostileHandDiscardBlock" || offer.stage === "hostileHandDiscardSubstitute") {
+        state.acceptedHandDiscardOffer = bakeHandDiscardAnswer(state.acceptedHandDiscardOffer, offer.stage, chosenInstanceId);
+        attemptPlayCard(state, cardDb, offer.actingPlayerId, offer.handInstanceId, offer.options, rng, record, nextCheckedStages);
+        return;
+      }
+      if (offer.stage === "playPrevention") {
+        if (chosenInstanceId) {
+          const handCard = getPlayer(state, offer.actingPlayerId).hand.find((c2) => c2.instanceId === offer.handInstanceId);
+          const handDef = handCard && cardDb.get(handCard.definitionKey);
+          let preventer;
+          for (const p of state.players.values()) {
+            const contributors = p.activeMagi ? [...p.inPlay, p.activeMagi] : p.inPlay;
+            const match = contributors.find((c2) => c2.instanceId === chosenInstanceId);
+            if (match) {
+              preventer = match;
+              break;
+            }
+          }
+          if (handDef && preventer) {
+            const preventerDef = cardDb.get(preventer.definitionKey);
+            const preventerEffect = preventerDef ? getCardEffectByName(preventerDef.name) : void 0;
+            preventerEffect?.confirmPreventedPlay?.(state, cardDb, handDef, offer.actingPlayerId, preventer, rng);
+            logEvent(state, "playPreventionConfirmed", {
+              actingPlayerId: offer.actingPlayerId,
+              handInstanceId: offer.handInstanceId,
+              preventerInstanceId: chosenInstanceId
+            });
+          }
+          record("confirmPlayPrevention", [offer.actingPlayerId, offer.handInstanceId, chosenInstanceId]);
+          return;
+        }
+        const options2 = {
+          ...offer.options,
+          playPrevention: "skip"
+        };
         attemptPlayCard(state, cardDb, offer.actingPlayerId, offer.handInstanceId, options2, rng, record, nextCheckedStages);
         return;
       }
@@ -8617,11 +9267,259 @@ function resolveReactiveOffer(state, cardDb, chosenInstanceId, rng = defaultRng,
         attemptDeclareAttack(state, cardDb, offer.actingPlayerId, declaration, rng, record, nextCheckedStages, onDeclareAttackReady);
         return;
       }
+      if (offer.stage === "ashgarSpellPlay" || offer.stage === "tempestHyrenSpellPlay") {
+        if (!chosenInstanceId) {
+          attemptDeclareAttack(state, cardDb, offer.actingPlayerId, declaration, rng, record, nextCheckedStages, onDeclareAttackReady);
+          return;
+        }
+        armPendingDeclareAttackResumeAndPlaySpell(
+          state,
+          cardDb,
+          offer.stage,
+          offer.actingPlayerId,
+          offer.selfInstanceId,
+          chosenInstanceId,
+          {},
+          declaration,
+          nextCheckedStages,
+          rng,
+          record
+        );
+        return;
+      }
+      if (offer.stage === "weaveChoice") {
+        const resolution = (() => {
+          if (!chosenInstanceId) return { skip: true };
+          const idx = offer.pool.indexOf(chosenInstanceId);
+          const dir = offer.weaveDirections?.[idx];
+          if (dir?.canGiveToSelf) return { partnerInstanceId: chosenInstanceId, direction: "toSelf" };
+          if (dir?.canTakeFromSelf) return { partnerInstanceId: chosenInstanceId, direction: "fromSelf" };
+          return { skip: true };
+        })();
+        const updated2 = {
+          ...declaration,
+          weaveChoices: { ...declaration.weaveChoices ?? {}, [offer.selfInstanceId]: resolution }
+        };
+        const withStageKey = [...offer.checkedStages, `weaveChoice:${offer.selfInstanceId}`];
+        attemptDeclareAttack(state, cardDb, offer.actingPlayerId, updated2, rng, record, withStageKey, onDeclareAttackReady);
+        return;
+      }
+      if (offer.stage === "preCombatTargetChoice") {
+        const resolution = chosenInstanceId ? { chosenInstanceId } : { skip: true };
+        const key = preCombatChoiceKey(offer.selfInstanceId, offer.clauseName);
+        const updated2 = {
+          ...declaration,
+          preCombatTargetChoices: { ...declaration.preCombatTargetChoices ?? {}, [key]: resolution }
+        };
+        const withStageKey = [...offer.checkedStages, `preCombatTargetChoice:${key}`];
+        attemptDeclareAttack(state, cardDb, offer.actingPlayerId, updated2, rng, record, withStageKey, onDeclareAttackReady);
+        return;
+      }
       const updated = chosenInstanceId ? { ...declaration, coDefenderInstanceId: chosenInstanceId } : declaration;
       attemptDeclareAttack(state, cardDb, offer.actingPlayerId, updated, rng, record, nextCheckedStages, onDeclareAttackReady);
       return;
     }
+    case "hostileHandDiscardStandalone": {
+      record("resolveHostileHandDiscardStandalone", [
+        offer.victimPlayerId,
+        offer.targetIds,
+        offer.causedByPlayerId,
+        offer.stage,
+        chosenInstanceId,
+        offer.checkedStages
+      ]);
+      state.acceptedHandDiscardOffer = bakeHandDiscardAnswer(state.acceptedHandDiscardOffer, offer.stage, chosenInstanceId);
+      const victim = state.players.get(offer.victimPlayerId);
+      if (!victim) return;
+      const rearmed = armStandaloneHostileHandDiscardIfEligible(
+        state,
+        cardDb,
+        victim,
+        offer.targetIds,
+        offer.causedByPlayerId,
+        nextCheckedStages
+      );
+      if (rearmed) return;
+      discardFromHand(state, cardDb, victim, offer.targetIds, offer.causedByPlayerId, rng);
+      return;
+    }
   }
+}
+function resolveWeaveChoice(state, cardDb, resolution, rng = defaultRng, record = () => {
+}, onDeclareAttackReady) {
+  const offer = state.pendingReactiveOffer;
+  if (!offer || offer.attemptKind !== "declareAttack" || offer.stage !== "weaveChoice") return;
+  state.pendingReactiveOffer = null;
+  const declaration = offer.declaration;
+  const updated = {
+    ...declaration,
+    weaveChoices: { ...declaration.weaveChoices ?? {}, [offer.selfInstanceId]: resolution }
+  };
+  const withStageKey = [...offer.checkedStages, `weaveChoice:${offer.selfInstanceId}`];
+  attemptDeclareAttack(state, cardDb, offer.actingPlayerId, updated, rng, record, withStageKey, onDeclareAttackReady);
+}
+function resolvePreCombatTargetChoice(state, cardDb, resolution, rng = defaultRng, record = () => {
+}, onDeclareAttackReady) {
+  const offer = state.pendingReactiveOffer;
+  if (!offer || offer.attemptKind !== "declareAttack" || offer.stage !== "preCombatTargetChoice") return;
+  state.pendingReactiveOffer = null;
+  const declaration = offer.declaration;
+  const key = preCombatChoiceKey(offer.selfInstanceId, offer.clauseName);
+  const updated = {
+    ...declaration,
+    preCombatTargetChoices: { ...declaration.preCombatTargetChoices ?? {}, [key]: resolution }
+  };
+  const withStageKey = [...offer.checkedStages, `preCombatTargetChoice:${key}`];
+  attemptDeclareAttack(state, cardDb, offer.actingPlayerId, updated, rng, record, withStageKey, onDeclareAttackReady);
+}
+function armPendingDeclareAttackResumeAndPlaySpell(state, cardDb, stage, attackingPlayerId, reactorInstanceId, chosenSpellInstanceId, choices, outerDeclaration, nextCheckedStages, rng, record) {
+  const reactor = findCreatureOrMagiById(state, reactorInstanceId);
+  if (!reactor) {
+    attemptDeclareAttack(state, cardDb, attackingPlayerId, outerDeclaration, rng, record, nextCheckedStages);
+    return;
+  }
+  const casterPlayerId = reactor.controllerId;
+  const caster = state.players.get(casterPlayerId);
+  const spell = caster?.hand.find((c2) => c2.instanceId === chosenSpellInstanceId);
+  const spellDef = spell && cardDb.get(spell.definitionKey);
+  if (!spell || !spellDef || spellDef.card_type !== "Spell") {
+    attemptDeclareAttack(state, cardDb, attackingPlayerId, outerDeclaration, rng, record, nextCheckedStages);
+    return;
+  }
+  const costFn = stage === "ashgarSpellPlay" ? goodOlAshgarSpellCost : tempestHyrenSpellCost;
+  const cost = costFn(cardDb, spell, choices.chosenXValue);
+  if ((reactor.currentEnergy ?? 0) < cost) {
+    attemptDeclareAttack(state, cardDb, attackingPlayerId, outerDeclaration, rng, record, nextCheckedStages);
+    return;
+  }
+  const reactorDef = cardDb.get(reactor.definitionKey);
+  if (reactorDef) {
+    getCardEffectByName(reactorDef.name)?.onReactiveSpellPlayConsumed?.(state, cardDb, reactor);
+  }
+  state.pendingDeclareAttackAfterSpell = {
+    attackingPlayerId,
+    declaration: outerDeclaration,
+    checkedStages: nextCheckedStages
+  };
+  const options = {
+    paidByInstanceId: reactorInstanceId,
+    costOverride: cost,
+    bypassRegionLegality: true,
+    viaReactiveSpellPlay: true,
+    chosenXValue: choices.chosenXValue,
+    chosenTargetId: choices.chosenTargetId,
+    chosenSecondTargetId: choices.chosenSecondTargetId,
+    chosenHandCardIds: choices.chosenHandCardIds,
+    chosenInPlayDiscardCostIds: choices.chosenInPlayDiscardCostIds,
+    chosenBoolean: choices.chosenBoolean,
+    chosenHandPlayId: choices.chosenHandPlayId,
+    chosenDiscardPileIds: choices.chosenDiscardPileIds,
+    chosenMultiTargetIds: choices.chosenMultiTargetIds,
+    chosenEnergyAllocation: choices.chosenEnergyAllocation,
+    chosenAmounts: choices.chosenAmounts,
+    chosenCategory: choices.chosenCategory
+  };
+  attemptPlayCard(state, cardDb, casterPlayerId, chosenSpellInstanceId, options, rng, record);
+}
+function resolveAshgarSpellPlay(state, cardDb, chosenSpellInstanceId, choices = {}, rng = defaultRng, record = () => {
+}) {
+  const offer = state.pendingReactiveOffer;
+  if (!offer || offer.attemptKind !== "declareAttack" || offer.stage !== "ashgarSpellPlay") return;
+  state.pendingReactiveOffer = null;
+  const declaration = offer.declaration;
+  const nextCheckedStages = [...offer.checkedStages, offer.stage];
+  if (!chosenSpellInstanceId) {
+    attemptDeclareAttack(state, cardDb, offer.actingPlayerId, declaration, rng, record, nextCheckedStages);
+    return;
+  }
+  armPendingDeclareAttackResumeAndPlaySpell(
+    state,
+    cardDb,
+    "ashgarSpellPlay",
+    offer.actingPlayerId,
+    offer.selfInstanceId,
+    chosenSpellInstanceId,
+    choices,
+    declaration,
+    nextCheckedStages,
+    rng,
+    record
+  );
+}
+function resolveTempestHyrenSpellPlay(state, cardDb, chosenSpellInstanceId, choices = {}, rng = defaultRng, record = () => {
+}) {
+  const offer = state.pendingReactiveOffer;
+  if (!offer || offer.attemptKind !== "declareAttack" || offer.stage !== "tempestHyrenSpellPlay") return;
+  state.pendingReactiveOffer = null;
+  const declaration = offer.declaration;
+  const nextCheckedStages = [...offer.checkedStages, offer.stage];
+  if (!chosenSpellInstanceId) {
+    attemptDeclareAttack(state, cardDb, offer.actingPlayerId, declaration, rng, record, nextCheckedStages);
+    return;
+  }
+  armPendingDeclareAttackResumeAndPlaySpell(
+    state,
+    cardDb,
+    "tempestHyrenSpellPlay",
+    offer.actingPlayerId,
+    offer.selfInstanceId,
+    chosenSpellInstanceId,
+    choices,
+    declaration,
+    nextCheckedStages,
+    rng,
+    record
+  );
+}
+function resumePendingDeclareAttackAfterSpell(state, cardDb, rng = defaultRng, record = () => {
+}, onDeclareAttackReady) {
+  const resume = state.pendingDeclareAttackAfterSpell;
+  if (!resume) return false;
+  if (state.pendingReactiveOffer) return false;
+  state.pendingDeclareAttackAfterSpell = null;
+  attemptDeclareAttack(
+    state,
+    cardDb,
+    resume.attackingPlayerId,
+    resume.declaration,
+    rng,
+    record,
+    resume.checkedStages,
+    onDeclareAttackReady
+  );
+  return true;
+}
+function resumePendingDeclareAttackAfterDieRoll(state, cardDb, rng = defaultRng, record = () => {
+}, onDeclareAttackReady) {
+  const resume = state.pendingDeclareAttackAfterDieRoll;
+  if (!resume) return false;
+  if (state.pendingReactiveOffer) return false;
+  if (state.pendingDieRoll) return false;
+  const rollAnswer = state.preCombatDieRollAnswers[resume.currentCardInstanceId];
+  if (rollAnswer === void 0) {
+    return false;
+  }
+  state.pendingDeclareAttackAfterDieRoll = null;
+  const declaration = resume.declaration;
+  const updated = {
+    ...declaration,
+    preCombatDieRolls: {
+      ...declaration.preCombatDieRolls ?? {},
+      [resume.currentCardInstanceId]: rollAnswer
+    }
+  };
+  const nextCheckedStages = [...resume.checkedStages, `preCombatDieRoll:${resume.currentCardInstanceId}`];
+  attemptDeclareAttack(
+    state,
+    cardDb,
+    resume.attackingPlayerId,
+    updated,
+    rng,
+    record,
+    nextCheckedStages,
+    onDeclareAttackReady
+  );
+  return true;
 }
 function declineStalePendingReactiveOffer(state, cardDb, rng = defaultRng) {
   while (state.pendingReactiveOffer) {
@@ -8632,6 +9530,113 @@ function declineStalePendingOpponentHandChoice(state, cardDb, rng = defaultRng) 
   while (state.pendingOpponentHandChoice) {
     resolveOpponentHandChoice(state, cardDb, [], rng);
   }
+}
+function playSpellFromOpponentZone(state, cardDb, caster, owner, sourceZone, spellInstanceId, postPlayDestination, rng = defaultRng, nestedChoices = {}) {
+  const list = owner[sourceZone];
+  const index = list.findIndex((c2) => c2.instanceId === spellInstanceId);
+  if (index === -1) return void 0;
+  const def = cardDb.get(list[index].definitionKey);
+  if (def?.card_type !== "Spell") return void 0;
+  const baseCost = isVariableCostPower(def.cost) ? resolveVariableCost(def.cost, nestedChoices.chosenXValue ?? 0) : typeof def.cost === "number" ? def.cost : 0;
+  const totalCost = spellPlayCostWithModifiers(state, cardDb, def, caster.playerId, baseCost);
+  const casterMagi = caster.activeMagi;
+  if ((casterMagi?.currentEnergy ?? 0) < totalCost) return void 0;
+  const [spell] = list.splice(index, 1);
+  const originalControllerId = spell.controllerId;
+  spell.controllerId = caster.playerId;
+  caster.hand.push(spell);
+  const previousSpellStealCleanup = state.pendingSpellStealCleanup;
+  state.pendingSpellStealCleanup = {
+    spellInstanceId,
+    ownerPlayerId: owner.playerId,
+    casterPlayerId: caster.playerId,
+    postPlayDestination
+  };
+  logEvent(state, "spellStolenAndCast", {
+    spellInstanceId,
+    name: def.name,
+    ownerPlayerId: owner.playerId,
+    casterPlayerId: caster.playerId,
+    postPlayDestination,
+    sourceZone
+  });
+  const options = {
+    bypassRegionLegality: true,
+    // D7b (2026-08-28): usePower's outer wrap around the whole resolveEffect fires the same
+    // `onAnyPowerAddedEnergyToCreature` / `onOwnPowerDiscardedOpposingEnergy` hooks; playCard
+    // must skip its own inner broadcast to avoid double-count. See suppressSpellBroadcasts'
+    // own doc comment.
+    suppressSpellBroadcasts: true,
+    chosenXValue: nestedChoices.chosenXValue,
+    chosenTargetId: nestedChoices.chosenTargetId,
+    chosenSecondTargetId: nestedChoices.chosenSecondTargetId,
+    chosenHandCardIds: nestedChoices.chosenHandCardIds,
+    chosenInPlayDiscardCostIds: nestedChoices.chosenInPlayDiscardCostIds,
+    chosenBoolean: nestedChoices.chosenBoolean,
+    chosenHandPlayId: nestedChoices.chosenHandPlayId,
+    chosenDiscardPileIds: nestedChoices.chosenDiscardPileIds,
+    chosenCategory: nestedChoices.chosenCategory
+  };
+  if (!isLegalToPlay(state, cardDb, caster.playerId, spellInstanceId, options).legal) {
+    const returnedIdx = caster.hand.findIndex((c2) => c2.instanceId === spellInstanceId);
+    if (returnedIdx >= 0) {
+      const [returned] = caster.hand.splice(returnedIdx, 1);
+      returned.controllerId = originalControllerId;
+      list.splice(index, 0, returned);
+    }
+    state.pendingSpellStealCleanup = previousSpellStealCleanup;
+    return void 0;
+  }
+  try {
+    attemptPlayCard(state, cardDb, caster.playerId, spellInstanceId, options, rng);
+  } catch (err) {
+    const returnedIdx = caster.hand.findIndex((c2) => c2.instanceId === spellInstanceId);
+    if (returnedIdx >= 0) {
+      const [returned] = caster.hand.splice(returnedIdx, 1);
+      returned.controllerId = originalControllerId;
+      list.splice(index, 0, returned);
+    }
+    state.pendingSpellStealCleanup = previousSpellStealCleanup;
+    return void 0;
+  }
+  if (!state.pendingReactiveOffer) {
+    resumePendingSpellStealCleanup(state, cardDb, rng);
+  }
+  return spell;
+}
+function resumePendingSpellStealCleanup(state, cardDb, rng = defaultRng) {
+  const cleanup = state.pendingSpellStealCleanup;
+  if (!cleanup) return false;
+  if (state.pendingReactiveOffer) return false;
+  state.pendingSpellStealCleanup = null;
+  const owner = state.players.get(cleanup.ownerPlayerId);
+  if (!owner) return true;
+  const spellStillInPlay = [...state.players.values()].some(
+    (p) => p.inPlay.some((c2) => c2.instanceId === cleanup.spellInstanceId)
+  );
+  if (spellStillInPlay) return true;
+  let spell;
+  let sourcePlayer;
+  for (const p of state.players.values()) {
+    const idx = p.discardPile.findIndex((c2) => c2.instanceId === cleanup.spellInstanceId);
+    if (idx >= 0) {
+      const [removed] = p.discardPile.splice(idx, 1);
+      spell = removed;
+      sourcePlayer = p;
+      break;
+    }
+  }
+  if (!spell) {
+    return true;
+  }
+  spell.controllerId = cleanup.ownerPlayerId;
+  if (cleanup.postPlayDestination === "ownersDeckShuffled") {
+    owner.deck.push(spell);
+    shuffleDeck(owner, rng);
+  } else {
+    moveToDiscardPile(state, owner, spell);
+  }
+  return true;
 }
 
 // src/simultaneousOrder.ts
@@ -8776,8 +9781,8 @@ function runStartOfTurnHooks(state, cardDb, rng = defaultRng) {
     }
   }
   if (player.activeMagi?.hasOmborResilience) {
-    const ownCreatures3 = player.inPlay.length;
-    const fewerThanSomeOpponent = getOpponents(state, player.playerId).some((o) => ownCreatures3 < o.inPlay.length);
+    const ownCreatures4 = player.inPlay.length;
+    const fewerThanSomeOpponent = getOpponents(state, player.playerId).some((o) => ownCreatures4 < o.inPlay.length);
     if (fewerThanSomeOpponent) {
       addEnergy(state, cardDb, player.activeMagi, 2, "effect");
     }
@@ -8947,6 +9952,16 @@ function effectiveEnergizeRate(state, cardDb, instance) {
   return Math.max(0, total, ...grants);
 }
 function applyEnergizeToInstance(state, cardDb, player, instance, rng = defaultRng) {
+  if (hasDurationTag(instance, NO_NEXT_ENERGIZE)) {
+    removeDurationTag(instance, NO_NEXT_ENERGIZE);
+    logEvent(state, "energized", {
+      playerId: player.playerId,
+      instanceId: instance.instanceId,
+      amount: 0,
+      newTotal: instance.currentEnergy ?? 0
+    });
+    return;
+  }
   for (const ownEffect of effectsFor(state, cardDb, instance)) {
     ownEffect.beforeOwnEnergize?.(state, cardDb, instance);
   }
@@ -9158,6 +10173,9 @@ function advancePhase(state, cardDb, rng = defaultRng, _skippingPhase = false) {
   sweepStalePendingChoiceTags(state);
   sweepStalePendingRevealChoiceTags(state);
   declineReactiveDreamwarp(state);
+  if (state.pendingDieRerollGrantOffer) {
+    declineStalePendingDieRerollGrantOffer(state, cardDb, rng);
+  }
   if (state.pendingDieRoll) {
     finalizePendingDieRoll(state, cardDb, rng);
   }
@@ -9476,11 +10494,13 @@ function sweepReturnToHandAtEndOfTurn(state, cardDb) {
   for (const player of state.players.values()) {
     const toReturn = player.inPlay.filter((c2) => c2.tags.has(RETURN_TO_HAND_AT_END_OF_TURN));
     for (const card of toReturn) {
+      removePermanentTag(card, RETURN_TO_HAND_AT_END_OF_TURN);
       returnToHand(state, cardDb, player, card.instanceId);
       logEvent(state, "endOfTurnReturnToHand", { instanceId: card.instanceId, name: cardDb.get(card.definitionKey)?.name });
     }
     const toReturnFromDiscard = player.discardPile.filter((c2) => c2.tags.has(RETURN_TO_HAND_AT_END_OF_TURN));
     for (const card of toReturnFromDiscard) {
+      removePermanentTag(card, RETURN_TO_HAND_AT_END_OF_TURN);
       returnToHand(state, cardDb, player, card.instanceId, "discardPile");
       logEvent(state, "endOfTurnReturnToHand", { instanceId: card.instanceId, name: cardDb.get(card.definitionKey)?.name });
     }
@@ -9666,6 +10686,10 @@ function setupGame(playerConfigs, cardDb, options = {}) {
     pendingReactiveDreamwarpInstanceId: null,
     pendingSimultaneousOrderChoice: null,
     pendingReactiveOffer: null,
+    acceptedHandDiscardOffer: null,
+    pendingDeclareAttackAfterSpell: null,
+    pendingSpellStealCleanup: null,
+    pendingDeclareAttackAfterDieRoll: null,
     pendingOpponentHandChoice: null,
     pendingOpponentSubChoice: null,
     blockedCardNamesThisTurn: /* @__PURE__ */ new Set(),
@@ -9676,6 +10700,7 @@ function setupGame(playerConfigs, cardDb, options = {}) {
     pendingIntensify: null,
     reactiveWindow: null,
     pendingDieRoll: null,
+    pendingDieRerollGrantOffer: null,
     pendingDiscardFromPlay: null,
     pendingDiscardFromPlayQueue: [],
     preCombatDieRollAnswers: {},
@@ -9900,9 +10925,20 @@ function resolveStartingCardTutorIfEmpty(state, cardDb) {
 }
 
 // src/queries.ts
+function isTargetPreventedFor(hook, state, cardDb, target, actingPlayerId) {
+  for (const p of state.players.values()) {
+    const contributors = p.activeMagi ? [p.activeMagi, ...p.inPlay] : [...p.inPlay];
+    for (const contributor of contributors) {
+      for (const effect of effectsFor(state, cardDb, contributor)) {
+        if (effect[hook]?.(state, cardDb, target, actingPlayerId, contributor)) return true;
+      }
+    }
+  }
+  return false;
+}
 function getLegalMoves(state, cardDb, playerId) {
   const moves = [];
-  if (state.winnerId) return moves;
+  if (state.winnerId || state.isDraw) return moves;
   if (state.pendingReactiveOffer || state.pendingOpponentHandChoice || state.pendingOpponentSubChoice) return moves;
   const player = getPlayer(state, playerId);
   const opponents = [...state.players.values()].filter((p) => p.playerId !== playerId);
@@ -9960,7 +10996,9 @@ function getLegalMoves(state, cardDb, playerId) {
       });
     }
   }
-  if (state.activePlayerId === playerId) moves.push({ type: "advancePhase" });
+  if (state.activePlayerId === playerId && canAdvancePhase(state, cardDb).legal) {
+    moves.push({ type: "advancePhase" });
+  }
   return moves;
 }
 var POWER_CHOICE_DECLARATIONS = [
@@ -10081,7 +11119,10 @@ function describeMoveChoices(state, cardDb, playerId, move, chosen = {}, rng = d
     }
     if (effect2?.powerTargets && chosen.chosenTargetId === void 0) {
       const pool3 = powerTargetsWithRegionSwap(state, cardDb, playerId, move.sourceInstanceId, move.powerName, void 0);
-      if (pool3 !== void 0) out.push({ kind: "singleTarget", field: "chosenTargetId", pool: instanceIds(pool3) });
+      if (pool3 !== void 0) {
+        const filtered = pool3.filter((c2) => !isTargetPreventedFor("preventsBeingChosenForPowerBy", state, cardDb, c2, playerId));
+        out.push({ kind: "singleTarget", field: "chosenTargetId", pool: instanceIds(filtered) });
+      }
     }
     if (effect2?.copyPowerChoice && chosen.chosenTargetId === void 0) {
       const pairs = effect2.copyPowerChoice.pool(state, cardDb, playerId, move.sourceInstanceId, move.powerName);
@@ -10205,7 +11246,10 @@ function describeMoveChoices(state, cardDb, playerId, move, chosen = {}, rng = d
   }
   if (effect?.spellTargets && chosen.chosenTargetId === void 0) {
     const pool3 = spellTargetsWithRegionSwap(state, cardDb, playerId, move.handInstanceId, void 0);
-    if (pool3 !== void 0) out.push({ kind: "singleTarget", field: "chosenTargetId", pool: instanceIds(pool3) });
+    if (pool3 !== void 0) {
+      const filtered = pool3.filter((c2) => !isTargetPreventedFor("preventsBeingChosenForSpellBy", state, cardDb, c2, playerId));
+      out.push({ kind: "singleTarget", field: "chosenTargetId", pool: instanceIds(filtered) });
+    }
   }
   if (effect?.copyPowerChoice && chosen.chosenTargetId === void 0) {
     const pairs = effect.copyPowerChoice.pool(state, cardDb, playerId, move.handInstanceId, "");
@@ -10390,7 +11434,7 @@ function getPendingObligations(state, cardDb, playerId) {
     out.push({ kind: "categoryChoice", resolveFn: "resolvePendingCategoryChoiceFor", selfInstanceId: choice.self.instanceId, prompt: choice.prompt, options: [...choice.options], optional: choice.optional });
   }
   for (const choice of findPendingMultiTargetChoices(state, cardDb)) {
-    if (choice.self.controllerId !== playerId) continue;
+    if (choice.answeringPlayerId !== playerId) continue;
     out.push({ kind: "multiTargetChoice", resolveFn: "resolvePendingMultiTargetChoiceFor", selfInstanceId: choice.self.instanceId, prompt: choice.prompt, pool: [...choice.pool], minCount: choice.minCount, maxCount: choice.maxCount, optional: choice.optional });
   }
   for (const choice of findPendingNumericChoices(state, cardDb)) {
@@ -10434,7 +11478,7 @@ function getPendingObligations(state, cardDb, playerId) {
   }
   if (state.pendingReactiveOffer && state.pendingReactiveOffer.owedToPlayerId === playerId) {
     const offer = state.pendingReactiveOffer;
-    const prompt = offer.attemptKind === "declareAttack" ? offer.stage === "defenderHide" ? "You are being attacked -- hide the defender behind a Relic, or decline" : offer.stage === "defenderDiscardAndPlay" ? "You are being attacked -- discard and play a substitute defender, or decline" : offer.stage === "defenderRedirect" ? "You are being attacked -- redirect the attack to another Creature, or decline" : "You are being attacked -- defend WITH another Creature, or decline" : `The opponent is about to ${offer.attemptKind === "usePower" ? "use a Power" : "play a Spell"} -- ${offer.attemptKind === "usePower" && offer.stage === "targetProtection" ? "become a protected type, or decline" : offer.stage === "furokProtection" || offer.stage === "discardSave" || offer.stage === "attachedSpellNegation" ? "protect your Creature from it, or decline" : offer.stage === "magiProtection" ? "protect your whole board from it with Three-Leaf Clover, or decline" : "negate it, or decline"}`;
+    const prompt = offer.attemptKind === "declareAttack" ? offer.stage === "defenderHide" ? "You are being attacked -- hide the defender behind a Relic, or decline" : offer.stage === "defenderDiscardAndPlay" ? "You are being attacked -- discard and play a substitute defender, or decline" : offer.stage === "defenderRedirect" ? "You are being attacked -- redirect the attack to another Creature, or decline" : "You are being attacked -- defend WITH another Creature, or decline" : offer.attemptKind === "hostileHandDiscardStandalone" ? offer.stage === "hostileHandDiscardBlock" ? "Cards are about to be discarded from your hand -- pay a cost to cancel the hand discard, or decline" : "Cards are about to be discarded from your hand -- discard one of your own cards instead, or decline" : `The opponent is about to ${offer.attemptKind === "usePower" ? "use a Power" : "play a Spell"} -- ${offer.attemptKind === "usePower" && offer.stage === "targetProtection" ? "become a protected type, or decline" : offer.stage === "furokProtection" || offer.stage === "discardSave" || offer.stage === "attachedSpellNegation" ? "protect your Creature from it, or decline" : offer.stage === "magiProtection" ? "protect your whole board from it with Three-Leaf Clover, or decline" : offer.stage === "hostileHandDiscardBlock" ? "pay a cost to cancel the hand discard, or decline" : offer.stage === "hostileHandDiscardSubstitute" ? "discard one of your own cards instead, or decline" : "negate it, or decline"}`;
     out.push({
       kind: "reactiveOfferSingle",
       resolveFn: "resolveReactiveOffer",
@@ -10446,14 +11490,16 @@ function getPendingObligations(state, cardDb, playerId) {
   }
   if (state.pendingOpponentHandChoice && state.pendingOpponentHandChoice.owedToPlayerId === playerId) {
     const offer = state.pendingOpponentHandChoice;
-    const prompt = offer.kind === "opponentHandDiscardChoice" ? `Choose up to ${offer.maxCount} card(s) from your hand to discard, or decline` : `Choose up to ${offer.maxCount} card(s) from the chosen player's hand, or decline`;
+    const rangeLabel = offer.minCount > 0 ? offer.minCount === offer.maxCount ? `exactly ${offer.maxCount}` : `${offer.minCount} to ${offer.maxCount}` : `up to ${offer.maxCount}`;
+    const declineClause = offer.minCount > 0 ? "" : ", or decline";
+    const prompt = offer.kind === "opponentHandDiscardChoice" ? `Choose ${rangeLabel} card(s) from your hand to discard${declineClause}` : `Choose ${rangeLabel} card(s) from the chosen player's hand${declineClause}`;
     out.push({
       kind: "opponentHandChoice",
       resolveFn: "resolveOpponentHandChoice",
       playerId,
       prompt,
       pool: offer.pool,
-      min: 0,
+      min: offer.minCount,
       max: offer.maxCount,
       optional: true
     });
@@ -10541,16 +11587,22 @@ function canAdvancePhase(state, cardDb) {
       return { legal: false, reason: `${playerId} must resolve: ${obligation.prompt}` };
     }
   }
+  const mustAttack = getUnresolvedMustAttackObligations(state, cardDb, state.activePlayerId);
+  if (mustAttack.length > 0) {
+    const first = mustAttack[0];
+    const def = cardDb.get(first.definitionKey);
+    return { legal: false, reason: `${state.activePlayerId} must attack with ${def?.name ?? "a Creature"} before advancing` };
+  }
   return { legal: true };
 }
 
 // src/cardEffects/drought.ts
 registerCardEffect("Drought", {
   resolveSpell: (ctx) => {
-    const expiry = beginningOfNextOwnTurnNumber(ctx.state);
+    const expiry = nextOwnTurnNumber(ctx.state);
     for (const player of ctx.state.players.values()) {
       const cards = player.activeMagi ? [...player.inPlay, player.activeMagi] : [...player.inPlay];
-      for (const card of cards) addDurationTag(ctx.state, ctx.cardDb, card, NO_ENERGY_GAIN, expiry);
+      for (const card of cards) addDurationTag(ctx.state, ctx.cardDb, card, NO_NEXT_ENERGIZE, expiry);
     }
   }
 });
@@ -13667,6 +14719,8 @@ registerCardEffect("Giant Vulbor", {
   opponentHandDiscardChoice: { maxCount: 2 },
   causesOpponentHandDiscard: true,
   // task #718 (Riptide clause 2, 2026-08-11)
+  causesHostileHandDiscard: () => true,
+  // M1 retrofit, 2026-08-27: Mind Shock discards from opposing Magi's controller's hand.
   resolvePower: (ctx) => {
     if (ctx.powerName !== "Mind Shock") return;
     if (ctx.chosenTargetId === void 0) return;
@@ -14467,7 +15521,7 @@ registerCardEffect("Hand of the Sky", {
     const base = isVariableCostPower(def.cost) ? resolveVariableCost(def.cost, 0) : typeof def.cost === "number" ? def.cost : 0;
     if (spellPlayCostWithModifiers(ctx.state, ctx.cardDb, def, ctx.controllingPlayer.playerId, base) > magiEnergy) return;
     discardFromPlay(ctx.state, ctx.cardDb, ctx.controllingPlayer, ctx.source.instanceId, void 0, void 0, ctx.rng);
-    castSpellFromOpponentZone(
+    playSpellFromOpponentZone(
       ctx.state,
       ctx.cardDb,
       ctx.controllingPlayer,
@@ -14504,7 +15558,7 @@ registerCardEffect("Heart of the Sky", {
     const opponent = getOpponents(ctx.state, ctx.controllingPlayer.playerId)[0];
     if (!opponent || !opponent.deck.some((c2) => c2.instanceId === ctx.chosenTargetId)) return;
     discardFromPlay(ctx.state, ctx.cardDb, ctx.controllingPlayer, ctx.source.instanceId, void 0, void 0, ctx.rng);
-    castSpellFromOpponentZone(
+    playSpellFromOpponentZone(
       ctx.state,
       ctx.cardDb,
       ctx.controllingPlayer,
@@ -14518,67 +15572,6 @@ registerCardEffect("Heart of the Sky", {
     shuffleDeck(opponent, ctx.rng);
   }
 });
-
-// src/cardEffects/tempestHyren.ts
-function tempestHyrenSpellCost(cardDb, card, chosenXValue) {
-  const printedCost = cardDb.get(card.definitionKey)?.cost;
-  const base = typeof printedCost === "number" ? printedCost : typeof printedCost === "string" ? resolveVariableCost(printedCost, chosenXValue ?? 0) : 0;
-  return Math.max(1, base - 2);
-}
-registerCardEffect("Tempest Hyren", {
-  offersOnAttackSpellPlay: (state, cardDb, self, attackingPlayerId) => {
-    const player = state.players.get(attackingPlayerId);
-    if (!player) return void 0;
-    const available = self.currentEnergy ?? 0;
-    return player.hand.filter((c2) => {
-      const def = cardDb.get(c2.definitionKey);
-      if (def?.card_type !== "Spell" || !def.regions.includes("Arderial")) return false;
-      return tempestHyrenSpellCost(cardDb, c2) <= available;
-    });
-  }
-});
-function resolveTempestHyrenSpellPlay(state, cardDb, self, controllingPlayerId, spellInstanceId, choices = {}, rng = defaultRng) {
-  const player = state.players.get(controllingPlayerId);
-  if (!player) return;
-  const index = player.hand.findIndex((c2) => c2.instanceId === spellInstanceId);
-  if (index === -1) return;
-  const def = cardDb.get(player.hand[index].definitionKey);
-  if (def?.card_type !== "Spell" || !def.regions.includes("Arderial")) return;
-  const cost = tempestHyrenSpellCost(cardDb, player.hand[index], choices.chosenXValue);
-  if ((self.currentEnergy ?? 0) < cost) return;
-  const [spell] = player.hand.splice(index, 1);
-  self.currentEnergy = (self.currentEnergy ?? 0) - cost;
-  spell.currentEnergy = null;
-  if (choices.chosenXValue !== void 0) spell.counters.startingX = choices.chosenXValue;
-  const spellEffect = getCardEffectByName(def.name);
-  if (spellEffect?.resolveSpell) {
-    const previousCurrentAction = state.currentAction;
-    state.currentAction = {
-      actorPlayerId: controllingPlayerId,
-      source: "spell",
-      sourceDefinitionKey: spell.definitionKey,
-      sourceInstanceId: spell.instanceId
-    };
-    spellEffect.resolveSpell({
-      state,
-      cardDb,
-      source: spell,
-      controllingPlayer: player,
-      chosenTargetId: choices.chosenTargetId,
-      chosenSecondTargetId: choices.chosenSecondTargetId,
-      chosenHandCardIds: choices.chosenHandCardIds,
-      chosenBoolean: choices.chosenBoolean,
-      chosenHandPlayId: choices.chosenHandPlayId,
-      chosenDiscardPileIds: choices.chosenDiscardPileIds,
-      rng
-    });
-    logEvent(state, "spellResolved", { instanceId: spell.instanceId, name: def.name, paidByInstanceId: self.instanceId });
-    checkMagiDefeats(state, cardDb, rng);
-    state.currentAction = previousCurrentAction;
-  }
-  moveToDiscardPile(state, player, spell);
-  checkHandEmptied(state, cardDb, rng);
-}
 
 // src/cardEffects/uwamarBeads.ts
 var KARMA_PENDING_PREFIX = "uwamarBeadsKarmaPending:";
@@ -18749,6 +19742,8 @@ registerCardEffect("Black Agovo", {
   opponentHandDiscardChoice: { maxCount: 3 },
   causesOpponentHandDiscard: true,
   // task #718 (Riptide clause 2, 2026-08-11)
+  causesHostileHandDiscard: () => true,
+  // M1 retrofit, 2026-08-27: Disrupt discards from opponent's hand.
   resolvePower: (ctx) => {
     if (ctx.powerName !== "Disrupt") return;
     if (ctx.chosenTargetId === void 0) return;
@@ -18773,6 +19768,8 @@ registerCardEffect("Vulbor", {
   opponentHandDiscardChoice: { maxCount: 2 },
   causesOpponentHandDiscard: true,
   // task #718 (Riptide clause 2, 2026-08-11)
+  causesHostileHandDiscard: () => true,
+  // M1 retrofit, 2026-08-27: Mind Shock forces the chosen opponent to discard two cards.
   resolvePower: (ctx) => {
     if (ctx.powerName !== "Mind Shock") return;
     if (ctx.chosenTargetId === void 0) return;
@@ -18851,6 +19848,7 @@ registerCardEffect("Bagala Fangs", {
     const value = ctx.powerName === "Downs" ? 1 : 10;
     target.startingEnergyOverride = { value, expiresAfterTurnNumber: beginningOfNextOwnTurnNumber(ctx.state) };
   },
+  offersHostileHandDiscardSubstitution: () => true,
   substitutesForHostileHandDiscard: () => true
 });
 
@@ -18875,6 +19873,8 @@ registerCardEffect("Epik", {
   powerTargets: (state) => allMagiInPlay(state),
   causesOpponentHandDiscard: true,
   // task #718 (Riptide clause 2, 2026-08-11)
+  causesHostileHandDiscard: () => true,
+  // M1 retrofit, 2026-08-27: Dream Feast discards from opponent's hand.
   chooseFromOpponentHand: {
     maxCount: 2,
     filter: (state, cardDb, playerId, card) => cardDb.get(card.definitionKey)?.card_type === "Creature"
@@ -18904,6 +19904,8 @@ registerCardEffect("Heat Lens", {
   chooseFromOpponentHand: { maxCount: 1 },
   causesOpponentHandDiscard: true,
   // task #718 (Riptide clause 2, 2026-08-11)
+  causesHostileHandDiscard: () => true,
+  // M1 retrofit, 2026-08-27: Mind Burn discards from chosen opponent's hand.
   resolvePower: (ctx) => {
     if (ctx.powerName !== "Mind Burn") return;
     if (ctx.chosenTargetId === void 0) return;
@@ -19426,9 +20428,9 @@ registerCardEffect("Warrior's Boots", {
     if (!def || def.card_type !== "Creature" || !magi || !magiDefRaw) return;
     if (typeof def.cost !== "number") return;
     const magiDef = effectiveMagiDef(magiDefRaw, magi);
-    const regionCheck = checkRegionLegality(magiDef, def);
+    const regionCheck = checkRegionLegality(magiDef, def, void 0, magi.magiIdentityOverride?.originalRegionPlayPenalty);
     if (!regionCheck.legal) return;
-    const totalCost = spellPlayCostWithModifiers(ctx.state, ctx.cardDb, def, ctx.controllingPlayer.playerId, def.cost) + regionCheck.regionalPenalty;
+    const totalCost = spellPlayCostWithModifiers(ctx.state, ctx.cardDb, def, ctx.controllingPlayer.playerId, def.cost, handCard) + regionCheck.regionalPenalty;
     if ((magi.currentEnergy ?? 0) < totalCost) return;
     discardFromPlay(ctx.state, ctx.cardDb, ctx.controllingPlayer, ctx.source.instanceId, void 0, void 0, ctx.rng);
     magi.currentEnergy = (magi.currentEnergy ?? 0) - totalCost;
@@ -20248,7 +21250,7 @@ registerCardEffect("Corathan", {
     if (hasDurationTag(self, BETRAYAL_USED_THIS_TURN)) return;
     if (betrayalPool(state, cardDb, self).length === 0) return;
     addPendingChoiceTag(self, BETRAYAL_PENDING);
-    addDurationTag(state, cardDb, self, BETRAYAL_USED_THIS_TURN, state.turnNumber);
+    addDurationTagRaw(self, BETRAYAL_USED_THIS_TURN, state.turnNumber);
   },
   pendingTargetChoice: (state, cardDb, self) => {
     if (!self.tags.has(BETRAYAL_PENDING)) return void 0;
@@ -20957,6 +21959,8 @@ registerCardEffect("Skullek", {
 });
 
 // src/cardEffects/everburningWick.ts
+var YES_NO_PENDING = "everburningWickYesNoPending";
+var TARGET_PENDING = "everburningWickTargetPending";
 registerCardEffect("Everburning Wick", {
   // Bucket D Batch C part 2 closure 2026-08-14: this Relic's body self-discards this card
   // from play, so Vault of Knowledge Key's Archive may offer a redirect. See registry.ts's
@@ -20966,7 +21970,7 @@ registerCardEffect("Everburning Wick", {
   // discarded by opponent; Really Short Fuse is the turn-start self-discard-to-nuke.
   effectHooks: {
     "Short Fuse": ["onCardDiscardedFromPlay"],
-    "Really Short Fuse": ["onOwnTurnStart"]
+    "Really Short Fuse": ["onOwnTurnStart", "pendingYesNoChoice", "pendingTargetChoice"]
   },
   onCardDiscardedFromPlay: (state, cardDb, discarded, discardedOwnerId, self, cause, source, causedByPlayerId) => {
     if (discardedOwnerId !== self.controllerId) return;
@@ -20975,13 +21979,50 @@ registerCardEffect("Everburning Wick", {
     if (!opponent?.activeMagi) return;
     discardEnergy(state, cardDb, opponent.activeMagi, 1, "effect");
   },
-  onOwnTurnStart: (state, cardDb, self, rng) => {
+  onOwnTurnStart: (state, cardDb, self) => {
     const owner = state.players.get(self.controllerId);
     if (!owner) return;
     if (owner.inPlay.some((c2) => cardDb.get(c2.definitionKey)?.card_type === "Creature")) return;
-    const candidates = opposingCreatures(state, cardDb, self.controllerId);
-    if (candidates.length === 0) return;
-    const chosen = candidates.reduce((best, c2) => (c2.currentEnergy ?? 0) > (best.currentEnergy ?? 0) ? c2 : best);
+    if (opposingCreatures(state, cardDb, self.controllerId).length === 0) return;
+    addPendingChoiceTag(self, YES_NO_PENDING);
+  },
+  pendingYesNoChoice: (state, cardDb, self) => {
+    if (!self.tags.has(YES_NO_PENDING)) return void 0;
+    const owner = state.players.get(self.controllerId);
+    if (!owner) return void 0;
+    if (owner.inPlay.some((c2) => cardDb.get(c2.definitionKey)?.card_type === "Creature")) return void 0;
+    if (opposingCreatures(state, cardDb, self.controllerId).length === 0) return void 0;
+    return {
+      prompt: "Everburning Wick's Really Short Fuse: discard Wick to choose a Creature and discard five energy from it?",
+      yesLabel: "Discard Wick",
+      noLabel: "Skip"
+    };
+  },
+  resolveYesNoChoice: (state, cardDb, self, chosenBoolean) => {
+    removePermanentTag(self, YES_NO_PENDING);
+    if (!chosenBoolean) return;
+    addPendingChoiceTag(self, TARGET_PENDING);
+  },
+  pendingTargetChoice: (state, cardDb, self) => {
+    if (!self.tags.has(TARGET_PENDING)) return void 0;
+    const pool3 = allCreaturesInPlay(state, cardDb);
+    if (pool3.length === 0) return void 0;
+    return {
+      prompt: "Everburning Wick's Really Short Fuse: choose a Creature to discard five energy from.",
+      pool: pool3
+    };
+  },
+  resolveTargetChoice: (state, cardDb, self, chosenInstanceId, rng) => {
+    removePermanentTag(self, TARGET_PENDING);
+    const owner = state.players.get(self.controllerId);
+    if (!owner) return;
+    let chosen = chosenInstanceId ? owner.inPlay.find((c2) => c2.instanceId === chosenInstanceId) ?? [...state.players.values()].flatMap((p) => p.inPlay).find((c2) => c2.instanceId === chosenInstanceId) : void 0;
+    if (!chosen) {
+      const candidates = opposingCreatures(state, cardDb, self.controllerId);
+      if (candidates.length === 0) return;
+      chosen = candidates.reduce((best, c2) => (c2.currentEnergy ?? 0) > (best.currentEnergy ?? 0) ? c2 : best);
+    }
+    if (cardDb.get(chosen.definitionKey)?.card_type !== "Creature") return;
     discardFromPlay(state, cardDb, owner, self.instanceId, void 0, void 0, rng);
     discardEnergy(state, cardDb, chosen, 5, "effect");
   }
@@ -21061,7 +22102,7 @@ registerCardEffect("Gumph", {
     if (hasDurationTag(self, NIGHTS_SHADE_USED_THIS_TURN)) return;
     if (allCreaturesInPlay(state, cardDb).length === 0) return;
     addPendingChoiceTag(self, NIGHTS_SHADE_PENDING);
-    addDurationTag(state, cardDb, self, NIGHTS_SHADE_USED_THIS_TURN, state.turnNumber);
+    addDurationTagRaw(self, NIGHTS_SHADE_USED_THIS_TURN, state.turnNumber);
   },
   pendingTargetChoice: (state, cardDb, self) => {
     if (!self.tags.has(NIGHTS_SHADE_PENDING)) return void 0;
@@ -21129,12 +22170,14 @@ registerCardEffect("Water of Life", {
 });
 
 // src/cardEffects/ruid.ts
+var MUTATE_PENDING_PREFIX = "ruidMutatePendingFor:";
 registerCardEffect("Ruid", {
   // Per-Effect hook narrowing (C3 Q2, 2026-08-12: Taglat). Invigorate owns the energize-rate
-  // bump on the controller's Magi. Mutate owns the onPlay Bograth->Core region override.
+  // bump on the controller's Magi. Mutate owns the onPlay Bograth->Core region override AND its
+  // deferred yes/no resolution (pendingTargetChoice/resolveTargetChoice below).
   effectHooks: {
     Invigorate: ["energizeRateModifier"],
-    Mutate: ["onPlay"]
+    Mutate: ["onPlay", "pendingTargetChoice", "resolveTargetChoice"]
   },
   energizeRateModifier: (state, cardDb, energizing, self) => {
     const owner = state.players.get(self.controllerId);
@@ -21146,7 +22189,32 @@ registerCardEffect("Ruid", {
     if (played.instanceId === self.instanceId) return;
     if (cardDb.get(played.definitionKey)?.card_type !== "Creature") return;
     if (!effectiveRegions(state, cardDb, played).includes("Bograth")) return;
-    played.effectiveRegionOverride = { region: "Core" };
+    addPendingChoiceTag(self, `${MUTATE_PENDING_PREFIX}${played.instanceId}`);
+  },
+  pendingTargetChoice: (state, cardDb, self) => {
+    const pendingTag = [...self.tags].find((t) => t.startsWith(MUTATE_PENDING_PREFIX));
+    if (!pendingTag) return void 0;
+    const targetId = pendingTag.slice(MUTATE_PENDING_PREFIX.length);
+    const target = findInPlayById(state, targetId);
+    if (!target) {
+      removePermanentTag(self, pendingTag);
+      return void 0;
+    }
+    const targetName = cardDb.get(target.definitionKey)?.name ?? "that Creature";
+    return {
+      prompt: `Ruid's Mutate: convert ${targetName} from Bograth to Core?`,
+      pool: [target]
+    };
+  },
+  resolveTargetChoice: (state, cardDb, self, chosenInstanceId) => {
+    const pendingTag = [...self.tags].find((t) => t.startsWith(MUTATE_PENDING_PREFIX));
+    if (!pendingTag) return;
+    const targetId = pendingTag.slice(MUTATE_PENDING_PREFIX.length);
+    removePermanentTag(self, pendingTag);
+    if (chosenInstanceId !== targetId) return;
+    const target = findInPlayById(state, targetId);
+    if (!target) return;
+    target.effectiveRegionOverride = { region: "Core" };
   }
 });
 
@@ -22975,80 +24043,6 @@ registerCardEffect("Ashgar", {
   }
 });
 
-// src/cardEffects/goodOlAshgar.ts
-var COMBAT_REFLEXES_USED_THIS_TURN = "ashgarCombatReflexesUsedThisTurn";
-function goodOlAshgarSpellCost(cardDb, card, chosenXValue) {
-  const printedCost = cardDb.get(card.definitionKey)?.cost;
-  const base = typeof printedCost === "number" ? printedCost : typeof printedCost === "string" ? resolveVariableCost(printedCost, chosenXValue ?? 0) : 0;
-  return Math.max(0, base - 2);
-}
-registerCardEffect("Good Ol' Ashgar", {
-  offersOnDefendingMagiAttackSpellPlay: (state, cardDb, self, defendingPlayerId) => {
-    if (hasDurationTag(self, COMBAT_REFLEXES_USED_THIS_TURN)) return void 0;
-    const player = state.players.get(defendingPlayerId);
-    if (!player) return void 0;
-    const available = self.currentEnergy ?? 0;
-    const pool3 = player.hand.filter((c2) => {
-      const def = cardDb.get(c2.definitionKey);
-      if (def?.card_type !== "Spell" || !def.regions.includes("Cald")) return false;
-      return goodOlAshgarSpellCost(cardDb, c2) <= available;
-    });
-    return pool3.length > 0 ? pool3 : void 0;
-  }
-});
-function resolveGoodOlAshgarSpellPlay(state, cardDb, self, controllingPlayerId, spellInstanceId, choices = {}, rng = defaultRng) {
-  const player = state.players.get(controllingPlayerId);
-  if (!player) return;
-  const index = player.hand.findIndex((c2) => c2.instanceId === spellInstanceId);
-  if (index === -1) return;
-  const def = cardDb.get(player.hand[index].definitionKey);
-  if (def?.card_type !== "Spell" || !def.regions.includes("Cald")) return;
-  const cost = goodOlAshgarSpellCost(cardDb, player.hand[index], choices.chosenXValue);
-  if ((self.currentEnergy ?? 0) < cost) return;
-  const [spell] = player.hand.splice(index, 1);
-  addDurationTag(state, cardDb, self, COMBAT_REFLEXES_USED_THIS_TURN, state.turnNumber);
-  self.currentEnergy = (self.currentEnergy ?? 0) - cost;
-  spell.currentEnergy = null;
-  if (choices.chosenXValue !== void 0) spell.counters.startingX = choices.chosenXValue;
-  const spellEffect = getCardEffectByName(def.name);
-  if (spellEffect?.resolveSpell) {
-    const previousCurrentAction = state.currentAction;
-    state.currentAction = {
-      actorPlayerId: controllingPlayerId,
-      source: "spell",
-      sourceDefinitionKey: spell.definitionKey,
-      sourceInstanceId: spell.instanceId
-    };
-    const opposingBefore = /* @__PURE__ */ new Map();
-    for (const opponent of getOpponents(state, controllingPlayerId)) {
-      for (const c2 of opponent.inPlay) opposingBefore.set(c2.instanceId, c2.currentEnergy ?? 0);
-    }
-    const allBefore = /* @__PURE__ */ new Map();
-    for (const p of state.players.values()) {
-      for (const c2 of p.inPlay) allBefore.set(c2.instanceId, c2.currentEnergy ?? 0);
-    }
-    spellEffect.resolveSpell({
-      state,
-      cardDb,
-      source: spell,
-      controllingPlayer: player,
-      chosenTargetId: choices.chosenTargetId,
-      chosenSecondTargetId: choices.chosenSecondTargetId,
-      chosenHandCardIds: choices.chosenHandCardIds,
-      chosenBoolean: choices.chosenBoolean,
-      chosenHandPlayId: choices.chosenHandPlayId,
-      chosenDiscardPileIds: choices.chosenDiscardPileIds,
-      rng
-    });
-    logEvent(state, "spellResolved", { instanceId: spell.instanceId, name: def.name, paidByInstanceId: self.instanceId });
-    broadcastSpellDiscardedOpposingEnergy(state, cardDb, controllingPlayerId, spell, opposingBefore, allBefore);
-    checkMagiDefeats(state, cardDb, rng);
-    state.currentAction = previousCurrentAction;
-  }
-  moveToDiscardPile(state, player, spell);
-  checkHandEmptied(state, cardDb, rng);
-}
-
 // src/cardEffects/baldar.ts
 registerCardEffect("Baldar", {
   onAttack: (ctx, self) => {
@@ -23509,6 +24503,9 @@ registerCardEffect("Kintor", {
   effectHooks: {
     Snowblind: ["offersPreCombatDieRoll", "onAttack"]
   },
+  // D6b-2 (2026-08-28): bot Whimsy heuristic. Snowblind rolls a d6; the attacker (Kintor's
+  // controller) wants a HIGH roll to deal more damage. Same threshold shape as Grass Hyren.
+  botConsidersRollBad: (_state, _cardDb, _self, currentRoll, botIsController) => botIsController ? currentRoll <= 2 : currentRoll >= 5,
   offersPreCombatDieRoll: (_state, _cardDb, self, isAttacker, _isDefender, _attacker, defender) => {
     return isAttacker && defender !== void 0;
   },
@@ -23531,6 +24528,11 @@ registerCardEffect("Grass Hyren", {
   onBeforeEnergyRemoved: (ctx, self) => {
     applyWeave(ctx, self, ["Weave"]);
   },
+  // D6b-2 (2026-08-28): bot Whimsy heuristic. Evade rolls a d6; the defender (Grass Hyren's
+  // controller) wants a HIGH roll to reduce more incoming damage. Bot fires Whimsy when
+  // the current roll is bad from its own perspective: reroll ≤ 2 as defender, reroll ≥ 5 as
+  // the opposing attacker who'd rather Grass Hyren's Evade whiff.
+  botConsidersRollBad: (_state, _cardDb, _self, currentRoll, botIsController) => botIsController ? currentRoll <= 2 : currentRoll >= 5,
   offersPreCombatDieRoll: (state, cardDb, self, _isAttacker, isDefender, attacker, _defender) => {
     if (!isDefender) return false;
     if (isEnergyLossReductionBlocked(state, cardDb, { scope: "combat", attacker, defender: self, direction: "attackerOutput", cause: "effect" })) {
@@ -23549,6 +24551,12 @@ registerCardEffect("Grass Hyren", {
 
 // src/cardEffects/welliskPup.ts
 registerCardEffect("Wellisk Pup", {
+  // D6b-2 (2026-08-28): bot Whimsy heuristic. INVERTED thresholds vs the other four D6b
+  // cards: Erratic Shield rolls a d6 where 1-4 heals Wellisk Pup (+3 energy) and 5-6
+  // discards it from play. Pup's controller wants a LOW roll to survive; the opposing
+  // attacker wants a HIGH roll to catastrophically remove the defender. So reroll when
+  // (bot is controller AND roll ≥ 5) OR (bot is opposing AND roll ≤ 4).
+  botConsidersRollBad: (_state, _cardDb, _self, currentRoll, botIsController) => botIsController ? currentRoll >= 5 : currentRoll <= 4,
   offersPreCombatDieRoll: (_state, _cardDb, _self, _isAttacker, isDefender) => isDefender,
   onBeforeEnergyRemoved: (ctx, self) => {
     if (ctx.defender?.instanceId !== self.instanceId) return;
@@ -25082,6 +26090,13 @@ registerCardEffect("Ullig's Slingshot", {
     if (hasDurationTag(self, FIRE_AWAY_USED_THIS_TURN)) return void 0;
     return { prompt: "Ullig's Slingshot's Fire Away!: roll a die to discard energy from the attacker or defender?", pool: [self] };
   },
+  // D6b-2 (2026-08-28): bot Whimsy heuristic. Fire Away rolls a d6: 1-2 hurts the defender
+  // (bad for Slingshot's controller), 3-4 hurts the attacker by 1 (OK), 5-6 hurts the
+  // attacker by 3 (great). Slingshot's controller (the defender's side) wants a HIGH roll.
+  // Same threshold shape as Grass Hyren -- the "roll 1-2 = hurt yourself" outcome is the
+  // one to reroll out of, and the "5-6 = hurt attacker by 3" is the one the opposing bot
+  // wants to reroll away.
+  botConsidersRollBad: (_state, _cardDb, _self, currentRoll, botIsController) => botIsController ? currentRoll <= 2 : currentRoll >= 5,
   offersPreCombatDieRoll: (state, cardDb, self, _isAttacker, _isDefender, _attacker, defender, preCombatTargetChoices) => {
     if (!defender || defender.controllerId !== self.controllerId) return false;
     if (hasDurationTag(self, FIRE_AWAY_USED_THIS_TURN)) return false;
@@ -25317,9 +26332,9 @@ registerCardEffect("Voice of the Storm", {
   costModifier: (state, cardDb, playedDef, playerId, self) => {
     if (playerId !== self.controllerId) return 0;
     if (playedDef.card_type !== "Creature") return 0;
-    const ownCreatures3 = creaturesControlledBy(state, cardDb, playerId);
-    const hasOrothe = ownCreatures3.some((c2) => effectiveRegions(state, cardDb, c2).includes("Orothe"));
-    const hasArderial = ownCreatures3.some((c2) => effectiveRegions(state, cardDb, c2).includes("Arderial"));
+    const ownCreatures4 = creaturesControlledBy(state, cardDb, playerId);
+    const hasOrothe = ownCreatures4.some((c2) => effectiveRegions(state, cardDb, c2).includes("Orothe"));
+    const hasArderial = ownCreatures4.some((c2) => effectiveRegions(state, cardDb, c2).includes("Arderial"));
     if (playedDef.regions.includes("Arderial") && hasOrothe) return -1;
     if (playedDef.regions.includes("Orothe") && hasArderial) return -1;
     return 0;
@@ -25980,6 +26995,7 @@ registerCardEffect("Kalius' Ring", {
     if (!target) return;
     const owner = state.players.get(target.controllerId);
     if (owner) discardFromPlay(state, cardDb, owner, target.instanceId, void 0, void 0, rng);
+    checkMagiDefeats(state, cardDb, rng);
   }
 });
 
@@ -27370,18 +28386,45 @@ registerCardEffect("Wellisk", {
 });
 
 // src/cardEffects/deepWellisk.ts
+var PENDING_PREFIX10 = "sunkenTreasurePending:";
+function pendingPlayedId3(self) {
+  for (const tag of self.tags) {
+    if (tag.startsWith(PENDING_PREFIX10)) return tag.slice(PENDING_PREFIX10.length);
+  }
+  return void 0;
+}
 registerCardEffect("Deep Wellisk", {
-  // Per-Effect hook narrowing (C3 Q2, 2026-08-12: Taglat). Only Sunken Treasure is mapped;
-  // the second (unnamed) discard-immunity + no-friendly-energy-gain clause pair
-  // (canBeDiscardedFromPlay, blocksOwnCausedEnergyGainTo) has no name to key on and falls
-  // through to whole-card grant.
+  // Per-Effect hook narrowing (C3 Q2, 2026-08-12: Taglat). Sunken Treasure covers the reactive
+  // onPlay chain (onPlay -> pendingYesNoChoice -> resolveYesNoChoice); the second (unnamed)
+  // discard-immunity + no-friendly-energy-gain clause pair (canBeDiscardedFromPlay,
+  // blocksOwnCausedEnergyGainTo) has no name to key on and falls through to whole-card grant.
   effectHooks: {
-    "Sunken Treasure": ["onPlay"]
+    "Sunken Treasure": ["onPlay", "pendingYesNoChoice", "resolveYesNoChoice"]
   },
-  onPlay: (state, cardDb, played, self, rng) => {
+  onPlay: (state, cardDb, played, self) => {
     if (played.controllerId === self.controllerId) return;
     if (cardDb.get(played.definitionKey)?.card_type !== "Relic") return;
     if ((self.currentEnergy ?? 0) < 2) return;
+    addPermanentTag(state, cardDb, self, `${PENDING_PREFIX10}${played.instanceId}`);
+  },
+  pendingYesNoChoice: (state, cardDb, self) => {
+    const playedId = pendingPlayedId3(self);
+    if (playedId === void 0) return void 0;
+    if (!findInPlayById(state, playedId)) return void 0;
+    if ((self.currentEnergy ?? 0) < 2) return void 0;
+    return {
+      prompt: "Deep Wellisk's Sunken Treasure: discard two energy from Deep Wellisk to discard the just-played Relic from play?",
+      yesLabel: "Discard 2 energy, discard the Relic",
+      noLabel: "Decline"
+    };
+  },
+  resolveYesNoChoice: (state, cardDb, self, chosenBoolean, rng) => {
+    const playedId = pendingPlayedId3(self);
+    if (playedId !== void 0) removePermanentTag(self, `${PENDING_PREFIX10}${playedId}`);
+    if (!chosenBoolean || playedId === void 0) return;
+    if ((self.currentEnergy ?? 0) < 2) return;
+    const played = findInPlayById(state, playedId);
+    if (!played) return;
     discardEnergy(state, cardDb, self, 2, "effect");
     const owner = state.players.get(played.controllerId);
     if (owner) discardFromPlay(state, cardDb, owner, played.instanceId, void 0, void 0, rng);
@@ -28279,7 +29322,7 @@ registerCardEffect("Gia's Tome", {
     if (!chosen || !def || def.card_type !== "Creature" || !magi || !magiDefRaw) return;
     if (typeof def.cost !== "number") return;
     const magiDef = effectiveMagiDef(magiDefRaw, magi);
-    const regionCheck = checkRegionLegality(magiDef, def);
+    const regionCheck = checkRegionLegality(magiDef, def, void 0, magi.magiIdentityOverride?.originalRegionPlayPenalty);
     if (!regionCheck.legal) return;
     const dreamwarpDelta = resolveDreamwarpDelta(
       ctx.state,
@@ -28560,38 +29603,85 @@ registerCardEffect("Bottled City", {
 });
 
 // src/cardEffects/hubdrasCube.ts
+var LINKED_PREFIX = "hubdrasCubeLinked:";
+function linkedInstanceIds(self) {
+  const ids = [];
+  for (const tag of self.tags) {
+    if (tag.startsWith(LINKED_PREFIX)) ids.push(tag.slice(LINKED_PREFIX.length));
+  }
+  return ids;
+}
+function ownRelicCopyLimitNames(cardDb, inPlay) {
+  const names = /* @__PURE__ */ new Set();
+  for (const c2 of inPlay) {
+    const def = cardDb.get(c2.definitionKey);
+    if (def?.card_type === "Relic") names.add(copyLimitName(def));
+  }
+  return names;
+}
 registerCardEffect("Hubdra's Cube", {
-  // Cards stored under this one are OUT of play, not markers riding on it -- see
-  // registry.ts's `holdsInertContents`. Without this, every board-wide broadcast that
-  // flattens `attachedCards` (to reach the marker family) also fires the abilities of
-  // whatever is sitting inertly in here.
-  holdsInertContents: true,
   powerTargets: (state, cardDb, playerId, powerName, sourceInstanceId) => {
     if (powerName !== "Relic Subversion") return void 0;
+    const caster = state.players.get(playerId);
+    if (!caster) return void 0;
+    const casterOwnedIds = new Set(caster.inPlay.map((c2) => c2.instanceId));
+    const ownNames = ownRelicCopyLimitNames(cardDb, caster.inPlay);
     return [...state.players.values()].flatMap(
-      (p) => p.inPlay.filter((c2) => c2.instanceId !== sourceInstanceId && cardDb.get(c2.definitionKey)?.card_type === "Relic")
+      (p) => p.inPlay.filter((c2) => {
+        if (c2.instanceId === sourceInstanceId) return false;
+        const def = cardDb.get(c2.definitionKey);
+        if (def?.card_type !== "Relic") return false;
+        if (!casterOwnedIds.has(c2.instanceId) && ownNames.has(copyLimitName(def))) return false;
+        return true;
+      })
     );
   },
   resolvePower: (ctx) => {
     if (ctx.powerName !== "Relic Subversion") return;
-    if (ctx.source.attachedCards.length > 0) return;
     if (!ctx.chosenTargetId) return;
+    if (linkedInstanceIds(ctx.source).length > 0) return;
     let target;
     for (const player of ctx.state.players.values()) {
       target = player.inPlay.find((c2) => c2.instanceId === ctx.chosenTargetId);
       if (target) break;
     }
     if (!target || target.instanceId === ctx.source.instanceId) return;
-    if (ctx.cardDb.get(target.definitionKey)?.card_type !== "Relic") return;
+    const targetDef = ctx.cardDb.get(target.definitionKey);
+    if (targetDef?.card_type !== "Relic") return;
+    const casterAlreadyOwns = ctx.controllingPlayer.inPlay.some((c2) => c2.instanceId === target.instanceId);
+    if (!casterAlreadyOwns) {
+      const ownNames = ownRelicCopyLimitNames(ctx.cardDb, ctx.controllingPlayer.inPlay);
+      if (ownNames.has(copyLimitName(targetDef))) return;
+    }
     gainControl(ctx.state, ctx.cardDb, target, ctx.controllingPlayer.playerId);
-    const index = ctx.controllingPlayer.inPlay.findIndex((c2) => c2.instanceId === target.instanceId);
-    if (index === -1) return;
-    const [stolen] = ctx.controllingPlayer.inPlay.splice(index, 1);
-    attachCard(ctx.source, stolen);
+    addPermanentTag(ctx.state, ctx.cardDb, ctx.source, `${LINKED_PREFIX}${target.instanceId}`);
+    addPermanentRestrictionTag(ctx.state, ctx.source, CANNOT_USE_POWER);
   },
-  onCardDiscardedFromPlay: (state, cardDb, discarded, discardedOwnerId, self) => {
-    if (discarded.instanceId !== self.instanceId) return;
-    discardAllAttached(state, cardDb, self);
+  onCardDiscardedFromPlay: (state, cardDb, discarded, _discardedOwnerId, self, _cause, _source, _causedByPlayerId, rng) => {
+    if (discarded.instanceId === self.instanceId) {
+      for (const linkedId of linkedInstanceIds(self)) {
+        for (const player of state.players.values()) {
+          if (player.inPlay.some((c2) => c2.instanceId === linkedId)) {
+            discardFromPlay(state, cardDb, player, linkedId, void 0, void 0, rng);
+            break;
+          }
+        }
+      }
+      return;
+    }
+    const linkTag = `${LINKED_PREFIX}${discarded.instanceId}`;
+    if (self.tags.has(linkTag)) {
+      removePermanentTag(self, linkTag);
+      removePermanentRestrictionTag(self, CANNOT_USE_POWER);
+    }
+  },
+  onGainControl: (state, cardDb, gained, newControllerId, self) => {
+    if (newControllerId === self.controllerId) return;
+    const linkTag = `${LINKED_PREFIX}${gained.instanceId}`;
+    if (self.tags.has(linkTag)) {
+      removePermanentTag(self, linkTag);
+      removePermanentRestrictionTag(self, CANNOT_USE_POWER);
+    }
   }
 });
 
@@ -28747,11 +29837,13 @@ registerCardEffect("Laranel", {
 
 // src/cardEffects/ust.ts
 var GAMBIT_USED_THIS_TURN = "ustGambitUsedThisTurn";
+var GAMBIT_HAND_PICK_PENDING = "ustGambitHandPickPending";
 registerCardEffect("Ust", {
   // Per-Effect hook narrowing (E1, 2026-08-12). Only Gambit is named; the narSurcharge clause is
-  // unnamed and Taglat's pool skips unnamed effects.
+  // unnamed and Taglat's pool skips unnamed effects. `pendingMultiTargetChoice` and
+  // `resolveMultiTargetChoice` are now part of Gambit too (2026-08-26 retrofit).
   effectHooks: {
-    Gambit: ["pendingPreCombatTargetChoice", "onBeforeEnergyRemoved"]
+    Gambit: ["pendingPreCombatTargetChoice", "onBeforeEnergyRemoved", "pendingMultiTargetChoice", "resolveMultiTargetChoice"]
   },
   costModifier: narSurcharge,
   pendingPreCombatTargetChoice: (state, cardDb, self, isAttacker, isDefender, attacker, defender, isDirectMagiDefender) => {
@@ -28771,9 +29863,39 @@ registerCardEffect("Ust", {
     const player = ctx.state.players.get(self.controllerId);
     if (!player || player.hand.length < 2) return;
     addDurationTag(ctx.state, ctx.cardDb, self, GAMBIT_USED_THIS_TURN, ctx.state.turnNumber);
-    const toDiscard = player.hand.slice(0, 2).map((c2) => c2.instanceId);
-    discardFromHand(ctx.state, ctx.cardDb, player, toDiscard, void 0, ctx.rng);
     discardFromPlay(ctx.state, ctx.cardDb, ctx.attackingPlayer, ctx.attacker.instanceId, void 0, void 0, ctx.rng);
+    addPendingChoiceTag(self, GAMBIT_HAND_PICK_PENDING);
+  },
+  pendingMultiTargetChoice: (state, cardDb, self) => {
+    if (!self.tags.has(GAMBIT_HAND_PICK_PENDING)) return void 0;
+    const player = state.players.get(self.controllerId);
+    if (!player || player.hand.length === 0) {
+      removePermanentTag(self, GAMBIT_HAND_PICK_PENDING);
+      return void 0;
+    }
+    const count = Math.min(2, player.hand.length);
+    return {
+      prompt: `Ust's Gambit: choose ${count === 1 ? "one card" : "two cards"} from your hand to discard as the cost`,
+      pool: player.hand.map((c2) => c2.instanceId),
+      minCount: count,
+      maxCount: count
+    };
+  },
+  resolveMultiTargetChoice: (state, cardDb, self, chosenInstanceIds, rng) => {
+    if (!self.tags.has(GAMBIT_HAND_PICK_PENDING)) return;
+    removePermanentTag(self, GAMBIT_HAND_PICK_PENDING);
+    const player = state.players.get(self.controllerId);
+    if (!player || player.hand.length === 0) return;
+    const count = Math.min(2, player.hand.length);
+    const handIds = new Set(player.hand.map((c2) => c2.instanceId));
+    let targetIds;
+    if (chosenInstanceIds) {
+      const valid = [...new Set(chosenInstanceIds)].filter((id) => handIds.has(id)).slice(0, count);
+      targetIds = valid.length === count ? valid : player.hand.slice(0, count).map((c2) => c2.instanceId);
+    } else {
+      targetIds = player.hand.slice(0, count).map((c2) => c2.instanceId);
+    }
+    if (targetIds.length > 0) discardFromHand(state, cardDb, player, targetIds, void 0, rng);
   }
 });
 
@@ -28889,6 +30011,10 @@ registerCardEffect("Sun Glasses", {
   effectHooks: {
     Glare: ["onAttack", "offersPreCombatDieRoll"]
   },
+  // D6b-2 (2026-08-28): bot Whimsy heuristic. Glare rolls a d6 that ADDS to the attacker's
+  // damage to the opposing Magi -- Sun Glasses' controller wants a HIGH roll. Same threshold
+  // shape as Grass Hyren / Kintor.
+  botConsidersRollBad: (_state, _cardDb, _self, currentRoll, botIsController) => botIsController ? currentRoll <= 2 : currentRoll >= 5,
   offersPreCombatDieRoll: (_state, _cardDb, self, _isAttacker, _isDefender, attacker, defender) => {
     if (defender !== void 0) return false;
     if (attacker.controllerId !== self.controllerId) return false;
@@ -29252,7 +30378,7 @@ registerCardEffect("Erisa", {
     Nomad: ["customDefeatCondition"],
     Legacy: ["survivesOwnMagiDefeat", "onNextMagiRevealed"]
   },
-  customDefeatCondition: (state, cardDb, magi, ownCreatures3) => (magi.currentEnergy ?? 0) <= 0 && ownCreatures3.every((c2) => isFrozen(state, cardDb, c2)),
+  customDefeatCondition: (state, cardDb, magi, ownCreatures4) => (magi.currentEnergy ?? 0) <= 0 && ownCreatures4.every((c2) => isFrozen(state, cardDb, c2)),
   survivesOwnMagiDefeat: (state, cardDb, magi, card) => {
     const def = cardDb.get(card.definitionKey);
     if (!def || def.card_type !== "Creature" && def.card_type !== "Relic") return false;
@@ -29292,9 +30418,9 @@ registerCardEffect("Kyg'n", {
   effectHooks: {
     "True Gift": ["customDefeatCondition"]
   },
-  customDefeatCondition: (state, cardDb, magi, ownCreatures3) => {
+  customDefeatCondition: (state, cardDb, magi, ownCreatures4) => {
     if (!magi.tags.has(EVER_ATTACKED_MAGI_DIRECTLY)) return false;
-    return (magi.currentEnergy ?? 0) <= 0 && ownCreatures3.length === 0;
+    return (magi.currentEnergy ?? 0) <= 0 && ownCreatures4.length === 0;
   },
   onMagiRevealed: (state, cardDb, revealedMagi, self) => {
     if (revealedMagi.instanceId !== self.instanceId) return;
@@ -29488,6 +30614,7 @@ registerCardEffect("Elios", {
 });
 
 // src/cardEffects/adis.ts
+var DEFEAT_DISCARD_PENDING_PREFIX = "adisDefeatDiscardPendingFor:";
 registerCardEffect("Adis", {
   // task #718 (Riptide clause 2, 2026-08-11): Effect-shaped hostile hand-discard. Tag + in-body
   // gate -- if Adis's owner has an active Riptide ban, the on-defeat discard is suppressed. The
@@ -29497,10 +30624,48 @@ registerCardEffect("Adis", {
   onOwnMagiDefeated: (state, cardDb, self) => {
     if (riptideBanActiveFor(state, self.controllerId)) return;
     for (const opponent of getOpponents(state, self.controllerId)) {
-      const toDiscard = opponent.hand.slice(0, 3).map((c2) => c2.instanceId);
-      if (toDiscard.length > 0) {
-        discardFromHand(state, cardDb, opponent, toDiscard);
+      if (opponent.hand.length > 0) {
+        addPendingChoiceTag(self, `${DEFEAT_DISCARD_PENDING_PREFIX}${opponent.playerId}`);
       }
+    }
+  },
+  pendingMultiTargetChoice: (state, cardDb, self) => {
+    const pendingTag = [...self.tags].find((t) => t.startsWith(DEFEAT_DISCARD_PENDING_PREFIX));
+    if (!pendingTag) return void 0;
+    const opponentId = pendingTag.slice(DEFEAT_DISCARD_PENDING_PREFIX.length);
+    const opponent = state.players.get(opponentId);
+    if (!opponent || opponent.hand.length === 0) {
+      removePermanentTag(self, pendingTag);
+      return void 0;
+    }
+    const count = Math.min(3, opponent.hand.length);
+    return {
+      prompt: `Adis's defeat: choose ${count} card${count === 1 ? "" : "s"} from your hand to discard`,
+      pool: opponent.hand.map((c2) => c2.instanceId),
+      minCount: count,
+      maxCount: count,
+      answeringPlayerId: opponentId
+    };
+  },
+  resolveMultiTargetChoice: (state, cardDb, self, chosenInstanceIds, rng) => {
+    const pendingTag = [...self.tags].find((t) => t.startsWith(DEFEAT_DISCARD_PENDING_PREFIX));
+    if (!pendingTag) return;
+    const opponentId = pendingTag.slice(DEFEAT_DISCARD_PENDING_PREFIX.length);
+    removePermanentTag(self, pendingTag);
+    const opponent = state.players.get(opponentId);
+    if (!opponent) return;
+    const count = Math.min(3, opponent.hand.length);
+    if (count <= 0) return;
+    const handIds = new Set(opponent.hand.map((c2) => c2.instanceId));
+    let targetIds;
+    if (chosenInstanceIds) {
+      const valid = [...new Set(chosenInstanceIds)].filter((id) => handIds.has(id)).slice(0, count);
+      targetIds = valid.length === count ? valid : opponent.hand.slice(0, count).map((c2) => c2.instanceId);
+    } else {
+      targetIds = opponent.hand.slice(0, count).map((c2) => c2.instanceId);
+    }
+    if (targetIds.length > 0) {
+      discardFromHand(state, cardDb, opponent, targetIds, self.controllerId, rng);
     }
   }
 });
@@ -30120,15 +31285,36 @@ registerCardEffect("Rolling Baldar", {
 
 // src/cardEffects/yarkGloves.ts
 var USED_THIS_TURN7 = "yarkGlovesUsedThisTurn";
+function eligibilityMatches(ctx, self) {
+  if (!ctx.defender) return false;
+  if (ctx.defender.controllerId !== self.controllerId) return false;
+  if (!effectiveRegions(ctx.state, ctx.cardDb, ctx.defender).includes("Kybar's Teeth")) return false;
+  if (effectiveRegions(ctx.state, ctx.cardDb, ctx.attacker).includes("Kybar's Teeth")) return false;
+  const attackerStart = effectiveStartingEnergy(ctx.state, ctx.cardDb, ctx.attacker);
+  if ((ctx.attacker.currentEnergy ?? 0) <= attackerStart) return false;
+  if (hasDurationTag(self, USED_THIS_TURN7)) return false;
+  return true;
+}
 registerCardEffect("Yark Gloves", {
+  pendingPreCombatTargetChoice: (state, cardDb, self, _isAttacker, _isDefender, attacker, defender) => {
+    if (!defender) return void 0;
+    if (defender.controllerId !== self.controllerId) return void 0;
+    if (!effectiveRegions(state, cardDb, defender).includes("Kybar's Teeth")) return void 0;
+    if (effectiveRegions(state, cardDb, attacker).includes("Kybar's Teeth")) return void 0;
+    const attackerStart = effectiveStartingEnergy(state, cardDb, attacker);
+    if ((attacker.currentEnergy ?? 0) <= attackerStart) return void 0;
+    if (hasDurationTag(self, USED_THIS_TURN7)) return void 0;
+    return {
+      prompt: `Yark Gloves' Deplete: reduce the attacking Creature to its starting energy (${attackerStart})?`,
+      pool: [attacker]
+    };
+  },
   onBeforeEnergyRemoved: (ctx, self) => {
-    if (!ctx.defender) return;
-    if (ctx.defender.controllerId !== self.controllerId) return;
-    if (!effectiveRegions(ctx.state, ctx.cardDb, ctx.defender).includes("Kybar's Teeth")) return;
-    if (effectiveRegions(ctx.state, ctx.cardDb, ctx.attacker).includes("Kybar's Teeth")) return;
+    if (!eligibilityMatches(ctx, self)) return;
+    const resolutions = ctx.scratch.preCombatTargetChoices;
+    const resolution = resolutions?.[self.instanceId];
+    if (!resolution || "skip" in resolution) return;
     const attackerStart = effectiveStartingEnergy(ctx.state, ctx.cardDb, ctx.attacker);
-    if ((ctx.attacker.currentEnergy ?? 0) <= attackerStart) return;
-    if (hasDurationTag(self, USED_THIS_TURN7)) return;
     restoreEnergy(ctx.state, ctx.cardDb, ctx.attacker, attackerStart);
     addDurationTag(ctx.state, ctx.cardDb, self, USED_THIS_TURN7, ctx.state.turnNumber);
   }
@@ -30415,17 +31601,17 @@ registerCardEffect("Staff of Hyren", {
 
 // src/cardEffects/rayjesShield.ts
 var CHOSEN_THIS_TURN = "rayjesShieldChosenThisTurn";
-var PENDING_PREFIX10 = "rayjesShieldPending:";
+var PENDING_PREFIX11 = "rayjesShieldPending:";
 function pendingCount(self) {
   for (const tag of self.tags) {
-    if (tag.startsWith(PENDING_PREFIX10)) return Number(tag.slice(PENDING_PREFIX10.length)) || 0;
+    if (tag.startsWith(PENDING_PREFIX11)) return Number(tag.slice(PENDING_PREFIX11.length)) || 0;
   }
   return 0;
 }
 function setPendingCount(state, cardDb, self, n) {
   const old = pendingCount(self);
-  if (old > 0) removePermanentTag(self, `${PENDING_PREFIX10}${old}`);
-  if (n > 0) addPermanentTag(state, cardDb, self, `${PENDING_PREFIX10}${n}`);
+  if (old > 0) removePermanentTag(self, `${PENDING_PREFIX11}${old}`);
+  if (n > 0) addPermanentTag(state, cardDb, self, `${PENDING_PREFIX11}${n}`);
 }
 function leadershipPool(state, cardDb, self) {
   return creaturesControlledBy(state, cardDb, self.controllerId).filter((c2) => !hasDurationTag(c2, CHOSEN_THIS_TURN));
@@ -30604,6 +31790,21 @@ function lorePool(state, self) {
 }
 registerCardEffect("Tomorrow's Jewel", {
   redirectsHostileHandDiscardToPlay: () => true,
+  offersHostileHandDiscardBlock: (state, _cardDb, self) => {
+    const magi = state.players.get(self.controllerId)?.activeMagi;
+    return !!magi && (magi.currentEnergy ?? 0) > 0;
+  },
+  resolveHostileHandDiscardBlock: (state, cardDb, self, _actorPlayerId, rng) => {
+    const magi = state.players.get(self.controllerId)?.activeMagi;
+    if (!magi || (magi.currentEnergy ?? 0) <= 0) return;
+    discardEnergy(state, cardDb, magi, 1, "effect", self.controllerId, rng);
+  },
+  // M1 (2026-08-27): sync fallback for reactive-hook-triggered hostile hand discards (~18
+  // cards where the discard fires from `onOwnMagiDefeated`/`afterCombat`/etc., not
+  // `resolvePower`/`resolveSpell`, so the reactive-offer stage doesn't arm). `discardFromHand`
+  // skips this when the reactive offer IS armed. Pays the same 1 Magi energy cost via
+  // `blocksHostileHandDiscard`'s side-effect-during-check convention (Orpus's-Relic-Guard
+  // pattern). See bagalaFangs.ts's header for the follow-up scope.
   blocksHostileHandDiscard: (state, cardDb, self) => {
     const magi = state.players.get(self.controllerId)?.activeMagi;
     if (!magi || (magi.currentEnergy ?? 0) <= 0) return false;
@@ -30770,10 +31971,10 @@ registerCardEffect("Rayje", {
 
 // src/cardEffects/glovesOfCrystal.ts
 var BISIWOG_FAMILY = /\bBisiwog\b/;
-var PENDING_PREFIX11 = "glovesOfCrystalPending:";
-function pendingPlayedId3(self) {
+var PENDING_PREFIX12 = "glovesOfCrystalPending:";
+function pendingPlayedId4(self) {
   for (const tag of self.tags) {
-    if (tag.startsWith(PENDING_PREFIX11)) return tag.slice(PENDING_PREFIX11.length);
+    if (tag.startsWith(PENDING_PREFIX12)) return tag.slice(PENDING_PREFIX12.length);
   }
   return void 0;
 }
@@ -30785,10 +31986,10 @@ registerCardEffect("Gloves of Crystal", {
     if (!def.regions.includes("Underneath")) return;
     const magi = state.players.get(self.controllerId)?.activeMagi;
     if (!magi || (magi.currentEnergy ?? 0) < 1) return;
-    addPermanentTag(state, cardDb, self, `${PENDING_PREFIX11}${played.instanceId}`);
+    addPermanentTag(state, cardDb, self, `${PENDING_PREFIX12}${played.instanceId}`);
   },
   pendingYesNoChoice: (state, cardDb, self) => {
-    const playedId = pendingPlayedId3(self);
+    const playedId = pendingPlayedId4(self);
     if (playedId === void 0) return void 0;
     const played = findInPlayById(state, playedId);
     if (!played) return void 0;
@@ -30802,8 +32003,8 @@ registerCardEffect("Gloves of Crystal", {
     };
   },
   resolveYesNoChoice: (state, cardDb, self, chosenBoolean, rng) => {
-    const playedId = pendingPlayedId3(self);
-    if (playedId !== void 0) removePermanentTag(self, `${PENDING_PREFIX11}${playedId}`);
+    const playedId = pendingPlayedId4(self);
+    if (playedId !== void 0) removePermanentTag(self, `${PENDING_PREFIX12}${playedId}`);
     if (!chosenBoolean || playedId === void 0) return;
     const played = findInPlayById(state, playedId);
     const magi = state.players.get(self.controllerId)?.activeMagi;
@@ -30815,10 +32016,10 @@ registerCardEffect("Gloves of Crystal", {
 });
 
 // src/cardEffects/hubram.ts
-var PENDING_PREFIX12 = "hubramPending:";
+var PENDING_PREFIX13 = "hubramPending:";
 function pendingSpellId(self) {
   for (const tag of self.tags) {
-    if (tag.startsWith(PENDING_PREFIX12)) return tag.slice(PENDING_PREFIX12.length);
+    if (tag.startsWith(PENDING_PREFIX13)) return tag.slice(PENDING_PREFIX13.length);
   }
   return void 0;
 }
@@ -30832,7 +32033,7 @@ registerCardEffect("Hubram", {
     if (def?.card_type !== "Spell") return;
     if (!def.regions.includes("Underneath")) return;
     if (!findInDiscardPile3(state, self.controllerId, played.instanceId)) return;
-    addPermanentTag(state, cardDb, self, `${PENDING_PREFIX12}${played.instanceId}`);
+    addPermanentTag(state, cardDb, self, `${PENDING_PREFIX13}${played.instanceId}`);
   },
   pendingYesNoChoice: (state, cardDb, self) => {
     const spellId = pendingSpellId(self);
@@ -30846,7 +32047,7 @@ registerCardEffect("Hubram", {
   },
   resolveYesNoChoice: (state, cardDb, self, chosenBoolean, rng) => {
     const spellId = pendingSpellId(self);
-    if (spellId !== void 0) removePermanentTag(self, `${PENDING_PREFIX12}${spellId}`);
+    if (spellId !== void 0) removePermanentTag(self, `${PENDING_PREFIX13}${spellId}`);
     if (!chosenBoolean || spellId === void 0) return;
     const player = state.players.get(self.controllerId);
     if (!player || !findInDiscardPile3(state, self.controllerId, spellId)) return;
@@ -31273,15 +32474,66 @@ registerCardEffect("Saitorr", {
 });
 
 // src/cardEffects/unesScale.ts
+var BALANCE_PENDING_PREFIX = "unesScaleBalancePendingFor:";
 registerCardEffect("Une's Scale", {
-  onOwnTurnEnd: (state, cardDb, self, rng) => {
+  onOwnTurnEnd: (state, cardDb, self) => {
     for (const player of state.players.values()) {
-      const excess = player.hand.length - 10;
-      if (excess <= 0) continue;
-      const toShuffleIn = player.hand.splice(player.hand.length - excess, excess);
-      player.deck.push(...toShuffleIn);
-      shuffleDeck(player, rng);
+      if (player.hand.length - 10 > 0) {
+        addPendingChoiceTag(self, `${BALANCE_PENDING_PREFIX}${player.playerId}`);
+      }
     }
+  },
+  pendingMultiTargetChoice: (state, cardDb, self) => {
+    const pendingTag = [...self.tags].find((t) => t.startsWith(BALANCE_PENDING_PREFIX));
+    if (!pendingTag) return void 0;
+    const playerId = pendingTag.slice(BALANCE_PENDING_PREFIX.length);
+    const player = state.players.get(playerId);
+    if (!player) {
+      removePermanentTag(self, pendingTag);
+      return void 0;
+    }
+    const excess = player.hand.length - 10;
+    if (excess <= 0) {
+      removePermanentTag(self, pendingTag);
+      return void 0;
+    }
+    return {
+      prompt: `Une's Scale's Balance: choose ${excess} card${excess === 1 ? "" : "s"} from your hand to shuffle into your deck (keep 10)`,
+      pool: player.hand.map((c2) => c2.instanceId),
+      minCount: excess,
+      maxCount: excess,
+      answeringPlayerId: playerId
+    };
+  },
+  resolveMultiTargetChoice: (state, cardDb, self, chosenInstanceIds, rng) => {
+    const pendingTag = [...self.tags].find((t) => t.startsWith(BALANCE_PENDING_PREFIX));
+    if (!pendingTag) return;
+    const playerId = pendingTag.slice(BALANCE_PENDING_PREFIX.length);
+    removePermanentTag(self, pendingTag);
+    const player = state.players.get(playerId);
+    if (!player) return;
+    const excess = player.hand.length - 10;
+    if (excess <= 0) return;
+    const handIds = new Set(player.hand.map((c2) => c2.instanceId));
+    let targetIds;
+    if (chosenInstanceIds) {
+      const valid = [...new Set(chosenInstanceIds)].filter((id) => handIds.has(id)).slice(0, excess);
+      targetIds = valid.length === excess ? valid : player.hand.slice(player.hand.length - excess).map((c2) => c2.instanceId);
+    } else {
+      targetIds = player.hand.slice(player.hand.length - excess).map((c2) => c2.instanceId);
+    }
+    const targetSet = new Set(targetIds);
+    const moved = [];
+    for (let i = player.hand.length - 1; i >= 0; i--) {
+      const card = player.hand[i];
+      if (targetSet.has(card.instanceId)) {
+        player.hand.splice(i, 1);
+        moved.push(card);
+      }
+    }
+    if (moved.length === 0) return;
+    for (const card of moved) player.deck.push(card);
+    shuffleDeck(player, rng ?? defaultRng);
   }
 });
 
@@ -31366,16 +32618,121 @@ registerCardEffect("Hubdra's Chest", {
 });
 
 // src/cardEffects/trygarsWill.ts
+var STAGE1_PREFIX = "trygarsWillStage1For:";
+var STAGE2_PREFIX = "trygarsWillStage2For:";
+function stage2TagFor(opponentId, chosenIds) {
+  return `${STAGE2_PREFIX}${opponentId}:${chosenIds.join(",")}`;
+}
+function decodeStage2(tag) {
+  if (!tag.startsWith(STAGE2_PREFIX)) return void 0;
+  const body = tag.slice(STAGE2_PREFIX.length);
+  const colonIndex = body.indexOf(":");
+  if (colonIndex === -1) return void 0;
+  const opponentId = body.slice(0, colonIndex);
+  const chosenIds = body.slice(colonIndex + 1).split(",").filter((s) => s.length > 0);
+  return { opponentId, chosenIds };
+}
 registerCardEffect("Trygar's Will", {
-  onOwnMagiDefeated: (state, cardDb, self, magi, rng) => {
+  onOwnMagiDefeated: (state, cardDb, self) => {
     for (const [playerId, player] of state.players) {
       if (playerId === self.controllerId) continue;
       const eligible4 = player.inPlay.filter((c2) => cardDb.get(c2.definitionKey)?.card_type !== "Magi");
       if (eligible4.length === 0) continue;
-      const chosen = eligible4.slice(0, 2);
-      discardFromPlay(state, cardDb, player, chosen[0].instanceId, void 0, void 0, rng);
+      addPendingChoiceTag(self, `${STAGE1_PREFIX}${playerId}`);
       return;
     }
+  },
+  pendingMultiTargetChoice: (state, cardDb, self) => {
+    const stage1Tag = [...self.tags].find((t) => t.startsWith(STAGE1_PREFIX));
+    if (!stage1Tag) return void 0;
+    const opponentId = stage1Tag.slice(STAGE1_PREFIX.length);
+    const opponent = state.players.get(opponentId);
+    if (!opponent) {
+      removePermanentTag(self, stage1Tag);
+      return void 0;
+    }
+    const eligible4 = opponent.inPlay.filter((c2) => cardDb.get(c2.definitionKey)?.card_type !== "Magi");
+    if (eligible4.length === 0) {
+      removePermanentTag(self, stage1Tag);
+      return void 0;
+    }
+    const count = Math.min(2, eligible4.length);
+    return {
+      prompt: `Trygar's Will Legacy: choose ${count === 1 ? "one" : "two"} of ${opponentId}'s non-Magi cards in play -- ${opponentId} then chooses which to discard`,
+      pool: eligible4.map((c2) => c2.instanceId),
+      minCount: count,
+      maxCount: count
+      // Stage 1's answer belongs to the CONTROLLER (Trygar's Will's own player), which is the
+      // default for pendingMultiTargetChoice -- no answeringPlayerId override needed.
+    };
+  },
+  resolveMultiTargetChoice: (state, cardDb, self, chosenInstanceIds) => {
+    const stage1Tag = [...self.tags].find((t) => t.startsWith(STAGE1_PREFIX));
+    if (!stage1Tag) return;
+    const opponentId = stage1Tag.slice(STAGE1_PREFIX.length);
+    removePermanentTag(self, stage1Tag);
+    const opponent = state.players.get(opponentId);
+    if (!opponent) return;
+    const eligible4 = opponent.inPlay.filter((c2) => cardDb.get(c2.definitionKey)?.card_type !== "Magi");
+    if (eligible4.length === 0) return;
+    const eligibleIds = new Set(eligible4.map((c2) => c2.instanceId));
+    const count = Math.min(2, eligible4.length);
+    let stage1Chosen;
+    if (chosenInstanceIds) {
+      const valid = [...new Set(chosenInstanceIds)].filter((id) => eligibleIds.has(id)).slice(0, count);
+      stage1Chosen = valid.length === count ? valid : eligible4.slice(0, count).map((c2) => c2.instanceId);
+    } else {
+      stage1Chosen = eligible4.slice(0, count).map((c2) => c2.instanceId);
+    }
+    if (stage1Chosen.length === 1) {
+      discardFromPlay(state, cardDb, opponent, stage1Chosen[0], void 0, void 0);
+      return;
+    }
+    addPendingChoiceTag(self, stage2TagFor(opponentId, stage1Chosen));
+  },
+  pendingTargetChoice: (state, cardDb, self) => {
+    const stage2Tag = [...self.tags].find((t) => t.startsWith(STAGE2_PREFIX));
+    if (!stage2Tag) return void 0;
+    const decoded = decodeStage2(stage2Tag);
+    if (!decoded) {
+      removePermanentTag(self, stage2Tag);
+      return void 0;
+    }
+    const opponent = state.players.get(decoded.opponentId);
+    if (!opponent) {
+      removePermanentTag(self, stage2Tag);
+      return void 0;
+    }
+    const pool3 = decoded.chosenIds.map((id) => opponent.inPlay.find((c2) => c2.instanceId === id)).filter((c2) => c2 !== void 0);
+    if (pool3.length === 0) {
+      removePermanentTag(self, stage2Tag);
+      return void 0;
+    }
+    if (pool3.length === 1) {
+      return {
+        prompt: `Trygar's Will Legacy: ${decoded.opponentId}, confirm the discard of the sole remaining chosen card`,
+        pool: pool3,
+        answeringPlayerId: decoded.opponentId
+      };
+    }
+    return {
+      prompt: `Trygar's Will Legacy: ${decoded.opponentId}, choose one of the two chosen cards to discard`,
+      pool: pool3,
+      answeringPlayerId: decoded.opponentId
+    };
+  },
+  resolveTargetChoice: (state, cardDb, self, chosenInstanceId, rng) => {
+    const stage2Tag = [...self.tags].find((t) => t.startsWith(STAGE2_PREFIX));
+    if (!stage2Tag) return;
+    const decoded = decodeStage2(stage2Tag);
+    removePermanentTag(self, stage2Tag);
+    if (!decoded) return;
+    const opponent = state.players.get(decoded.opponentId);
+    if (!opponent) return;
+    const survivors = decoded.chosenIds.filter((id) => opponent.inPlay.some((c2) => c2.instanceId === id));
+    if (survivors.length === 0) return;
+    const finalId = chosenInstanceId && survivors.includes(chosenInstanceId) ? chosenInstanceId : survivors[0];
+    discardFromPlay(state, cardDb, opponent, finalId, void 0, void 0, rng);
   }
 });
 
@@ -31416,7 +32773,29 @@ registerCardEffect("Sorreah, Warrior", {
 // src/cardEffects/emecsForge.ts
 var USED_THIS_TURN10 = "emecsForgeUsedThisTurn";
 registerCardEffect("Emec's Forge", {
+  // Pure eligibility sibling of `preventsDiscardOf` below -- must match every guard there
+  // exactly (own KT Creature exists in play, once-per-turn tag unused, at least one OTHER
+  // Relic to sacrifice), so the reactive-offer scanner and the imperative applier agree on
+  // whether a prevention could fire during this action. Doesn't take a specific `target`
+  // because the scanner fires BEFORE any target is committed to being defeated -- see
+  // registry.ts's own `offersDiscardOfPrevention` doc comment for the pre-collection contract.
+  offersDiscardOfPrevention: (state, cardDb, self) => {
+    if (hasDurationTag(self, USED_THIS_TURN10)) return false;
+    const owner = state.players.get(self.controllerId);
+    if (!owner) return false;
+    const hasKtCreature = owner.inPlay.some((c2) => {
+      const def = cardDb.get(c2.definitionKey);
+      return def?.card_type === "Creature" && def.regions.includes("Kybar's Teeth");
+    });
+    if (!hasKtCreature) return false;
+    const hasOtherRelic = owner.inPlay.some(
+      (c2) => c2.instanceId !== self.instanceId && cardDb.get(c2.definitionKey)?.card_type === "Relic"
+    );
+    return hasOtherRelic;
+  },
   preventsDiscardOf: (state, cardDb, target, self, cause, rng) => {
+    const preCollected = state.currentAction?.discardOfPrevention;
+    if (preCollected === "skip") return false;
     if (target.controllerId !== self.controllerId) return false;
     const targetDef = cardDb.get(target.definitionKey);
     if (targetDef?.card_type !== "Creature" || !targetDef.regions.includes("Kybar's Teeth")) return false;
@@ -31430,6 +32809,9 @@ registerCardEffect("Emec's Forge", {
     discardFromPlay(state, cardDb, owner, relic.instanceId, void 0, void 0, rng);
     restoreEnergy(state, cardDb, target, effectiveStartingEnergy(state, cardDb, target));
     addDurationTag(state, cardDb, self, USED_THIS_TURN10, state.turnNumber);
+    if (state.currentAction && state.currentAction.discardOfPrevention) {
+      state.currentAction.discardOfPrevention = void 0;
+    }
     return true;
   }
 });
@@ -31557,7 +32939,19 @@ registerCardEffect("Rala Tail", {
 // src/cardEffects/emec.ts
 var USED_THIS_TURN12 = "emecTinkerUsedThisTurn";
 registerCardEffect("Emec", {
+  // Pure eligibility sibling of `grantsDieReroll` below -- must match every guard there
+  // exactly (once-per-turn tag unused, own-side roller, roller is a Kybar's Teeth Relic).
+  offersDieReroll: (_state, cardDb, roller, self) => {
+    if (hasDurationTag(self, USED_THIS_TURN12)) return false;
+    if (roller.controllerId !== self.controllerId) return false;
+    const rollerDef = cardDb.get(roller.definitionKey);
+    if (rollerDef?.card_type !== "Relic" || !rollerDef.regions.includes("Kybar's Teeth")) return false;
+    return true;
+  },
   grantsDieReroll: (state, cardDb, roller, self) => {
+    const preCollected = state.dieRerollGrantAnswer;
+    if (preCollected === "skip") return false;
+    if (preCollected !== void 0 && preCollected.chosenGrantorInstanceId !== self.instanceId) return false;
     if (hasDurationTag(self, USED_THIS_TURN12)) return false;
     if (roller.controllerId !== self.controllerId) return false;
     const rollerDef = cardDb.get(roller.definitionKey);
@@ -31569,7 +32963,21 @@ registerCardEffect("Emec", {
 
 // src/cardEffects/loadedDice.ts
 registerCardEffect("Loaded Dice", {
+  // Pure eligibility sibling of `grantsDieReroll` below -- must match every guard there
+  // exactly (other-card roller, own-side roller, at least one hand card to discard as cost) so
+  // the pre-roll scanner and the applier agree on which rolls can trigger the reroll grant.
+  // See registry.ts's own `offersDieReroll` doc comment for the contract.
+  offersDieReroll: (state, _cardDb, roller, self) => {
+    if (roller.instanceId === self.instanceId) return false;
+    if (roller.controllerId !== self.controllerId) return false;
+    const owner = state.players.get(self.controllerId);
+    if (!owner || owner.hand.length === 0) return false;
+    return true;
+  },
   grantsDieReroll: (state, cardDb, roller, self) => {
+    const preCollected = state.dieRerollGrantAnswer;
+    if (preCollected === "skip") return false;
+    if (preCollected !== void 0 && preCollected.chosenGrantorInstanceId !== self.instanceId) return false;
     if (roller.instanceId === self.instanceId) return false;
     if (roller.controllerId !== self.controllerId) return false;
     const owner = state.players.get(self.controllerId);
@@ -31581,6 +32989,7 @@ registerCardEffect("Loaded Dice", {
 
 // src/cardEffects/evusJellybeans.ts
 var JELLYBEAN = "jellybean";
+var BLACK_ONES_DISCARD_PENDING_PREFIX = "evusJellybeansBlackOnesDiscardPendingFor:";
 registerCardEffect("Evu's Jellybeans", {
   causesOpponentHandDiscard: true,
   // task #718 (Riptide clause 2, 2026-08-11)
@@ -31606,9 +33015,34 @@ registerCardEffect("Evu's Jellybeans", {
     const isCore2 = magiDef?.regions.includes(ashioAdjustedRegion(ctx.state, ctx.cardDb, "Core", ["Naroom"])) ?? false;
     if (isCore2) {
       discardRandomFromHand(ctx.state, ctx.cardDb, target, 1, ctx.rng);
-    } else {
-      discardFromHand(ctx.state, ctx.cardDb, target, [target.hand[0].instanceId], void 0, ctx.rng);
+      return;
     }
+    addPendingChoiceTag(ctx.source, `${BLACK_ONES_DISCARD_PENDING_PREFIX}${target.playerId}`);
+  },
+  pendingTargetChoice: (state, cardDb, self) => {
+    const pendingTag = [...self.tags].find((t) => t.startsWith(BLACK_ONES_DISCARD_PENDING_PREFIX));
+    if (!pendingTag) return void 0;
+    const targetId = pendingTag.slice(BLACK_ONES_DISCARD_PENDING_PREFIX.length);
+    const target = state.players.get(targetId);
+    if (!target || target.hand.length === 0) {
+      removePermanentTag(self, pendingTag);
+      return void 0;
+    }
+    return {
+      prompt: "Evu's Jellybeans' Black Ones: choose a card from your hand to discard",
+      pool: target.hand,
+      answeringPlayerId: targetId
+    };
+  },
+  resolveTargetChoice: (state, cardDb, self, chosenInstanceId, rng) => {
+    const pendingTag = [...self.tags].find((t) => t.startsWith(BLACK_ONES_DISCARD_PENDING_PREFIX));
+    if (!pendingTag) return;
+    const targetId = pendingTag.slice(BLACK_ONES_DISCARD_PENDING_PREFIX.length);
+    removePermanentTag(self, pendingTag);
+    const target = state.players.get(targetId);
+    if (!target || target.hand.length === 0) return;
+    const finalId = chosenInstanceId && target.hand.some((c2) => c2.instanceId === chosenInstanceId) ? chosenInstanceId : target.hand[0].instanceId;
+    discardFromHand(state, cardDb, target, [finalId], void 0, rng);
   }
 });
 
@@ -31739,6 +33173,7 @@ registerCardEffect("Bulomp", {
 
 // src/cardEffects/bogWellisk.ts
 var DREAM_DRAFT_USED = "bogWellisksDreamDraftUsedThisTurn";
+var DREAM_DRAFT_PENDING = "bogWellisksDreamDraftPending";
 registerCardEffect("Bog Wellisk", {
   reactsToPlayFromHand: (state, cardDb, self, played, playerId) => {
     if (playerId === self.controllerId) return false;
@@ -31749,8 +33184,54 @@ registerCardEffect("Bog Wellisk", {
     const magiRegions2 = effectiveRegions(state, cardDb, magi);
     if (!magiRegions2.includes("Bograth") && !magiRegions2.includes("Orothe")) return false;
     if (hasDurationTag(magi, DREAM_DRAFT_USED)) return false;
+    const anySiblingPending = player.hand.some(
+      (c2) => cardDb.get(c2.definitionKey)?.name === "Bog Wellisk" && c2.tags.has(DREAM_DRAFT_PENDING)
+    );
+    if (anySiblingPending) return false;
+    addPendingChoiceTag(self, DREAM_DRAFT_PENDING);
+    return false;
+  },
+  pendingYesNoChoice: (state, cardDb, self) => {
+    if (!self.tags.has(DREAM_DRAFT_PENDING)) return void 0;
+    const owner = state.players.get(self.controllerId);
+    const magi = owner?.activeMagi;
+    if (!magi) {
+      removePermanentTag(self, DREAM_DRAFT_PENDING);
+      return void 0;
+    }
+    if (hasDurationTag(magi, DREAM_DRAFT_USED)) {
+      removePermanentTag(self, DREAM_DRAFT_PENDING);
+      return void 0;
+    }
+    const magiRegions2 = effectiveRegions(state, cardDb, magi);
+    if (!magiRegions2.includes("Bograth") && !magiRegions2.includes("Orothe")) {
+      removePermanentTag(self, DREAM_DRAFT_PENDING);
+      return void 0;
+    }
+    return {
+      prompt: "Bog Wellisk's Dream Draft: play Bog Wellisk from hand (ignoring all costs)?",
+      yesLabel: "Play Bog Wellisk",
+      noLabel: "Decline",
+      intent: "beneficial"
+    };
+  },
+  resolveYesNoChoice: (state, cardDb, self, chosenBoolean, rng) => {
+    if (!self.tags.has(DREAM_DRAFT_PENDING)) return;
+    removePermanentTag(self, DREAM_DRAFT_PENDING);
+    if (!chosenBoolean) return;
+    const owner = state.players.get(self.controllerId);
+    const magi = owner?.activeMagi;
+    if (!owner || !magi) return;
+    if (hasDurationTag(magi, DREAM_DRAFT_USED)) return;
     addDurationTag(state, cardDb, magi, DREAM_DRAFT_USED, state.turnNumber);
-    return true;
+    playFromZone(
+      state,
+      cardDb,
+      { owner, zone: "hand", instanceId: self.instanceId },
+      owner,
+      printedStartingEnergy(cardDb, self.definitionKey),
+      rng
+    );
   }
 });
 
@@ -32014,16 +33495,26 @@ registerCardEffect("Looph", {
 
 // src/cardEffects/blackStuff.ts
 var REGENERATE_PENDING = "blackStuffRegeneratePending";
+function magiCanAffordSelf(state, cardDb, self) {
+  const player = state.players.get(self.controllerId);
+  const magi = player?.activeMagi;
+  if (!magi) return false;
+  const def = cardDb.get(self.definitionKey);
+  const cost = typeof def?.cost === "number" ? def.cost : 0;
+  return (magi.currentEnergy ?? 0) >= cost;
+}
 registerCardEffect("Black Stuff", {
   reactsFromDiscardPileAtOwnTurnStart: (state, cardDb, self) => {
     const player = state.players.get(self.controllerId);
     if (!player) return;
     const magi = player.activeMagi;
     if (!magi || !effectiveRegions(state, cardDb, magi).includes("Bograth")) return;
+    if (!magiCanAffordSelf(state, cardDb, self)) return;
     addPendingChoiceTag(self, REGENERATE_PENDING);
   },
   pendingTargetChoice: (state, cardDb, self) => {
     if (!self.tags.has(REGENERATE_PENDING)) return void 0;
+    if (!magiCanAffordSelf(state, cardDb, self)) return void 0;
     return { prompt: "Regenerate: play Black Stuff from your discard pile, paying all costs?", pool: [self] };
   },
   resolveTargetChoice: (state, cardDb, self, chosenInstanceId, rng) => {
@@ -32175,6 +33666,7 @@ registerCardEffect("Tar Hyren", {
 });
 
 // src/cardEffects/moobRing.ts
+var SACRIFICE_PENDING = "moobRingSacrificePending";
 function targetsOwnCreature2(state, cardDb, self, currentTargetId) {
   if (!currentTargetId) return false;
   const owner = state.players.get(self.controllerId);
@@ -32184,13 +33676,27 @@ function targetsOwnCreature2(state, cardDb, self, currentTargetId) {
 function isInPlay2(state, self) {
   return !!state.players.get(self.controllerId)?.inPlay.some((c2) => c2.instanceId === self.instanceId);
 }
-function sacrificeLowestEnergyBograthCreature(state, cardDb, self, rng) {
-  const eligible4 = creaturesControlledBy(state, cardDb, self.controllerId).filter((c2) => effectiveRegions(state, cardDb, c2).includes("Bograth"));
+function eligibleSacrifices(state, cardDb, self) {
+  return creaturesControlledBy(state, cardDb, self.controllerId).filter(
+    (c2) => effectiveRegions(state, cardDb, c2).includes("Bograth")
+  );
+}
+function performSacrifice(state, cardDb, self, chosenInstanceId, rng) {
+  const eligible4 = eligibleSacrifices(state, cardDb, self);
   if (eligible4.length === 0) return;
-  const sacrifice = eligible4.reduce((worst, c2) => (c2.currentEnergy ?? 0) < (worst.currentEnergy ?? 0) ? c2 : worst);
+  const picked = chosenInstanceId ? eligible4.find((c2) => c2.instanceId === chosenInstanceId) : void 0;
+  const sacrifice = picked ?? eligible4.reduce((worst, c2) => (c2.currentEnergy ?? 0) < (worst.currentEnergy ?? 0) ? c2 : worst);
   const owner = state.players.get(self.controllerId);
   if (!owner) return;
   discardFromPlay(state, cardDb, owner, sacrifice.instanceId, void 0, void 0, rng);
+}
+function stageOrPerformSacrifice(state, cardDb, self, rng) {
+  const eligible4 = eligibleSacrifices(state, cardDb, self);
+  if (eligible4.length <= 1) {
+    performSacrifice(state, cardDb, self, void 0, rng);
+    return;
+  }
+  addPendingChoiceTag(self, SACRIFICE_PENDING);
 }
 registerCardEffect("Moob Ring", {
   offersPowerNegation: (state, cardDb, self, user, powerName, currentTargetId) => {
@@ -32200,7 +33706,7 @@ registerCardEffect("Moob Ring", {
     return creaturesControlledBy(state, cardDb, self.controllerId).some((c2) => effectiveRegions(state, cardDb, c2).includes("Bograth"));
   },
   resolvePowerNegation: (state, cardDb, self, _negatedSource, _negatedPowerName, _currentTargetId, rng) => {
-    sacrificeLowestEnergyBograthCreature(state, cardDb, self, rng);
+    stageOrPerformSacrifice(state, cardDb, self, rng);
   },
   offersSpellNegation: (state, cardDb, self, playedDef, playerId, currentTargetId) => {
     if (playerId === self.controllerId) return false;
@@ -32209,8 +33715,30 @@ registerCardEffect("Moob Ring", {
     return creaturesControlledBy(state, cardDb, self.controllerId).some((c2) => effectiveRegions(state, cardDb, c2).includes("Bograth"));
   },
   resolveSpellNegation: (state, cardDb, self, _negatedSpell, _currentTargetId, rng) => {
-    sacrificeLowestEnergyBograthCreature(state, cardDb, self, rng);
+    stageOrPerformSacrifice(state, cardDb, self, rng);
   },
+  pendingTargetChoice: (state, cardDb, self) => {
+    if (!self.tags.has(SACRIFICE_PENDING)) return void 0;
+    const eligible4 = eligibleSacrifices(state, cardDb, self);
+    if (eligible4.length === 0) {
+      removePermanentTag(self, SACRIFICE_PENDING);
+      return void 0;
+    }
+    return {
+      prompt: "Moob Ring's Martyr: choose a Bograth Creature to discard from play",
+      pool: eligible4
+    };
+  },
+  resolveTargetChoice: (state, cardDb, self, chosenInstanceId, rng) => {
+    if (!self.tags.has(SACRIFICE_PENDING)) return;
+    removePermanentTag(self, SACRIFICE_PENDING);
+    performSacrifice(state, cardDb, self, chosenInstanceId, rng);
+  },
+  offersHostileHandDiscardSubstitution: () => true,
+  // M1 (2026-08-27): sync fallback for reactive-hook-triggered hostile hand discards (~18 cards
+  // where the discard fires from `onOwnMagiDefeated`/`afterCombat`/etc., not `resolvePower`/
+  // `resolveSpell`, so the reactive-offer stage doesn't arm). `discardFromHand` skips this when
+  // the reactive offer IS armed. See bagalaFangs.ts's header for the full follow-up scope.
   substitutesForHostileHandDiscard: () => true
 });
 
@@ -32281,10 +33809,25 @@ registerCardEffect("Yog", {
 });
 
 // src/cardEffects/calderaAq.ts
+var HEARTWARMING_PENDING = "calderaAqHeartwarmingPending";
 registerCardEffect("Caldera Aq", {
-  onAnyPowerDiscardedEnergyFromCreature: (state, cardDb, self, sourceCard, _amount, rng) => {
+  onAnyPowerDiscardedEnergyFromCreature: (state, cardDb, self, sourceCard, _amount) => {
     const sourceDef = cardDb.get(sourceCard.definitionKey);
     if (!sourceDef?.regions.includes("Cald")) return;
+    addPendingChoiceTag(self, HEARTWARMING_PENDING);
+  },
+  pendingYesNoChoice: (state, cardDb, self) => {
+    if (!self.tags.has(HEARTWARMING_PENDING)) return void 0;
+    return {
+      prompt: "Caldera Aq's Heartwarming: discard Caldera Aq to draw a card?",
+      yesLabel: "Discard and draw",
+      noLabel: "Keep in play"
+    };
+  },
+  resolveYesNoChoice: (state, cardDb, self, chosenBoolean, rng) => {
+    if (!self.tags.has(HEARTWARMING_PENDING)) return;
+    removePermanentTag(self, HEARTWARMING_PENDING);
+    if (!chosenBoolean) return;
     const owner = state.players.get(self.controllerId);
     if (!owner) return;
     discardFromPlay(state, cardDb, owner, self.instanceId, void 0, void 0, rng);
@@ -32397,7 +33940,7 @@ registerCardEffect("The Last Words", {
     const sourceDef = cardDb.get(sourceCard.definitionKey);
     if (sourceDef?.card_type !== "Creature") return;
     if (!sourceDef.regions.includes("Cald") && !sourceDef.regions.includes("Orothe")) return;
-    discardEnergy(state, cardDb, target, 2, "power");
+    applyModifierDiscard(state, cardDb, target, 2, "power");
   },
   blocksOwnEnergyLossToOpposingMagi: () => true
 });
@@ -32407,7 +33950,7 @@ registerCardEffect("Scroll of Fire", {
   onOwnPowerDiscardedOpposingEnergyFromCreature: (state, cardDb, self, sourceCard, target) => {
     const sourceType = cardDb.get(sourceCard.definitionKey)?.card_type;
     if (sourceType !== "Creature" && sourceType !== "Spell") return;
-    discardEnergy(state, cardDb, target, 1, "power");
+    applyModifierDiscard(state, cardDb, target, 1, "power");
   }
 });
 
@@ -32421,7 +33964,7 @@ registerCardEffect("Ithapher", {
   onOwnPowerDiscardedOpposingEnergyFromCreature: (state, cardDb, self, _sourceCard, target, _amount, distinctCreaturesAffected) => {
     if (!hasDurationTag(self, COMBUSTION_ACTIVE)) return;
     if (distinctCreaturesAffected !== 1) return;
-    discardEnergy(state, cardDb, target, 1, "power");
+    applyModifierDiscard(state, cardDb, target, 1, "power");
   }
 });
 
@@ -32429,7 +33972,7 @@ registerCardEffect("Ithapher", {
 registerCardEffect("Valkan", {
   onOwnPowerDiscardedOpposingEnergyFromCreature: (state, cardDb, self, sourceCard, target) => {
     if (cardDb.get(sourceCard.definitionKey)?.card_type !== "Spell") return;
-    discardEnergy(state, cardDb, target, 2, "spell");
+    applyModifierDiscard(state, cardDb, target, 2, "spell");
   }
 });
 
@@ -32464,7 +34007,7 @@ registerCardEffect("Volcano Hyren", {
     if (!cardDb.get(sourceCard.definitionKey)?.regions.includes("Cald")) return;
     if (distinctCreaturesAffected !== 1) return;
     removeDurationTag(self, CONFLAGRATION_ARMED);
-    discardEnergy(state, cardDb, target, 1, "power");
+    applyModifierDiscard(state, cardDb, target, 1, "power");
     for (const other of creaturesControlledBy(state, cardDb, target.controllerId)) {
       if (other.instanceId === target.instanceId) continue;
       discardEnergy(state, cardDb, other, 1, "power");
@@ -32499,11 +34042,11 @@ registerCardEffect("Nara", {
 });
 
 // src/cardEffects/blastGloves.ts
-var PENDING_PREFIX13 = "blastGlovesFlameBoostPending:";
+var PENDING_PREFIX14 = "blastGlovesFlameBoostPending:";
 function parsePending2(self) {
   for (const tag of self.tags) {
-    if (!tag.startsWith(PENDING_PREFIX13)) continue;
-    const rest = tag.slice(PENDING_PREFIX13.length);
+    if (!tag.startsWith(PENDING_PREFIX14)) continue;
+    const rest = tag.slice(PENDING_PREFIX14.length);
     const separatorIndex = rest.lastIndexOf(":");
     if (separatorIndex === -1) continue;
     const targetInstanceId = rest.slice(0, separatorIndex);
@@ -32519,7 +34062,7 @@ registerCardEffect("Blast Gloves", {
   // `causesOwnRelicSelfDiscard` doc comment.
   causesOwnRelicSelfDiscard: true,
   onAnySpellDiscardedEnergyFromSingleCreature: (state, cardDb, self, _sourceCard, target, amount) => {
-    addPermanentTag(state, cardDb, self, `${PENDING_PREFIX13}${target.instanceId}:${amount}`);
+    addPermanentTag(state, cardDb, self, `${PENDING_PREFIX14}${target.instanceId}:${amount}`);
   },
   pendingYesNoChoice: (state, cardDb, self) => {
     const pending = parsePending2(self);
@@ -32532,7 +34075,7 @@ registerCardEffect("Blast Gloves", {
   },
   resolveYesNoChoice: (state, cardDb, self, chosenBoolean, rng) => {
     const pending = parsePending2(self);
-    if (pending) removePermanentTag(self, `${PENDING_PREFIX13}${pending.targetInstanceId}:${pending.amount}`);
+    if (pending) removePermanentTag(self, `${PENDING_PREFIX14}${pending.targetInstanceId}:${pending.amount}`);
     if (!chosenBoolean || !pending) return;
     const target = findInPlayById(state, pending.targetInstanceId);
     if (!target) return;
@@ -32661,13 +34204,23 @@ registerCardEffect("Flameplate Armor", {
   // 1-less-lost grant to the controller's Magi; Good Offense is the redirect trade.
   effectHooks: {
     "Best Defense": ["grantsOpposingEnergyLossReductionTo"],
-    "Good Offense": ["redirectsEnergyLossToOpponent"]
+    "Good Offense": ["offersEnergyLossRedirectToOpponent", "redirectsEnergyLossToOpponent"]
   },
   grantsOpposingEnergyLossReductionTo: (state, cardDb, self, target) => {
     if (cardDb.get(target.definitionKey)?.card_type !== "Magi") return void 0;
     const owner = state.players.get(self.controllerId);
     if (owner?.activeMagi?.instanceId !== target.instanceId) return void 0;
     return 1;
+  },
+  // Pure eligibility sibling of `redirectsEnergyLossToOpponent` below -- must match every guard
+  // there exactly, so the reactive-offer scanner and the discardEnergy applier agree on which
+  // targets can trigger the redirect. See registry.ts's own doc comment for the contract.
+  offersEnergyLossRedirectToOpponent: (state, cardDb, target, self) => {
+    if (cardDb.get(target.definitionKey)?.card_type !== "Magi") return false;
+    const owner = state.players.get(self.controllerId);
+    if (owner?.activeMagi?.instanceId !== target.instanceId) return false;
+    if (owner.hand.length === 0) return false;
+    return opposingMagi(state, cardDb, self.controllerId).length > 0;
   },
   redirectsEnergyLossToOpponent: (state, cardDb, target, self, rng) => {
     if (cardDb.get(target.definitionKey)?.card_type !== "Magi") return void 0;
@@ -32726,6 +34279,9 @@ registerCardEffect("Molten Gauntlets", {
 // src/cardEffects/abraxinsCrown.ts
 registerCardEffect("Abraxin's Crown", {
   grantsFlexibleMagiCreatureTargeting: () => true,
+  offersHostileHandDiscardSubstitution: () => true,
+  // M1 (2026-08-27): sync fallback for reactive-hook-triggered hostile hand discards. See
+  // bagalaFangs.ts's header for the follow-up scope.
   substitutesForHostileHandDiscard: () => true,
   onSubstitutedForHostileHandDiscard: (state, cardDb, self, actorPlayerId, rng) => {
     const opponent = state.players.get(actorPlayerId);
@@ -33521,11 +35077,11 @@ registerCardEffect("Thrybe", {
 
 // src/cardEffects/dakat.ts
 var WATCHING = "dakatDejaVuWatching";
-var PENDING_PREFIX14 = "dakatDejaVuPending:";
+var PENDING_PREFIX15 = "dakatDejaVuPending:";
 function parsePending3(self) {
   for (const tag of self.tags) {
-    if (!tag.startsWith(PENDING_PREFIX14)) continue;
-    const rest = tag.slice(PENDING_PREFIX14.length);
+    if (!tag.startsWith(PENDING_PREFIX15)) continue;
+    const rest = tag.slice(PENDING_PREFIX15.length);
     const separatorIndex = rest.indexOf(":");
     if (separatorIndex === -1) continue;
     const amount = Number(rest.slice(0, separatorIndex));
@@ -33549,7 +35105,7 @@ registerCardEffect("Dakat", {
     if (!self.tags.has(WATCHING)) return;
     removePermanentTag(self, WATCHING);
     if (allCreaturesInPlay(state, cardDb).filter((c2) => c2.instanceId !== target.instanceId).length === 0) return;
-    addPermanentTag(state, cardDb, self, `${PENDING_PREFIX14}${amount}:${target.instanceId}`);
+    addPermanentTag(state, cardDb, self, `${PENDING_PREFIX15}${amount}:${target.instanceId}`);
   },
   pendingTargetChoice: (state, cardDb, self) => {
     const pending = parsePending3(self);
@@ -33561,7 +35117,7 @@ registerCardEffect("Dakat", {
   resolveTargetChoice: (state, cardDb, self, chosenInstanceId, rng) => {
     const pending = parsePending3(self);
     if (!pending) return;
-    removePermanentTag(self, `${PENDING_PREFIX14}${pending.amount}:${pending.excludedInstanceId}`);
+    removePermanentTag(self, `${PENDING_PREFIX15}${pending.amount}:${pending.excludedInstanceId}`);
     if (!chosenInstanceId) return;
     const target = findInPlayById(state, chosenInstanceId);
     if (!target || target.instanceId === pending.excludedInstanceId) return;
@@ -34055,6 +35611,15 @@ registerCardEffect("Instant Fortress", {
 
 // src/cardEffects/sunglareCelphet.ts
 registerCardEffect("Sunglare Celphet", {
+  // Pure eligibility sibling of `redirectsEnergyLossToOpponent` below -- must match every guard
+  // there exactly. See registry.ts's own doc comment for the contract.
+  offersEnergyLossRedirectToOpponent: (state, cardDb, target, self) => {
+    if (cardDb.get(target.definitionKey)?.card_type !== "Creature") return false;
+    if (target.controllerId !== self.controllerId) return false;
+    if (target.instanceId === self.instanceId) return false;
+    const owner = state.players.get(self.controllerId);
+    return !!owner?.activeMagi;
+  },
   redirectsEnergyLossToOpponent: (state, cardDb, target, self, rng) => {
     if (cardDb.get(target.definitionKey)?.card_type !== "Creature") return void 0;
     if (target.controllerId !== self.controllerId) return void 0;
@@ -34183,7 +35748,7 @@ registerCardEffect("Icy Heart", {
 });
 
 // src/cardEffects/snowBarlPup.ts
-var DREAM_DRAFT_PENDING = "snowBarlPupDreamDraftPending";
+var DREAM_DRAFT_PENDING2 = "snowBarlPupDreamDraftPending";
 var DREAM_DRAFT_USED_THIS_TURN = "snowBarlPupDreamDraftUsedThisTurn";
 registerCardEffect("Snow Barl Pup", {
   onAnyCardDrawnWhileInHand: (state, cardDb, self, drawingPlayerId) => {
@@ -34192,10 +35757,10 @@ registerCardEffect("Snow Barl Pup", {
     if (hasDurationTag(self, DREAM_DRAFT_USED_THIS_TURN)) return;
     const player = state.players.get(self.controllerId);
     if (!player?.hand.some((c2) => c2.instanceId === self.instanceId)) return;
-    addPendingChoiceTag(self, DREAM_DRAFT_PENDING);
+    addPendingChoiceTag(self, DREAM_DRAFT_PENDING2);
   },
   pendingYesNoChoice: (state, cardDb, self) => {
-    if (!self.tags.has(DREAM_DRAFT_PENDING)) return void 0;
+    if (!self.tags.has(DREAM_DRAFT_PENDING2)) return void 0;
     return {
       prompt: "Snow Barl Pup's Dream Draft: play it now?",
       yesLabel: "Play Snow Barl Pup",
@@ -34203,7 +35768,7 @@ registerCardEffect("Snow Barl Pup", {
     };
   },
   resolveYesNoChoice: (state, cardDb, self, chosenBoolean, rng) => {
-    removePermanentTag(self, DREAM_DRAFT_PENDING);
+    removePermanentTag(self, DREAM_DRAFT_PENDING2);
     if (!chosenBoolean) return;
     addDurationTag(state, cardDb, self, DREAM_DRAFT_USED_THIS_TURN, state.turnNumber);
     const player = state.players.get(self.controllerId);
@@ -34521,6 +36086,7 @@ registerCardEffect("Fird", {
 });
 
 // src/cardEffects/furokGuardian.ts
+var REBIRTH_PENDING_PREFIX = "furokGuardianRebirthPendingFor:";
 function returnPendingCreatures(state, cardDb, self, rng) {
   const owner = state.players.get(self.controllerId);
   if (!owner) return;
@@ -34537,8 +36103,41 @@ registerCardEffect("Furok Guardian", {
     if (discarded.instanceId === self.instanceId) return;
     if (effectiveCardType(cardDb, discarded) !== "Creature") return;
     if ((self.currentEnergy ?? 0) <= 5) return;
+    addPendingChoiceTag(self, `${REBIRTH_PENDING_PREFIX}${discarded.instanceId}`);
+  },
+  pendingYesNoChoice: (state, cardDb, self) => {
+    const pendingTag = [...self.tags].find((t) => t.startsWith(REBIRTH_PENDING_PREFIX));
+    if (!pendingTag) return void 0;
+    if ((self.currentEnergy ?? 0) <= 5) {
+      removePermanentTag(self, pendingTag);
+      return void 0;
+    }
+    const targetId = pendingTag.slice(REBIRTH_PENDING_PREFIX.length);
+    const owner = state.players.get(self.controllerId);
+    const target = owner?.discardPile.find((c2) => c2.instanceId === targetId);
+    if (!target) {
+      removePermanentTag(self, pendingTag);
+      return void 0;
+    }
+    const targetName = cardDb.get(target.definitionKey)?.name ?? "that Creature";
+    return {
+      prompt: `Furok Guardian's Terra Rebirth: discard 5 energy from Furok Guardian to return ${targetName} to play at end of turn?`,
+      yesLabel: "Pay 5 and return",
+      noLabel: "Skip"
+    };
+  },
+  resolveYesNoChoice: (state, cardDb, self, chosenBoolean, rng) => {
+    const pendingTag = [...self.tags].find((t) => t.startsWith(REBIRTH_PENDING_PREFIX));
+    if (!pendingTag) return;
+    const targetId = pendingTag.slice(REBIRTH_PENDING_PREFIX.length);
+    removePermanentTag(self, pendingTag);
+    if (!chosenBoolean) return;
+    if ((self.currentEnergy ?? 0) <= 5) return;
+    const owner = state.players.get(self.controllerId);
+    const target = owner?.discardPile.find((c2) => c2.instanceId === targetId);
+    if (!target) return;
     discardEnergy(state, cardDb, self, 5, "effect");
-    addPermanentTag(state, cardDb, discarded, FUROK_GUARDIAN_RETURN_PENDING);
+    addPermanentTag(state, cardDb, target, FUROK_GUARDIAN_RETURN_PENDING);
   },
   onOwnTurnEnd: (state, cardDb, self, rng) => returnPendingCreatures(state, cardDb, self, rng),
   onOpponentTurnEnd: (state, cardDb, self, rng) => returnPendingCreatures(state, cardDb, self, rng)
@@ -34628,6 +36227,8 @@ registerCardEffect("Orthea", {
 registerCardEffect("Hunter Jile", {
   causesOpponentHandDiscard: true,
   // task #718 (Riptide clause 2, 2026-08-11): Drench discards Core Creatures from opposing hand.
+  causesHostileHandDiscard: () => true,
+  // M1 retrofit, 2026-08-27: Drench discards Core Creatures from chosen player's hand.
   // "Resistance" checks the ACTING card's own printed region, not a chosen/affected target's --
   // out of scope for the region-swap sweep (same as Chaos Flugg's/Yollum's own Resistance clauses).
   blocksPowerEffectBySourceRegion: (state, cardDb) => {
@@ -34728,28 +36329,99 @@ registerCardEffect("Sylorum", {
 
 // src/cardEffects/weethan.ts
 var IMPEDE_USED = "weethanImpedeUsedThisTurn";
+var IMPEDE_ACTIVATION_PENDING_PREFIX = "weethanImpedeActivationPendingFor:";
+var IMPEDE_DISCARD_PENDING_PREFIX = "weethanImpedeDiscardPendingFor:";
+function alreadyImpededOrActivationPending(state, cardDb, self) {
+  const owner = state.players.get(self.controllerId);
+  if (!owner) return false;
+  return owner.inPlay.some((c2) => {
+    if (cardDb.get(c2.definitionKey)?.name !== "Weethan") return false;
+    if (hasDurationTag(c2, IMPEDE_USED)) return true;
+    for (const tag of c2.tags) {
+      if (tag.startsWith(IMPEDE_ACTIVATION_PENDING_PREFIX)) return true;
+      if (tag.startsWith(IMPEDE_DISCARD_PENDING_PREFIX)) return true;
+    }
+    return false;
+  });
+}
 registerCardEffect("Weethan", {
   // task #718 (Riptide clause 2, 2026-08-11): Impede is Effect-shaped (reactive, not a play/use
   // action), so a hook-body gate is needed in addition to the declarative tag.
   causesOpponentHandDiscard: true,
-  onAnyCardDrawn: (state, cardDb, self, drawingPlayerId, _drawnCard, rng) => {
+  onAnyCardDrawn: (state, cardDb, self, drawingPlayerId, _drawnCard, _rng) => {
     if (drawingPlayerId === self.controllerId) return;
     if (riptideBanActiveFor(state, self.controllerId)) return;
     if ((self.currentEnergy ?? 0) <= 0) return;
     const owner = state.players.get(self.controllerId);
     if (!owner) return;
-    const alreadyImpeded = owner.inPlay.some(
-      (c2) => cardDb.get(c2.definitionKey)?.name === "Weethan" && hasDurationTag(c2, IMPEDE_USED)
-    );
-    if (alreadyImpeded) return;
+    if (alreadyImpededOrActivationPending(state, cardDb, self)) return;
     const drawer = state.players.get(drawingPlayerId);
     if (!drawer || drawer.hand.length === 0) return;
-    const pick2 = drawer.hand.reduce(
-      (lo, c2) => (cardDb.get(c2.definitionKey)?.cost ?? 0) < (cardDb.get(lo.definitionKey)?.cost ?? 0) ? c2 : lo
-    );
+    addPendingChoiceTag(self, `${IMPEDE_ACTIVATION_PENDING_PREFIX}${drawingPlayerId}`);
+  },
+  pendingYesNoChoice: (state, _cardDb, self) => {
+    const pendingTag = [...self.tags].find((t) => t.startsWith(IMPEDE_ACTIVATION_PENDING_PREFIX));
+    if (!pendingTag) return void 0;
+    const drawerId = pendingTag.slice(IMPEDE_ACTIVATION_PENDING_PREFIX.length);
+    const drawer = state.players.get(drawerId);
+    if (!drawer || drawer.hand.length === 0) {
+      removePermanentTag(self, pendingTag);
+      return void 0;
+    }
+    if ((self.currentEnergy ?? 0) <= 0) {
+      removePermanentTag(self, pendingTag);
+      return void 0;
+    }
+    return {
+      prompt: `Weethan's Impede: discard 1 energy from Weethan to force ${drawerId} to discard a card?`,
+      yesLabel: "Activate Impede (pay 1 energy)",
+      noLabel: "Decline",
+      intent: "harmful"
+    };
+  },
+  resolveYesNoChoice: (state, cardDb, self, chosenBoolean, _rng) => {
+    const pendingTag = [...self.tags].find((t) => t.startsWith(IMPEDE_ACTIVATION_PENDING_PREFIX));
+    if (!pendingTag) return;
+    const drawerId = pendingTag.slice(IMPEDE_ACTIVATION_PENDING_PREFIX.length);
+    removePermanentTag(self, pendingTag);
+    if (!chosenBoolean) return;
+    const owner = state.players.get(self.controllerId);
+    if (!owner) return;
+    if (owner.inPlay.some((c2) => cardDb.get(c2.definitionKey)?.name === "Weethan" && hasDurationTag(c2, IMPEDE_USED))) return;
+    if (riptideBanActiveFor(state, self.controllerId)) return;
+    if ((self.currentEnergy ?? 0) <= 0) return;
+    const drawer = state.players.get(drawerId);
+    if (!drawer || drawer.hand.length === 0) return;
     addDurationTag(state, cardDb, self, IMPEDE_USED, state.turnNumber);
     discardEnergy(state, cardDb, self, 1, "effect", self.controllerId);
-    discardFromHand(state, cardDb, drawer, [pick2.instanceId], self.controllerId, rng);
+    addPendingChoiceTag(self, `${IMPEDE_DISCARD_PENDING_PREFIX}${drawerId}`);
+  },
+  pendingTargetChoice: (state, _cardDb, self) => {
+    const pendingTag = [...self.tags].find((t) => t.startsWith(IMPEDE_DISCARD_PENDING_PREFIX));
+    if (!pendingTag) return void 0;
+    const drawerId = pendingTag.slice(IMPEDE_DISCARD_PENDING_PREFIX.length);
+    const drawer = state.players.get(drawerId);
+    if (!drawer || drawer.hand.length === 0) {
+      removePermanentTag(self, pendingTag);
+      return void 0;
+    }
+    return {
+      prompt: "Weethan's Impede: choose a card from your hand to discard",
+      pool: drawer.hand,
+      answeringPlayerId: drawerId
+    };
+  },
+  resolveTargetChoice: (state, cardDb, self, chosenInstanceId, rng) => {
+    const pendingTag = [...self.tags].find((t) => t.startsWith(IMPEDE_DISCARD_PENDING_PREFIX));
+    if (!pendingTag) return;
+    const drawerId = pendingTag.slice(IMPEDE_DISCARD_PENDING_PREFIX.length);
+    removePermanentTag(self, pendingTag);
+    const drawer = state.players.get(drawerId);
+    if (!drawer || drawer.hand.length === 0) return;
+    const targetId = chosenInstanceId && drawer.hand.some((c2) => c2.instanceId === chosenInstanceId) ? chosenInstanceId : drawer.hand.reduce(
+      (lo, c2) => (cardDb.get(c2.definitionKey)?.cost ?? 0) < (cardDb.get(lo.definitionKey)?.cost ?? 0) ? c2 : lo
+    ).instanceId;
+    discardFromHand(state, cardDb, drawer, [targetId], self.controllerId, rng);
   }
 });
 
@@ -34804,6 +36476,11 @@ registerCardEffect("Karak Ink", {
   onAnyCardDrawn: (state, cardDb, self, drawingPlayerId, drawnCard) => {
     if (drawingPlayerId === self.controllerId) return;
     if (state.phase === "draw") return;
+    logEvent(state, "handRevealed", {
+      revealedPlayerId: drawingPlayerId,
+      sourceInstanceId: self.instanceId,
+      cards: [{ instanceId: drawnCard.instanceId, definitionKey: drawnCard.definitionKey }]
+    });
     if (cardDb.get(drawnCard.definitionKey)?.card_type !== "Creature") return;
     const magi = state.players.get(self.controllerId)?.activeMagi;
     if (magi) addEnergy(state, cardDb, magi, 1, "effect");
@@ -34879,12 +36556,25 @@ registerCardEffect("Parathin Shell", {
 });
 
 // src/cardEffects/husp.ts
+var KEEP_CHOICE_PENDING_PREFIX = "huspKeepChoicePendingFor:";
 function allMagiInPlay4(state) {
   const result = [];
   for (const player of state.players.values()) {
     if (player.activeMagi) result.push(player.activeMagi);
   }
   return result;
+}
+function encodePendingTag(ownerId, chosenIds) {
+  return `${KEEP_CHOICE_PENDING_PREFIX}${ownerId}:${chosenIds.join(",")}`;
+}
+function decodePendingTag(tag) {
+  if (!tag.startsWith(KEEP_CHOICE_PENDING_PREFIX)) return void 0;
+  const body = tag.slice(KEEP_CHOICE_PENDING_PREFIX.length);
+  const colonIndex = body.indexOf(":");
+  if (colonIndex === -1) return void 0;
+  const ownerId = body.slice(0, colonIndex);
+  const chosenIds = body.slice(colonIndex + 1).split(",").filter((s) => s.length > 0);
+  return { ownerId, chosenIds };
 }
 registerCardEffect("Husp", {
   powerTargets: (state) => allMagiInPlay4(state),
@@ -34899,16 +36589,64 @@ registerCardEffect("Husp", {
     discardFromPlay(ctx.state, ctx.cardDb, ctx.controllingPlayer, ctx.source.instanceId, void 0, void 0, ctx.rng);
     const chosenIds = (ctx.chosenDeckSearchIds ?? []).slice(0, 3);
     const chosenCards = chosenIds.map((id) => owner.deck.find((c2) => c2.instanceId === id)).filter((c2) => c2 !== void 0);
-    if (chosenCards.length > 0) {
-      const keep = chosenCards.reduce((best, c2) => {
-        const cCost = ctx.cardDb.get(c2.definitionKey)?.cost ?? 0;
-        const bestCost = ctx.cardDb.get(best.definitionKey)?.cost ?? 0;
-        return cCost > bestCost ? c2 : best;
-      });
-      const toDiscard = chosenCards.filter((c2) => c2.instanceId !== keep.instanceId).map((c2) => c2.instanceId);
-      discardFromDeck(ctx.state, owner, toDiscard);
+    if (chosenCards.length === 0) {
+      shuffleDeck(owner, ctx.rng);
+      return;
     }
-    shuffleDeck(owner, ctx.rng);
+    if (chosenCards.length === 1) {
+      shuffleDeck(owner, ctx.rng);
+      return;
+    }
+    addPendingChoiceTag(ctx.source, encodePendingTag(owner.playerId, chosenCards.map((c2) => c2.instanceId)));
+  },
+  pendingTargetChoice: (state, cardDb, self) => {
+    const pendingTag = [...self.tags].find((t) => t.startsWith(KEEP_CHOICE_PENDING_PREFIX));
+    if (!pendingTag) return void 0;
+    const decoded = decodePendingTag(pendingTag);
+    if (!decoded) {
+      removePermanentTag(self, pendingTag);
+      return void 0;
+    }
+    const owner = state.players.get(decoded.ownerId);
+    if (!owner) {
+      removePermanentTag(self, pendingTag);
+      return void 0;
+    }
+    const pool3 = decoded.chosenIds.map((id) => owner.deck.find((c2) => c2.instanceId === id)).filter((c2) => c2 !== void 0);
+    if (pool3.length === 0) {
+      removePermanentTag(self, pendingTag);
+      return void 0;
+    }
+    return {
+      prompt: "Husp's Ensnare: choose one of the searched cards to keep in your deck (the others are discarded)",
+      pool: pool3,
+      answeringPlayerId: decoded.ownerId
+    };
+  },
+  resolveTargetChoice: (state, cardDb, self, chosenInstanceId, rng) => {
+    const pendingTag = [...self.tags].find((t) => t.startsWith(KEEP_CHOICE_PENDING_PREFIX));
+    if (!pendingTag) return;
+    const decoded = decodePendingTag(pendingTag);
+    removePermanentTag(self, pendingTag);
+    if (!decoded) return;
+    const owner = state.players.get(decoded.ownerId);
+    if (!owner) return;
+    const chosenCards = decoded.chosenIds.map((id) => owner.deck.find((c2) => c2.instanceId === id)).filter((c2) => c2 !== void 0);
+    if (chosenCards.length === 0) {
+      shuffleDeck(owner, rng ?? defaultRng);
+      return;
+    }
+    const pickedByAnswer = chosenInstanceId ? chosenCards.find((c2) => c2.instanceId === chosenInstanceId) : void 0;
+    const keep = pickedByAnswer ?? chosenCards.reduce((best, c2) => {
+      const cCost = cardDb.get(c2.definitionKey)?.cost ?? 0;
+      const bestCost = cardDb.get(best.definitionKey)?.cost ?? 0;
+      return cCost > bestCost ? c2 : best;
+    });
+    const toDiscard = chosenCards.filter((c2) => c2.instanceId !== keep.instanceId).map((c2) => c2.instanceId);
+    if (toDiscard.length > 0) {
+      discardFromDeck(state, owner, toDiscard);
+    }
+    shuffleDeck(owner, rng ?? defaultRng);
   }
 });
 
@@ -35146,6 +36884,8 @@ registerCardEffect("Ripcurl", {
 registerCardEffect("Storm of Fishes", {
   causesOpponentHandDiscard: true,
   // task #718 (Riptide clause 2, 2026-08-11): symmetric hand sweep hits opposing hands too.
+  causesHostileHandDiscard: () => true,
+  // M1 retrofit, 2026-08-27: symmetric all-players discard also touches the opposing hand.
   spellCategoryChoice: {
     prompt: "Choose Spells or Relics -- all players discard every card of that type from their hand",
     options: () => ["Spell", "Relic"]
@@ -35153,6 +36893,9 @@ registerCardEffect("Storm of Fishes", {
   resolveSpell: (ctx) => {
     const category = ctx.chosenCategory;
     if (category !== "Spell" && category !== "Relic") return;
+    for (const player of ctx.state.players.values()) {
+      revealHandToAll(ctx.state, ctx.cardDb, player.playerId, ctx.source.instanceId);
+    }
     for (const player of ctx.state.players.values()) {
       const ids = player.hand.filter((c2) => ctx.cardDb.get(c2.definitionKey)?.card_type === category).map((c2) => c2.instanceId);
       if (ids.length > 0) discardFromHand(ctx.state, ctx.cardDb, player, ids, void 0, ctx.rng);
@@ -35302,6 +37045,9 @@ registerCardEffect("Shell", {
       }
     }
   },
+  offersHostileHandDiscardSubstitution: () => true,
+  // M1 (2026-08-27): sync fallback for reactive-hook-triggered hostile hand discards. See
+  // bagalaFangs.ts's header for the follow-up scope.
   substitutesForHostileHandDiscard: () => true,
   onSubstitutedForHostileHandDiscard: (state, cardDb, self, actorPlayerId, rng) => {
     const opponent = state.players.get(actorPlayerId);
@@ -36058,20 +37804,25 @@ registerCardEffect("Cleansing", {
 });
 
 // src/cardEffects/fossikMagi.ts
-var AWAITING5 = "fossikStrengthenAwaitingChoice";
+var AWAITING_YES_NO = "fossikStrengthenAwaitingChoice";
+var AWAITING_TARGET = "fossikStrengthenAwaitingTarget";
+function ownCreatures2(state, cardDb, self) {
+  return creaturesControlledBy(state, cardDb, self.controllerId);
+}
 function lowestEnergyOwnCreature(state, cardDb, self) {
-  const own = creaturesControlledBy(state, cardDb, self.controllerId);
+  const own = ownCreatures2(state, cardDb, self);
   if (own.length === 0) return void 0;
   return own.reduce((lo, c2) => (c2.currentEnergy ?? 0) < (lo.currentEnergy ?? 0) ? c2 : lo);
 }
 registerCardEffect("Fossik", {
   onOwnTurnStart: (state, cardDb, self) => {
     delete self.counters.fossikStrengthenTurn;
-    removePermanentTag(self, AWAITING5);
-    if (lowestEnergyOwnCreature(state, cardDb, self)) addPendingChoiceTag(self, AWAITING5);
+    removePermanentTag(self, AWAITING_YES_NO);
+    removePermanentTag(self, AWAITING_TARGET);
+    if (ownCreatures2(state, cardDb, self).length > 0) addPendingChoiceTag(self, AWAITING_YES_NO);
   },
   pendingYesNoChoice: (state, cardDb, self) => {
-    if (!self.tags.has(AWAITING5)) return void 0;
+    if (!self.tags.has(AWAITING_YES_NO)) return void 0;
     return {
       prompt: "Fossik's Strengthen: add 3 energy to a Creature instead of drawing one of your two cards this turn?",
       yesLabel: "Add 3 energy (draw one card)",
@@ -36079,9 +37830,29 @@ registerCardEffect("Fossik", {
     };
   },
   resolveYesNoChoice: (state, cardDb, self, chosenBoolean) => {
-    removePermanentTag(self, AWAITING5);
+    removePermanentTag(self, AWAITING_YES_NO);
     if (!chosenBoolean) return;
-    const target = lowestEnergyOwnCreature(state, cardDb, self);
+    if (ownCreatures2(state, cardDb, self).length === 0) return;
+    addPendingChoiceTag(self, AWAITING_TARGET);
+  },
+  pendingTargetChoice: (state, cardDb, self) => {
+    if (!self.tags.has(AWAITING_TARGET)) return void 0;
+    const pool3 = ownCreatures2(state, cardDb, self);
+    if (pool3.length === 0) {
+      removePermanentTag(self, AWAITING_TARGET);
+      return void 0;
+    }
+    return {
+      prompt: "Fossik's Strengthen: choose one of your Creatures to gain 3 energy",
+      pool: pool3
+    };
+  },
+  resolveTargetChoice: (state, cardDb, self, chosenInstanceId) => {
+    if (!self.tags.has(AWAITING_TARGET)) return;
+    removePermanentTag(self, AWAITING_TARGET);
+    const pool3 = ownCreatures2(state, cardDb, self);
+    if (pool3.length === 0) return;
+    const target = chosenInstanceId ? pool3.find((c2) => c2.instanceId === chosenInstanceId) ?? lowestEnergyOwnCreature(state, cardDb, self) : lowestEnergyOwnCreature(state, cardDb, self);
     if (!target) return;
     self.counters.fossikStrengthenTurn = state.turnNumber;
     addEnergy(state, cardDb, target, 3, "effect");
@@ -36545,7 +38316,19 @@ function blocksHandReveal(state, cardDb, owner) {
 registerCardEffect("Deceptive Dreams", {
   spellTargets: (state, cardDb, playerId) => opposingCreatures(state, cardDb, playerId),
   chooseFromOpponentHand: {
+    // Mandatory pick, not a "may" -- printed text is "If there are any Creatures in that player's
+    // hand, play one of them" (2026-08-26 fix, save-1787786489715 T23 playtest). The engine now
+    // threads `minCount` through `previewOpponentHandPickOfferForSpell` -> the pause obligation's
+    // `min` -> the driver's random count floor and the UI's Confirm gate, so no player (or bot)
+    // can decline to pick when the pool is non-empty.
+    minCount: 1,
     maxCount: 1,
+    // Bounce-first, look-second: printed text sequence is "Return the chosen Creature to its
+    // owner's hand... Look at the chosen player's hand" (2026-08-26 fix). Without this, the pool
+    // was computed BEFORE `resolveSpell` bounced the target, so the bounced Creature was
+    // invisible to the picker -- the caster could have been offered zero Creatures on a hand
+    // that would have had at least the bounced one at look-time.
+    includesBouncedTarget: true,
     filter: (state, cardDb, playerId, c2) => {
       const owner = c2.controllerId ? state.players.get(c2.controllerId) : void 0;
       if (owner && blocksHandReveal(state, cardDb, owner)) return false;
@@ -36820,7 +38603,7 @@ registerCardEffect("Lightning Sand", {
 });
 
 // src/cardEffects/forgottenSongs.ts
-var PENDING_PREFIX15 = "forgottenSongsPending:";
+var PENDING_PREFIX16 = "forgottenSongsPending:";
 function forgottenSongsCost(state, cardDb, self) {
   const def = cardDb.get(self.definitionKey);
   const printed = typeof def?.cost === "number" ? def.cost : 1;
@@ -36834,12 +38617,12 @@ registerCardEffect("Forgotten Songs", {
     const player = state.players.get(self.controllerId);
     if (!player) return;
     if (!player.hand.some((c2) => c2.instanceId === self.instanceId)) return;
-    addPermanentTag(state, cardDb, self, PENDING_PREFIX15 + discarded.instanceId);
+    addPermanentTag(state, cardDb, self, PENDING_PREFIX16 + discarded.instanceId);
   },
   pendingYesNoChoice: (state, cardDb, self) => {
-    const pendingTag = [...self.tags].find((t) => t.startsWith(PENDING_PREFIX15));
+    const pendingTag = [...self.tags].find((t) => t.startsWith(PENDING_PREFIX16));
     if (!pendingTag) return void 0;
-    const discardedId = pendingTag.slice(PENDING_PREFIX15.length);
+    const discardedId = pendingTag.slice(PENDING_PREFIX16.length);
     const player = state.players.get(self.controllerId);
     if (!player || !player.discardPile.some((c2) => c2.instanceId === discardedId)) return void 0;
     if ((player.activeMagi?.currentEnergy ?? 0) < forgottenSongsCost(state, cardDb, self)) return void 0;
@@ -36851,10 +38634,10 @@ registerCardEffect("Forgotten Songs", {
     };
   },
   resolveYesNoChoice: (state, cardDb, self, chosenBoolean) => {
-    const pendingTag = [...self.tags].find((t) => t.startsWith(PENDING_PREFIX15));
+    const pendingTag = [...self.tags].find((t) => t.startsWith(PENDING_PREFIX16));
     if (!pendingTag) return;
     removePermanentTag(self, pendingTag);
-    const discardedId = pendingTag.slice(PENDING_PREFIX15.length);
+    const discardedId = pendingTag.slice(PENDING_PREFIX16.length);
     if (!chosenBoolean) return;
     const player = state.players.get(self.controllerId);
     if (!player) return;
@@ -37141,10 +38924,10 @@ registerCardEffect("Bog Stench", {
 });
 
 // src/cardEffects/muckRain.ts
-var PENDING_PREFIX16 = "muckRainPendingFor:";
+var PENDING_PREFIX17 = "muckRainPendingFor:";
 function pendingTargetControllerId(self) {
-  const tag = [...self.tags].find((t) => t.startsWith(PENDING_PREFIX16));
-  return tag ? tag.slice(PENDING_PREFIX16.length) : void 0;
+  const tag = [...self.tags].find((t) => t.startsWith(PENDING_PREFIX17));
+  return tag ? tag.slice(PENDING_PREFIX17.length) : void 0;
 }
 function creaturePool(state, cardDb, targetControllerId) {
   return creaturesControlledBy(state, cardDb, targetControllerId);
@@ -37160,7 +38943,7 @@ registerCardEffect("Muck Rain", {
     const energizeRate = effectiveEnergizeRate(ctx.state, ctx.cardDb, target);
     if (bograthCount <= energizeRate) return;
     if (creaturePool(ctx.state, ctx.cardDb, target.controllerId).length === 0) return;
-    addPermanentTag(ctx.state, ctx.cardDb, ctx.source, `${PENDING_PREFIX16}${target.controllerId}`);
+    addPermanentTag(ctx.state, ctx.cardDb, ctx.source, `${PENDING_PREFIX17}${target.controllerId}`);
   },
   pendingTargetChoice: (state, cardDb, self) => {
     const targetControllerId = pendingTargetControllerId(self);
@@ -37171,7 +38954,7 @@ registerCardEffect("Muck Rain", {
   },
   resolveTargetChoice: (state, cardDb, self, chosenInstanceId, rng) => {
     const targetControllerId = pendingTargetControllerId(self);
-    if (targetControllerId) removePermanentTag(self, `${PENDING_PREFIX16}${targetControllerId}`);
+    if (targetControllerId) removePermanentTag(self, `${PENDING_PREFIX17}${targetControllerId}`);
     if (!chosenInstanceId || !targetControllerId) return;
     const chosen = creaturePool(state, cardDb, targetControllerId).find((c2) => c2.instanceId === chosenInstanceId);
     if (!chosen) return;
@@ -37687,7 +39470,7 @@ registerCardEffect("Flame Spurt", {
 });
 
 // src/cardEffects/bombard.ts
-var AWAITING_TARGET = "bombardAwaitingTarget";
+var AWAITING_TARGET2 = "bombardAwaitingTarget";
 var AWAITING_AMOUNT = "bombardAwaitingAmount";
 var CURRENT_PICK_PREFIX = "bombardCurrentPick:";
 var USED_TARGET_PREFIX = "bombardUsedTarget:";
@@ -37722,7 +39505,7 @@ registerCardEffect("Bombard", {
     );
   },
   pendingTargetChoice: (state, cardDb, self) => {
-    if (!self.tags.has(AWAITING_TARGET)) return void 0;
+    if (!self.tags.has(AWAITING_TARGET2)) return void 0;
     if (getCounter(self, REMAINING_POOL_COUNTER) <= 0) return void 0;
     if (usedTargetIds(self).size >= MAX_TARGETS2) return void 0;
     const pool3 = eligiblePool(state, cardDb, self);
@@ -37731,7 +39514,7 @@ registerCardEffect("Bombard", {
     return { prompt: `Bombard: choose an opposing Creature to discard some of the remaining ${remaining} energy from`, pool: pool3 };
   },
   resolveTargetChoice: (state, cardDb, self, chosenInstanceId) => {
-    removePermanentTag(self, AWAITING_TARGET);
+    removePermanentTag(self, AWAITING_TARGET2);
     if (!chosenInstanceId) return;
     const target = eligiblePool(state, cardDb, self).find((c2) => c2.instanceId === chosenInstanceId);
     if (!target) return;
@@ -37755,7 +39538,7 @@ registerCardEffect("Bombard", {
     addPermanentTag(state, cardDb, self, `${USED_TARGET_PREFIX}${targetId}`);
     setCounter(self, REMAINING_POOL_COUNTER, remaining - amount);
     if (remaining - amount > 0 && usedTargetIds(self).size < MAX_TARGETS2 && eligiblePool(state, cardDb, self).length > 0) {
-      addPendingChoiceTag(self, AWAITING_TARGET);
+      addPendingChoiceTag(self, AWAITING_TARGET2);
     }
   }
 });
@@ -37764,7 +39547,7 @@ registerRollConsumer("bombard:resolve", (state, cardDb, source, payload, finalRo
   const { controllingPlayerId } = payload;
   setCounter(source, REMAINING_POOL_COUNTER, finalRoll);
   if (opposingCreatures(state, cardDb, controllingPlayerId).length > 0) {
-    addPendingChoiceTag(source, AWAITING_TARGET);
+    addPendingChoiceTag(source, AWAITING_TARGET2);
   }
 });
 
@@ -37778,24 +39561,24 @@ function taggedId(self, prefix) {
   const tag = [...self.tags].find((t) => t.startsWith(prefix));
   return tag ? tag.slice(prefix.length) : void 0;
 }
-function ownCreatures2(state, cardDb, self) {
+function ownCreatures3(state, cardDb, self) {
   return creaturesControlledBy(state, cardDb, self.controllerId);
 }
 registerCardEffect("Flame Control", {
   resolveSpell: (ctx) => {
-    if (ownCreatures2(ctx.state, ctx.cardDb, ctx.source).length >= 2) {
+    if (ownCreatures3(ctx.state, ctx.cardDb, ctx.source).length >= 2) {
       addPendingChoiceTag(ctx.source, AWAITING_SOURCE);
     }
   },
   pendingTargetChoice: (state, cardDb, self) => {
     if (self.tags.has(AWAITING_SOURCE)) {
-      const pool3 = ownCreatures2(state, cardDb, self).filter((c2) => (c2.currentEnergy ?? 0) > 0);
+      const pool3 = ownCreatures3(state, cardDb, self).filter((c2) => (c2.currentEnergy ?? 0) > 0);
       if (pool3.length === 0) return void 0;
       return { prompt: "Flame Control: choose a Creature to move energy FROM (or decline to finish)", pool: pool3 };
     }
     if (self.tags.has(AWAITING_DESTINATION)) {
       const sourceId = taggedId(self, SOURCE_PREFIX);
-      const pool3 = ownCreatures2(state, cardDb, self).filter((c2) => c2.instanceId !== sourceId);
+      const pool3 = ownCreatures3(state, cardDb, self).filter((c2) => c2.instanceId !== sourceId);
       if (pool3.length === 0) return void 0;
       return { prompt: "Flame Control: choose a Creature to move that energy TO", pool: pool3 };
     }
@@ -37805,7 +39588,7 @@ registerCardEffect("Flame Control", {
     if (self.tags.has(AWAITING_SOURCE)) {
       removePermanentTag(self, AWAITING_SOURCE);
       if (!chosenInstanceId) return;
-      const source = ownCreatures2(state, cardDb, self).find((c2) => c2.instanceId === chosenInstanceId);
+      const source = ownCreatures3(state, cardDb, self).find((c2) => c2.instanceId === chosenInstanceId);
       if (!source || (source.currentEnergy ?? 0) <= 0) return;
       addPermanentTag(state, cardDb, self, `${SOURCE_PREFIX}${chosenInstanceId}`);
       addPendingChoiceTag(self, AWAITING_DESTINATION);
@@ -37816,13 +39599,13 @@ registerCardEffect("Flame Control", {
       const sourceId = taggedId(self, SOURCE_PREFIX);
       if (!chosenInstanceId || !sourceId) {
         if (sourceId) removePermanentTag(self, `${SOURCE_PREFIX}${sourceId}`);
-        if (ownCreatures2(state, cardDb, self).length >= 2) addPendingChoiceTag(self, AWAITING_SOURCE);
+        if (ownCreatures3(state, cardDb, self).length >= 2) addPendingChoiceTag(self, AWAITING_SOURCE);
         return;
       }
-      const dest = ownCreatures2(state, cardDb, self).find((c2) => c2.instanceId === chosenInstanceId);
+      const dest = ownCreatures3(state, cardDb, self).find((c2) => c2.instanceId === chosenInstanceId);
       if (!dest || chosenInstanceId === sourceId) {
         removePermanentTag(self, `${SOURCE_PREFIX}${sourceId}`);
-        if (ownCreatures2(state, cardDb, self).length >= 2) addPendingChoiceTag(self, AWAITING_SOURCE);
+        if (ownCreatures3(state, cardDb, self).length >= 2) addPendingChoiceTag(self, AWAITING_SOURCE);
         return;
       }
       addPermanentTag(state, cardDb, self, `${DESTINATION_PREFIX}${chosenInstanceId}`);
@@ -37832,7 +39615,7 @@ registerCardEffect("Flame Control", {
   pendingNumericChoice: (state, cardDb, self) => {
     if (!self.tags.has(AWAITING_AMOUNT2)) return void 0;
     const sourceId = taggedId(self, SOURCE_PREFIX);
-    const source = sourceId ? ownCreatures2(state, cardDb, self).find((c2) => c2.instanceId === sourceId) : void 0;
+    const source = sourceId ? ownCreatures3(state, cardDb, self).find((c2) => c2.instanceId === sourceId) : void 0;
     const max = source?.currentEnergy ?? 0;
     if (max <= 0) return void 0;
     return { prompt: "Flame Control: how much energy to move?", min: 0, max };
@@ -37844,11 +39627,11 @@ registerCardEffect("Flame Control", {
     const destId = taggedId(self, DESTINATION_PREFIX);
     if (destId) removePermanentTag(self, `${DESTINATION_PREFIX}${destId}`);
     if (sourceId && destId && chosen > 0) {
-      const source = ownCreatures2(state, cardDb, self).find((c2) => c2.instanceId === sourceId);
-      const dest = ownCreatures2(state, cardDb, self).find((c2) => c2.instanceId === destId);
+      const source = ownCreatures3(state, cardDb, self).find((c2) => c2.instanceId === sourceId);
+      const dest = ownCreatures3(state, cardDb, self).find((c2) => c2.instanceId === destId);
       if (source && dest) rearrangeEnergy(state, cardDb, source, dest, chosen, rng);
     }
-    if (ownCreatures2(state, cardDb, self).length > 0) addPendingChoiceTag(self, AWAITING_SOURCE);
+    if (ownCreatures3(state, cardDb, self).length > 0) addPendingChoiceTag(self, AWAITING_SOURCE);
   }
 });
 
@@ -38203,35 +39986,49 @@ registerCardEffect("Turn", {
 });
 
 // src/cardEffects/haunt.ts
-var TARGET_PREFIX3 = "hauntTarget:";
-function trackedTargetId2(self) {
-  const tag = [...self.tags].find((t) => t.startsWith(TARGET_PREFIX3));
-  return tag ? tag.slice(TARGET_PREFIX3.length) : void 0;
+var HOST_PREFIX2 = "hauntHost:";
+function hostIdOf2(self) {
+  for (const tag of self.tags) if (tag.startsWith(HOST_PREFIX2)) return tag.slice(HOST_PREFIX2.length);
+  return void 0;
 }
 registerCardEffect("Haunt", {
   spellTargets: (state, cardDb, playerId) => opposingCreatures(state, cardDb, playerId),
   spellStaysInPlay: true,
   resolveSpell: (ctx) => {
     if (!ctx.chosenTargetId) return;
-    addPermanentTag(ctx.state, ctx.cardDb, ctx.source, `${TARGET_PREFIX3}${ctx.chosenTargetId}`);
-    ctx.controllingPlayer.inPlay.push(ctx.source);
+    const target = findInPlayById(ctx.state, ctx.chosenTargetId);
+    if (!target || ctx.cardDb.get(target.definitionKey)?.card_type !== "Creature") return;
+    addPermanentTag(ctx.state, ctx.cardDb, ctx.source, `${HOST_PREFIX2}${target.instanceId}`);
+    attachCard(target, ctx.source);
   },
-  onCardDiscardedFromPlay: (state, cardDb, discarded, discardedOwnerId, self, _cause, _source, _causedByPlayerId, rng) => {
-    const targetId = trackedTargetId2(self);
-    if (!targetId || discarded.instanceId !== targetId) return;
-    removePermanentTag(self, `${TARGET_PREFIX3}${targetId}`);
-    const owner = state.players.get(discardedOwnerId);
-    const hauntController = state.players.get(self.controllerId);
-    if (owner && hauntController) {
-      const startingEnergy = effectiveStartingEnergy(state, cardDb, discarded);
-      const played = playFromZone(state, cardDb, { owner, zone: "discardPile", instanceId: discarded.instanceId }, hauntController, startingEnergy, rng);
-      if (played) {
-        played.effectiveRegionOverride = { region: "Core" };
-        addRestrictionTag(state, played, CANNOT_ATTACK, state.turnNumber);
+  // Reached via task #329's release path: Haunt rides in its host's `attachedCards`, which no
+  // broadcast scans, so "my host just left play" arrives as Haunt's OWN discard event
+  // (attachedCards.ts's `discardAllAttached` fires each released card's `onCardDiscardedFromPlay`).
+  // Sunburn's proven route.
+  onCardDiscardedFromPlay: (state, cardDb, discarded, _discardedOwnerId, self, _cause, _source, _causedByPlayerId, rng) => {
+    if (discarded.instanceId !== self.instanceId) return;
+    const hostId = hostIdOf2(self);
+    if (hostId === void 0) return;
+    if (!isInAnyDiscardPile(state, hostId)) return;
+    let host;
+    let hostOwnerId;
+    for (const player of state.players.values()) {
+      const found = player.discardPile.find((c2) => c2.instanceId === hostId);
+      if (found) {
+        host = found;
+        hostOwnerId = player.playerId;
+        break;
       }
     }
-    if (hauntController && hauntController.inPlay.some((c2) => c2.instanceId === self.instanceId)) {
-      discardFromPlay(state, cardDb, hauntController, self.instanceId, void 0, void 0, rng);
+    if (!host || !hostOwnerId) return;
+    const owner = state.players.get(hostOwnerId);
+    const hauntController = state.players.get(self.controllerId);
+    if (!owner || !hauntController) return;
+    const startingEnergy = effectiveStartingEnergy(state, cardDb, host);
+    const played = playFromZone(state, cardDb, { owner, zone: "discardPile", instanceId: host.instanceId }, hauntController, startingEnergy, rng);
+    if (played) {
+      played.effectiveRegionOverride = { region: "Core", clearOnLeavePlay: true };
+      addRestrictionTag(state, played, CANNOT_ATTACK, state.turnNumber);
     }
   }
 });
@@ -38310,9 +40107,11 @@ registerCardEffect("Hrada", {
     if (!target) return;
     const targetDef = ctx.cardDb.get(target.definitionKey);
     if (!targetDef || isCoreRegion(targetDef.regions)) return;
+    const isNaroom = targetDef.regions.includes("Naroom");
     target.magiIdentityOverride = {
       asShadowOfOriginalRegion: targetDef.regions[0],
-      expiresAfterTurnNumber: beginningOfNextOwnTurnNumber(ctx.state)
+      expiresAfterTurnNumber: beginningOfNextOwnTurnNumber(ctx.state),
+      originalRegionPlayPenalty: isNaroom ? 2 : 1
     };
   }
 });
@@ -38382,48 +40181,48 @@ registerCardEffect("Terrorize", {
 });
 
 // src/cardEffects/stealth.ts
-var TARGET_PREFIX4 = "stealthTarget:";
-function trackedTargetId3(self) {
-  const tag = [...self.tags].find((t) => t.startsWith(TARGET_PREFIX4));
-  return tag ? tag.slice(TARGET_PREFIX4.length) : void 0;
+var TARGET_PREFIX3 = "stealthTarget:";
+function trackedTargetId2(self) {
+  const tag = [...self.tags].find((t) => t.startsWith(TARGET_PREFIX3));
+  return tag ? tag.slice(TARGET_PREFIX3.length) : void 0;
 }
 registerCardEffect("Stealth", {
   spellTargets: (state, cardDb) => allCreaturesInPlay(state, cardDb),
   spellStaysInPlay: true,
   resolveSpell: (ctx) => {
     if (!ctx.chosenTargetId) return;
-    addPermanentTag(ctx.state, ctx.cardDb, ctx.source, `${TARGET_PREFIX4}${ctx.chosenTargetId}`);
+    addPermanentTag(ctx.state, ctx.cardDb, ctx.source, `${TARGET_PREFIX3}${ctx.chosenTargetId}`);
     addPermanentTag(ctx.state, ctx.cardDb, ctx.source, DISCARD_AT_END_OF_TURN);
     ctx.controllingPlayer.inPlay.push(ctx.source);
   },
   onAttack: (ctx, self) => {
-    const targetId = trackedTargetId3(self);
+    const targetId = trackedTargetId2(self);
     if (!targetId || ctx.attacker.instanceId !== targetId) return;
     ctx.firstStrike = "attacker";
   }
 });
 
 // src/cardEffects/hauntingVisions.ts
-var TARGET_PREFIX5 = "hauntingVisionsTarget:";
-function trackedTargetId4(self) {
-  const tag = [...self.tags].find((t) => t.startsWith(TARGET_PREFIX5));
-  return tag ? tag.slice(TARGET_PREFIX5.length) : void 0;
+var TARGET_PREFIX4 = "hauntingVisionsTarget:";
+function trackedTargetId3(self) {
+  const tag = [...self.tags].find((t) => t.startsWith(TARGET_PREFIX4));
+  return tag ? tag.slice(TARGET_PREFIX4.length) : void 0;
 }
 function protectsAsHauntingVisions(self, target, actingPlayerId) {
-  return trackedTargetId4(self) === target.instanceId && actingPlayerId === target.controllerId;
+  return trackedTargetId3(self) === target.instanceId && actingPlayerId === target.controllerId;
 }
 registerCardEffect("Haunting Visions", {
   spellTargets: (state, cardDb, playerId) => opposingCreatures(state, cardDb, playerId),
   spellStaysInPlay: true,
   resolveSpell: (ctx) => {
     if (!ctx.chosenTargetId) return;
-    addPermanentTag(ctx.state, ctx.cardDb, ctx.source, `${TARGET_PREFIX5}${ctx.chosenTargetId}`);
+    addPermanentTag(ctx.state, ctx.cardDb, ctx.source, `${TARGET_PREFIX4}${ctx.chosenTargetId}`);
     ctx.controllingPlayer.inPlay.push(ctx.source);
   },
   onCardDiscardedFromPlay: (state, cardDb, discarded, discardedOwnerId, self, _cause, _source, _causedByPlayerId, rng) => {
-    const targetId = trackedTargetId4(self);
+    const targetId = trackedTargetId3(self);
     if (!targetId || discarded.instanceId !== targetId) return;
-    removePermanentTag(self, `${TARGET_PREFIX5}${targetId}`);
+    removePermanentTag(self, `${TARGET_PREFIX4}${targetId}`);
     const owner = state.players.get(self.controllerId);
     if (owner && owner.inPlay.some((c2) => c2.instanceId === self.instanceId)) {
       discardFromPlay(state, cardDb, owner, self.instanceId, void 0, void 0, rng);
@@ -38434,10 +40233,10 @@ registerCardEffect("Haunting Visions", {
 });
 
 // src/cardEffects/shadowRain.ts
-var TARGET_PREFIX6 = "shadowRainTarget:";
-function trackedTargetId5(self) {
-  const tag = [...self.tags].find((t) => t.startsWith(TARGET_PREFIX6));
-  return tag ? tag.slice(TARGET_PREFIX6.length) : void 0;
+var TARGET_PREFIX5 = "shadowRainTarget:";
+function trackedTargetId4(self) {
+  const tag = [...self.tags].find((t) => t.startsWith(TARGET_PREFIX5));
+  return tag ? tag.slice(TARGET_PREFIX5.length) : void 0;
 }
 registerCardEffect("Shadow Rain", {
   spellTargets: (state, cardDb, playerId) => creaturesControlledBy(state, cardDb, playerId),
@@ -38454,11 +40253,11 @@ registerCardEffect("Shadow Rain", {
       discardEnergy(ctx.state, ctx.cardDb, magi, amount, "spell", void 0, ctx.rng);
       addEnergy(ctx.state, ctx.cardDb, target, amount, "spell");
     }
-    addPermanentTag(ctx.state, ctx.cardDb, ctx.source, `${TARGET_PREFIX6}${target.instanceId}`);
+    addPermanentTag(ctx.state, ctx.cardDb, ctx.source, `${TARGET_PREFIX5}${target.instanceId}`);
     ctx.controllingPlayer.inPlay.push(ctx.source);
   },
   onOwnAttackStepEnd: (state, cardDb, self, rng) => {
-    const targetId = trackedTargetId5(self);
+    const targetId = trackedTargetId4(self);
     if (!targetId) return;
     const owner = state.players.get(self.controllerId);
     if (!owner || !owner.inPlay.some((c2) => c2.instanceId === self.instanceId)) return;
@@ -38505,17 +40304,17 @@ registerCardEffect("Anarchy", {
 });
 
 // src/cardEffects/moragsGift.ts
-var TARGET_PREFIX7 = "moragsGiftTarget:";
-function trackedTargetId6(self) {
-  const tag = [...self.tags].find((t) => t.startsWith(TARGET_PREFIX7));
-  return tag ? tag.slice(TARGET_PREFIX7.length) : void 0;
+var TARGET_PREFIX6 = "moragsGiftTarget:";
+function trackedTargetId5(self) {
+  const tag = [...self.tags].find((t) => t.startsWith(TARGET_PREFIX6));
+  return tag ? tag.slice(TARGET_PREFIX6.length) : void 0;
 }
 function alreadyClaimedMagiIds(state, cardDb) {
   const result = /* @__PURE__ */ new Set();
   for (const p of state.players.values()) {
     for (const c2 of p.inPlay) {
       if (cardDb.get(c2.definitionKey)?.name !== "Morag's 'Gift'") continue;
-      const id = trackedTargetId6(c2);
+      const id = trackedTargetId5(c2);
       if (id) result.add(id);
     }
   }
@@ -38539,11 +40338,11 @@ registerCardEffect("Morag's 'Gift'", {
       );
       if (owned) returnToHand(ctx.state, ctx.cardDb, ctx.controllingPlayer, ctx.chosenSecondTargetId);
     }
-    addPermanentTag(ctx.state, ctx.cardDb, ctx.source, `${TARGET_PREFIX7}${targetMagi.instanceId}`);
+    addPermanentTag(ctx.state, ctx.cardDb, ctx.source, `${TARGET_PREFIX6}${targetMagi.instanceId}`);
     ctx.controllingPlayer.inPlay.push(ctx.source);
   },
   onPlay: (state, cardDb, played, self) => {
-    const targetId = trackedTargetId6(self);
+    const targetId = trackedTargetId5(self);
     if (!targetId) return;
     if (cardDb.get(played.definitionKey)?.card_type !== "Creature") return;
     const targetMagi = findCreatureOrMagiById(state, targetId);
@@ -38554,16 +40353,16 @@ registerCardEffect("Morag's 'Gift'", {
     if (casterMagi) addEnergy(state, cardDb, casterMagi, 2, "spell");
   },
   onAnyMagiDefeated: (state, cardDb, self, defeatedMagi, defeatedPlayerId, rng) => {
-    const targetId = trackedTargetId6(self);
+    const targetId = trackedTargetId5(self);
     if (!targetId || defeatedMagi.instanceId !== targetId) return;
-    removePermanentTag(self, `${TARGET_PREFIX7}${targetId}`);
+    removePermanentTag(self, `${TARGET_PREFIX6}${targetId}`);
     const owner = state.players.get(self.controllerId);
     if (owner && owner.inPlay.some((c2) => c2.instanceId === self.instanceId)) {
       discardFromPlay(state, cardDb, owner, self.instanceId, void 0, void 0, rng);
     }
   },
   standingConditionMet: (state, cardDb, self) => {
-    const targetId = trackedTargetId6(self);
+    const targetId = trackedTargetId5(self);
     return !!targetId && !findCreatureOrMagiById(state, targetId);
   }
 });
@@ -38599,6 +40398,8 @@ registerCardEffect("Gloom", {
 registerCardEffect("Mind Blank", {
   causesOpponentHandDiscard: true,
   // task #718 (Riptide clause 2, 2026-08-11): symmetric all-players discard hits opposing hands too.
+  causesHostileHandDiscard: () => true,
+  // M1 retrofit, 2026-08-27: symmetric Spell discard also touches the opposing hand.
   resolveSpell: (ctx) => {
     for (const player of ctx.state.players.values()) {
       revealHandToAll(ctx.state, ctx.cardDb, player.playerId, ctx.source.instanceId);
@@ -39996,7 +41797,7 @@ registerCardEffect("Circling Darbok", {
 });
 
 // src/cardEffects/sheath.ts
-var HOST_PREFIX2 = "sheathHost:";
+var HOST_PREFIX3 = "sheathHost:";
 var DISCARD_PENDING2 = "sheathDiscardPending";
 registerCardEffect("Sheath", {
   spellTargets: (state, cardDb) => allCreaturesInPlay(state, cardDb).filter(
@@ -40012,15 +41813,15 @@ registerCardEffect("Sheath", {
     addPermanentRestrictionTag(ctx.state, target, CANNOT_ATTACK);
     addPermanentRestrictionTag(ctx.state, target, CANNOT_USE_POWER);
     addPermanentRestrictionTag(ctx.state, target, EFFECTS_LOCKED_DOWN);
-    addPermanentTag(ctx.state, ctx.cardDb, ctx.source, HOST_PREFIX2 + target.instanceId);
+    addPermanentTag(ctx.state, ctx.cardDb, ctx.source, HOST_PREFIX3 + target.instanceId);
     attachCard(target, ctx.source);
   },
   onCardDiscardedFromPlay: (state, cardDb, discarded, discardedOwnerId, self) => {
     if (discarded.instanceId !== self.instanceId) return;
     let hostId;
-    for (const tag of self.tags) if (tag.startsWith(HOST_PREFIX2)) hostId = tag.slice(HOST_PREFIX2.length);
+    for (const tag of self.tags) if (tag.startsWith(HOST_PREFIX3)) hostId = tag.slice(HOST_PREFIX3.length);
     if (hostId === void 0 || !isInAnyDiscardPile(state, hostId)) return;
-    removePermanentTag(self, HOST_PREFIX2 + hostId);
+    removePermanentTag(self, HOST_PREFIX3 + hostId);
     const owner = state.players.get(self.controllerId);
     if (!owner || owner.hand.length === 0) return;
     addPendingChoiceTag(self, DISCARD_PENDING2);
@@ -40205,6 +42006,54 @@ function applyLogEntry(state, cardDb, rng, entry) {
       declareAttack(state, cardDb, playerId, declaration, {}, rng);
       return;
     }
+    case "startPreCombatDieRoll": {
+      const [cardInstanceId] = args;
+      const card = findCardAnywhereById(state, cardInstanceId);
+      if (!card) return;
+      startPreCombatDieRoll(state, cardDb, card, rng);
+      return;
+    }
+    case "confirmPlayPrevention": {
+      const [actingPlayerId, handInstanceId, preventerInstanceId] = args;
+      const handCard = getPlayer(state, actingPlayerId).hand.find((c2) => c2.instanceId === handInstanceId);
+      const handDef = handCard && cardDb.get(handCard.definitionKey);
+      let preventer;
+      for (const p of state.players.values()) {
+        const contributors = p.activeMagi ? [...p.inPlay, p.activeMagi] : p.inPlay;
+        const match = contributors.find((c2) => c2.instanceId === preventerInstanceId);
+        if (match) {
+          preventer = match;
+          break;
+        }
+      }
+      if (handDef && preventer) {
+        const preventerDef = cardDb.get(preventer.definitionKey);
+        const preventerEffect = preventerDef ? getCardEffectByName(preventerDef.name) : void 0;
+        preventerEffect?.confirmPreventedPlay?.(state, cardDb, handDef, actingPlayerId, preventer, rng);
+        logEvent(state, "playPreventionConfirmed", {
+          actingPlayerId,
+          handInstanceId,
+          preventerInstanceId
+        });
+      }
+      return;
+    }
+    case "confirmPowerTargetProtection": {
+      const [targetInstanceId, chosenInstanceId] = args;
+      confirmIdentityOverrideForPower(state, cardDb, targetInstanceId, "creatureType", chosenInstanceId);
+      return;
+    }
+    case "resolveHostileHandDiscardStandalone": {
+      const [victimPlayerId, targetIds, causedByPlayerId, stage, chosenInstanceId, checkedStages] = args;
+      state.acceptedHandDiscardOffer = bakeHandDiscardAnswer(state.acceptedHandDiscardOffer, stage, chosenInstanceId);
+      const victim = state.players.get(victimPlayerId);
+      if (!victim) return;
+      const nextCheckedStages = [...checkedStages, stage];
+      const rearmed = armStandaloneHostileHandDiscardIfEligible(state, cardDb, victim, targetIds, causedByPlayerId, nextCheckedStages);
+      if (rearmed) return;
+      discardFromHand(state, cardDb, victim, targetIds, causedByPlayerId, rng);
+      return;
+    }
     case "abandonDeclaredAttack": {
       const [playerId, declaration, reason] = args;
       abandonDeclaredAttack(state, playerId, declaration, reason);
@@ -40235,15 +42084,24 @@ function applyLogEntry(state, cardDb, rng, entry) {
       return;
     }
     case "resolveTempestHyrenSpellPlay": {
-      const [selfInstanceId, controllingPlayerId, spellInstanceId, choices] = args;
-      const self = findCreatureOrMagiById(state, selfInstanceId);
-      if (self) resolveTempestHyrenSpellPlay(state, cardDb, self, controllingPlayerId, spellInstanceId, choices, rng);
+      if (args.length >= 4) {
+        const [, , spellInstanceId, choices] = args;
+        resolveTempestHyrenSpellPlay(state, cardDb, spellInstanceId, choices, rng);
+      } else {
+        const [spellInstanceId, choices] = args;
+        resolveTempestHyrenSpellPlay(state, cardDb, spellInstanceId, choices, rng);
+      }
       return;
     }
-    case "resolveGoodOlAshgarSpellPlay": {
-      const [selfInstanceId, controllingPlayerId, spellInstanceId, choices] = args;
-      const self = findCreatureOrMagiById(state, selfInstanceId);
-      if (self) resolveGoodOlAshgarSpellPlay(state, cardDb, self, controllingPlayerId, spellInstanceId, choices, rng);
+    case "resolveGoodOlAshgarSpellPlay":
+    case "resolveAshgarSpellPlay": {
+      if (args.length >= 4) {
+        const [, , spellInstanceId, choices] = args;
+        resolveAshgarSpellPlay(state, cardDb, spellInstanceId, choices, rng);
+      } else {
+        const [spellInstanceId, choices] = args;
+        resolveAshgarSpellPlay(state, cardDb, spellInstanceId, choices, rng);
+      }
       return;
     }
     case "resolveKlynnSeer": {
@@ -40323,6 +42181,11 @@ function applyLogEntry(state, cardDb, rng, entry) {
     case "resolveFateWhimsyChoice": {
       const [playerId, keepReroll] = args;
       resolveFateWhimsyChoice(state, cardDb, playerId, keepReroll, rng);
+      return;
+    }
+    case "resolveDieRerollGrantOffer": {
+      const [chosenGrantorInstanceId] = args;
+      resolveDieRerollGrantOffer(state, cardDb, chosenGrantorInstanceId, rng);
       return;
     }
     case "resolvePendingTargetChoiceFor": {
@@ -41269,6 +43132,10 @@ function playRandomGame(cardDb, p1DeckCardKeys, p1MagiOrder, p2DeckCardKeys, p2M
         actionsApplied += 1;
         continue;
       }
+      if (answerDieRerollGrantWindow(state, cardDb, rng, policyRng, record)) {
+        actionsApplied += 1;
+        continue;
+      }
       const obligation = nextObligation(state, cardDb);
       if (obligation) {
         const handled = dischargeObligation(state, cardDb, obligation.playerId, obligation.obligation, rng, policyRng, record);
@@ -41361,9 +43228,23 @@ function nextObligation(state, cardDb) {
 function answerFateWhimsyWindow(state, cardDb, rng, policyRng, record, refusals) {
   const pending = state.pendingDieRoll;
   if (!pending) return false;
+  const source = findCardAnywhereById(state, pending.sourceInstanceId);
+  const sourceEffect = source ? getCardEffectByName(cardDb.get(source.definitionKey)?.name ?? "") : void 0;
+  const consultHook = (playerId2, roll) => {
+    if (!source || !sourceEffect?.botConsidersRollBad) return void 0;
+    const botIsController = source.controllerId === playerId2;
+    return sourceEffect.botConsidersRollBad(state, cardDb, source, roll, botIsController);
+  };
   if (pending.pendingRerollChoice) {
     const answeringPlayerId = pending.pendingRerollChoice.answeringPlayerId;
-    const keepReroll = policyRng() < 0.5;
+    const currentBad = consultHook(answeringPlayerId, pending.currentValue);
+    const newBad = consultHook(answeringPlayerId, pending.pendingRerollChoice.newValue);
+    let keepReroll;
+    if (currentBad === void 0 || newBad === void 0) {
+      keepReroll = policyRng() < 0.5;
+    } else {
+      keepReroll = currentBad && !newBad;
+    }
     const result = resolveFateWhimsyChoice(state, cardDb, answeringPlayerId, keepReroll, rng);
     if (!result.ok) {
       refusals.push({ kind: "fateWhimsy", declaredAs: "resolveFateWhimsyChoice", turnNumber: state.turnNumber });
@@ -41377,7 +43258,8 @@ function answerFateWhimsyWindow(state, cardDb, rng, policyRng, record, refusals)
   const player = state.players.get(playerId);
   if (!player) return false;
   const whimsyIds = player.hand.filter((c2) => cardDb.get(c2.definitionKey)?.name === "Fate's Whimsy").map((c2) => c2.instanceId);
-  const declining = whimsyIds.length === 0 || policyRng() < 0.2;
+  const hookVerdict = consultHook(playerId, pending.currentValue);
+  const declining = whimsyIds.length === 0 || (hookVerdict !== void 0 ? !hookVerdict : policyRng() < 0.2);
   if (!declining) {
     const chosen = pick(whimsyIds, policyRng);
     const played = playFateWhimsy(state, cardDb, playerId, chosen, rng);
@@ -41400,11 +43282,31 @@ function answerFateWhimsyWindow(state, cardDb, rng, policyRng, record, refusals)
   record("declineFateWhimsyOffer", [playerId]);
   return true;
 }
+function answerDieRerollGrantWindow(state, cardDb, rng, policyRng, record) {
+  const pending = state.pendingDieRerollGrantOffer;
+  if (!pending) return false;
+  const decline = pending.eligibleGrantorInstanceIds.length === 0 || policyRng() < 0.2;
+  const chosen = decline ? void 0 : pick(pending.eligibleGrantorInstanceIds, policyRng);
+  resolveDieRerollGrantOffer(state, cardDb, chosen, rng);
+  record("resolveDieRerollGrantOffer", [chosen]);
+  return true;
+}
 function dischargeObligation(state, cardDb, playerId, obligation, rng, policyRng, record) {
   recordOpportunity(`obligation:${obligation.kind}`);
   const handled = dischargeObligationImpl(state, cardDb, playerId, obligation, rng, policyRng, record);
   if (handled) recordTaken(`obligation:${obligation.kind}`);
   return handled;
+}
+function catchResumeIllegal(state, fn) {
+  try {
+    fn();
+  } catch (err) {
+    const msg = String(err?.message ?? err);
+    if (!msg.startsWith("Illegal play:") && !msg.startsWith("Illegal Power use:")) throw err;
+    state.pendingReactiveOffer = null;
+    state.pendingOpponentHandChoice = null;
+    state.pendingOpponentSubChoice = null;
+  }
 }
 function dischargeObligationImpl(state, cardDb, playerId, obligation, rng, policyRng, record) {
   switch (obligation.kind) {
@@ -41548,7 +43450,7 @@ function dischargeObligationImpl(state, cardDb, playerId, obligation, rng, polic
     }
     case "reactiveOfferSingle": {
       const chosen = policyRng() < 0.2 ? void 0 : pick(obligation.pool, policyRng);
-      resolveReactiveOffer(state, cardDb, chosen, rng, record);
+      catchResumeIllegal(state, () => resolveReactiveOffer(state, cardDb, chosen, rng, record));
       return true;
     }
     case "simultaneousOrderChoice": {
@@ -41563,13 +43465,14 @@ function dischargeObligationImpl(state, cardDb, playerId, obligation, rng, polic
         const j = Math.floor(policyRng() * (i + 1));
         [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
       }
-      const count = randomInt(0, Math.min(obligation.max, shuffled.length), policyRng);
-      resolveOpponentHandChoice(state, cardDb, shuffled.slice(0, count), rng, record);
+      const minCount = Math.max(0, Math.min(obligation.min, shuffled.length));
+      const count = randomInt(minCount, Math.min(obligation.max, shuffled.length), policyRng);
+      catchResumeIllegal(state, () => resolveOpponentHandChoice(state, cardDb, shuffled.slice(0, count), rng, record));
       return true;
     }
     case "opponentSubChoice": {
       if (obligation.choiceKind === "boolean") {
-        resolveOpponentSubChoice(state, cardDb, policyRng() < 0.5, rng, record);
+        catchResumeIllegal(state, () => resolveOpponentSubChoice(state, cardDb, policyRng() < 0.5, rng, record));
         return true;
       }
       const shuffled = [...obligation.pool];
@@ -41578,7 +43481,7 @@ function dischargeObligationImpl(state, cardDb, playerId, obligation, rng, polic
         [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
       }
       const count = randomInt(obligation.min, Math.min(obligation.max, shuffled.length), policyRng);
-      resolveOpponentSubChoice(state, cardDb, shuffled.slice(0, count), rng, record);
+      catchResumeIllegal(state, () => resolveOpponentSubChoice(state, cardDb, shuffled.slice(0, count), rng, record));
       return true;
     }
     case "startingCardTutor":
@@ -42656,6 +44559,7 @@ export {
   NO_ENERGY_IN_ATTACKS,
   NO_ENERGY_LOST_FROM_OPPOSING_POWER,
   NO_ENERGY_LOST_IN_ATTACKS,
+  NO_NEXT_ENERGIZE,
   NO_STARTING_CARDS,
   PERPETUAL_MOTION,
   PHASE_ORDER,
@@ -42723,12 +44627,14 @@ export {
   attemptDeclareAttack,
   attemptPlayCard,
   attemptUsePower,
+  bakeHandDiscardAnswer,
   beginOrderedBroadcast,
   beginTurn,
   beginningOfNextOwnTurnNumber,
   blockedByFirdStoneProtection,
   blockedByShadowCloakFromNonCorePowerOrSpell,
   blockedByShadowCloakProtection,
+  blockedByShellFromOpposingPowerOrSpell,
   blockedByThreeLeafCloverProtection,
   blockedByUmmmNoProtection,
   buildCardDatabase,
@@ -42764,6 +44670,7 @@ export {
   declineFateWhimsyOffer,
   declineReactiveDreamwarp,
   declineSpiritSpellWindow,
+  declineStalePendingDieRerollGrantOffer,
   declineStalePendingOpponentHandChoice,
   declineStalePendingOpponentSubChoice,
   declineStalePendingReactiveOffer,
@@ -42877,6 +44784,7 @@ export {
   playFromZonePayingCost,
   playMatchup,
   playRandomGame,
+  playSpellFromOpponentZone,
   playedCardNameThisTurn,
   pointsFor,
   powerTargetsWithRegionSwap,
@@ -42889,6 +44797,8 @@ export {
   previewDefenderDiscardAndPlayOffer,
   previewDefenderHideOffer,
   previewDefenderRedirectOffers,
+  previewDieRerollGrantOffer,
+  previewDiscardOfPreventionOffers,
   previewDiscardSaveOffersForSpell,
   previewFateWhimsyOffer,
   previewFateWhimsyRerollChoice,
@@ -42908,6 +44818,7 @@ export {
   previewOpponentHandPickOfferForSpell,
   previewOpponentSubChoiceOffer,
   previewPlayCostRedirectOffers,
+  previewPlayPreventionOffers,
   previewPlayableFromDeck,
   previewPlayableFromDiscardPile,
   previewPowerCostRedirectOffers,
@@ -42938,6 +44849,7 @@ export {
   removePermanentTag,
   replayGameLog,
   resetInstanceCounter,
+  resolveAshgarSpellPlay,
   resolveAttachRedirectOffer,
   resolveAttachedReleaseFor,
   resolveAttachedSpellNegation,
@@ -42945,10 +44857,10 @@ export {
   resolveDefenderDiscardAndPlaySubstitute,
   resolveDefenderHide,
   resolveDefenderRedirectAcceptance,
+  resolveDieRerollGrantOffer,
   resolveFateWhimsyChoice,
   resolveFirstPlayerChoice,
   resolveGloomSaveFor,
-  resolveGoodOlAshgarSpellPlay,
   resolveKlynnSeer,
   resolveOpponentHandChoice,
   resolveOpponentSubChoice,
@@ -42963,6 +44875,7 @@ export {
   resolvePerPowerField,
   resolvePlayableFromDeck,
   resolvePlayableFromDiscardPile,
+  resolvePreCombatTargetChoice,
   resolveReactiveDreamwarpFor,
   resolveReactiveOffer,
   resolveSelfDiscardChoiceFor,
@@ -42975,9 +44888,13 @@ export {
   resolveTiebreakByMagiCount,
   resolveCardRef as resolveTutorialCardRef,
   resolveVariableCost,
+  resolveWeaveChoice,
   resolveWeightsForBot,
   resolveWeightsForRegion,
   restoreEnergy2 as restoreEnergy,
+  resumePendingDeclareAttackAfterDieRoll,
+  resumePendingDeclareAttackAfterSpell,
+  resumePendingSpellStealCleanup,
   revealNextMagi,
   roleFor,
   rollForTurnOrder,
