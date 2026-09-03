@@ -43008,6 +43008,29 @@ function pickBestCategoryChoice(state, cardDb, botPlayerId, obligation, policyRn
   if (bestOptions.length === 0) return void 0;
   return pick(bestOptions, policyRng);
 }
+function pickBestReactiveAnswer(state, cardDb, botPlayerId, obligation, policyRng, weights) {
+  const candidates = [...obligation.pool, void 0];
+  const originalHandIds = new Set(state.players.get(botPlayerId)?.hand.map((c2) => c2.instanceId) ?? []);
+  let bestScore = -Infinity;
+  let bestOptions = [];
+  for (const option of candidates) {
+    const simRng = createSeededRng(1);
+    const clone = structuredClone(state);
+    catchResumeIllegal(clone, () => resolveReactiveOffer(clone, cardDb, option, simRng, () => {
+    }));
+    const budget = { remaining: DEFAULT_NODE_BUDGET_PER_CANDIDATE };
+    const crossingBudget = { remaining: OPPONENT_TURN_CROSSINGS };
+    const score = scoreWithLookahead(clone, cardDb, botPlayerId, simRng, budget, originalHandIds, crossingBudget, weights);
+    if (score > bestScore) {
+      bestScore = score;
+      bestOptions = [option];
+    } else if (score === bestScore) {
+      bestOptions.push(option);
+    }
+  }
+  if (bestOptions.length === 0) return void 0;
+  return pick(bestOptions, policyRng);
+}
 function capRootCandidates(moves) {
   if (moves.length <= MAX_ROOT_CANDIDATES) return moves;
   const passMove = moves.find((m) => m.type === "advancePhase");
@@ -43690,6 +43713,11 @@ function takeBotAction(state, cardDb, botPlayerId, rng, policyRng, record, resol
       const chosen = isFromScratchRegionPick(ownObligation.options) ? dominantDeckRegion(state, cardDb, botPlayerId, policyRng) : pickBestCategoryChoice(state, cardDb, botPlayerId, ownObligation, policyRng, weights);
       resolvePendingCategoryChoiceFor(state, cardDb, ownObligation.selfInstanceId, chosen, rng);
       record("resolvePendingCategoryChoiceFor", [ownObligation.selfInstanceId, chosen]);
+      return true;
+    }
+    if (ownObligation.kind === "reactiveOfferSingle") {
+      const chosen = pickBestReactiveAnswer(state, cardDb, botPlayerId, ownObligation, policyRng, weights);
+      catchResumeIllegal(state, () => resolveReactiveOffer(state, cardDb, chosen, rng, record));
       return true;
     }
     return dischargeObligation(state, cardDb, botPlayerId, ownObligation, rng, policyRng, record);
