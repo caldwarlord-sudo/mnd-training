@@ -130,31 +130,44 @@ function readMethodologyRows() {
   return rows;
 }
 
-/** Best-so-far = highest series-points across all methodology rows so far.
- *  Tie-break by RECENCY (more recent gen wins), which matters because two runs with
- *  statistically-indistinguishable focus points shouldn't lock in the older one -- see
- *  the 2026-08-23 case where gen 1's Mut1 (13pts, likely a noise-lucky win) tied gen 2's
- *  baseline (13pts, more stable measure) and the old tie-break kept mutating from Mut1
- *  for a third generation. Anchor stability now flows from "beat the current anchor
- *  cleanly", not "was the first entrant to hit this score."
+/** Best-so-far = the current champion in the mutation lineage.
+ *
+ *  Fixed 2026-09-04 (Cald v1 gen 3 exposed the bug): PRIOR implementation picked by highest
+ *  raw `focusPoints` across all rows. That's meaningless cross-gen because per-gen field
+ *  composition varies (different sibling mutations, different seeds, different anchor scores).
+ *  The Cald case: gen 1 Baseline scored 11 pts vs weak-mutation siblings; gen 2 Mut3 scored 10
+ *  pts vs baseline + stronger-mutation siblings. Mut3 BEAT its in-gen anchor (10 vs 7.5 pts)
+ *  by +2.5 -- real progress -- but max-focusPoints logic kept gen 1 Baseline as anchor
+ *  because 11 > 10, ignoring the within-gen improvement signal. Result: gen 3 mutations
+ *  spawned from Baseline instead of chaining from Mut3, so evolution effectively restarted
+ *  every gen. Same bug affected Core v1's whole 3-gen campaign.
+ *
+ *  CORRECTED semantics: walk rows chronologically, only update the anchor when the wrapper's
+ *  own `bestSoFarUpdated` flag was true for that gen (i.e. a mutation genuinely beat its
+ *  in-gen anchor). This matches the plateau-rule semantics fixed the same day: within-gen
+ *  comparison is authoritative, cross-gen focusPoints comparison is confounded.
  *
  *  Returns { gen, weights, points, origin } or null if no rows exist yet. `origin` is the
  *  row's `championOrigin` string (e.g. "baseline", "mutation 1", "best-so-far-*") so callers
  *  can tell if the anchor IS baseline and skip a redundant best-so-far slot in the field. */
 function bestSoFarFrom(rows) {
   if (rows.length === 0) return null;
-  let best = rows[0];
-  for (const r of rows) {
-    const rPts = r.focusPoints ?? -Infinity;
-    const bestPts = best.focusPoints ?? -Infinity;
-    // Prefer strictly higher; on a tie, prefer more recent gen.
-    if (rPts > bestPts || (rPts === bestPts && r.gen > best.gen)) best = r;
+  // Walk chronologically. Anchor updates only when the wrapper flagged bestSoFarUpdated=true
+  // for that gen. Missing/false = anchor unchanged that gen (championOrigin=baseline case,
+  // or no mutation beat the in-gen anchor).
+  const sorted = [...rows].sort((a, b) => (a.gen ?? 0) - (b.gen ?? 0));
+  let anchor = null;
+  for (const r of sorted) {
+    if (r.bestSoFarUpdated === true) {
+      anchor = r;
+    }
   }
+  if (anchor === null) return null;
   return {
-    gen: best.gen,
-    weights: best.championWeights,
-    points: best.focusPoints ?? null,
-    origin: best.championOrigin ?? null,
+    gen: anchor.gen,
+    weights: anchor.championWeights,
+    points: anchor.focusPoints ?? null,
+    origin: anchor.championOrigin ?? null,
   };
 }
 
