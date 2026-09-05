@@ -11,19 +11,34 @@ name: Evolve Underneath (focused)
 #   After the gen, the top target entrant is compared to best-so-far -- if it cleanly beats
 #   best-so-far, it becomes the new best-so-far; otherwise best-so-far persists.
 #
-# Best-so-far state persists across generations WITHIN a single workflow run by appending to
-# evolution-generations.jsonl (which the wrapper reads on startup for previous best-so-far
-# rows). BETWEEN workflow runs, persistence is manual: the final evolution-generations.jsonl
-# is uploaded as an artifact; the caller downloads it, commits over the mnd-training version
-# (or the private repo's version, then syncs), and pushes before firing the next batch.
+# Sharded pipeline (2026-09-05, added after Cald v1 gen 4 hit the GH 6h platform cap on a single
+# runner). Three jobs, mirroring roundrobin.yml's plan -> shard -> aggregate shape:
+#
+#   plan      -- wrapper `--planOnly`. Reads genlog, computes best-so-far, generates mutations,
+#                writes plan.json + field files. Uploads scratch as artifact. Emits matrix output.
+#   shard     -- matrix of N runners. Each downloads plan scratch and invokes roundrobin.mjs
+#                DIRECTLY (not through the wrapper) with --shardIndex / --shardCount. Uploads
+#                its per-shard results.
+#   aggregate -- needs [plan, shard], if: always() so partial shard failures still produce a
+#                best-effort genlog row. Downloads plan + all shard artifacts, invokes
+#                `roundrobin.mjs --aggregateShards` to merge, then wrapper `--aggregateOnly` to
+#                pick champion + append genlog row. Records `partialShards` on the row when any
+#                shard failed so downstream analysis can caveat conclusions from partial data.
+#
+# Best-so-far state persists across generations by appending to evolution-generations.jsonl,
+# which the wrapper reads on startup for previous best-so-far rows. BETWEEN workflow runs,
+# persistence is manual: the final evolution-generations.jsonl is uploaded as an artifact; the
+# caller downloads it, commits over the mnd-training version (or the private repo's version,
+# then syncs), and pushes before firing the next batch.
 #
 # Trigger:
 #   gh workflow run evolve-underneath.yml -R caldwarlord-sudo/mnd-training \
 #     -f deckPath="engine/decks-experimental/underneath-test-v2.json" \
-#     -f generations=5 \
+#     -f generations=1 \
 #     -f populationSize=4 \
 #     -f mutationSigma="" \
 #     -f gamesPerPair=4 \
+#     -f shards=4 \
 #     -f workers=2 \
 #     -f betaMode=true
 
@@ -39,7 +54,7 @@ on:
         required: true
         default: 'engine/decks-experimental/underneath-test-v2.json'
       generations:
-        description: 'Generations per invocation. KEEP AT 1 -- GH enforces a hard 6h job cap that a slow region like Underneath can exceed in a single generation. Session-driven pattern: fire, wait for completion, auto-fire the next.'
+        description: 'Generations per invocation. MUST BE 1 -- the sharded pipeline runs one gen per invocation (each gen depends on the previous gen''s genlog row). Session-driven pattern: fire, wait for completion, auto-fire the next.'
         required: false
         default: '1'
       startGeneration:
@@ -55,11 +70,15 @@ on:
         required: false
         default: ''
       gamesPerPair:
-        description: 'Games per pair series (must be even). Default 4 (2026-08-26 rollback from 6: Bograth gen 1 hit the 6h GH cap at 6 games/pair, confirming the risk we anticipated when we bumped to 6 on 2026-08-25. Faster regions like Arderial can override to 6 per-invocation for cleaner signal; Underneath/Bograth/similar slow regions should stay at 4).'
+        description: 'Games per pair series (must be even). Default 4 (2026-08-26 rollback from 6: Bograth gen 1 hit the 6h GH cap at 6 games/pair on the pre-sharding single-runner infra. Sharding relaxes that constraint but 4 remains the standard so shipped campaign parameters are unchanged).'
+        required: false
+        default: '4'
+      shards:
+        description: 'Matrix shard count (1-8). Default 4 -- roughly halves single-runner wall-clock on fast/medium regions and gets Cald/Bograth-class slow regions comfortably under the 6h cap. Override upward for VERY slow regions if aggregate still runs long.'
         required: false
         default: '4'
       workers:
-        description: 'Worker processes (2 max on standard runners).'
+        description: 'Worker processes per shard runner (2 max on standard runners).'
         required: false
         default: '2'
       maxTurns:
@@ -86,9 +105,13 @@ on:
         default: '42'
 
 jobs:
-  evolve:
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 720   # 12h ceiling; 5-gen batches at ~1.5-2h/gen fit comfortably
+    timeout-minutes: 20
+    outputs:
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+      shard-count: ${{ steps.build-matrix.outputs.shard-count }}
+      gen: ${{ steps.plan-gen.outputs.gen }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -98,11 +121,30 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Prepare output directory
-        run: mkdir -p results
+      - name: Validate inputs + emit matrix
+        id: build-matrix
+        run: |
+          SHARDS="${{ inputs.shards }}"
+          if [ "$SHARDS" -lt 1 ] || [ "$SHARDS" -gt 8 ]; then
+            echo "shards must be between 1 and 8 (got $SHARDS)"
+            exit 1
+          fi
+          if [ "${{ inputs.generations }}" != "1" ]; then
+            echo "generations must be 1 (sharded workflow runs one gen per invocation; see docs/plans/per-region-training-methodology.md §1 for the session-driven per-gen pattern)."
+            exit 1
+          fi
+          MATRIX=$(seq 0 $((SHARDS - 1)) | jq -R -s -c 'split("\n") | map(select(length > 0) | tonumber)')
+          echo "matrix={\"shardIndex\":$MATRIX}" >> $GITHUB_OUTPUT
+          echo "shard-count=$SHARDS" >> $GITHUB_OUTPUT
+          echo "Planned $SHARDS shard job(s)"
 
-      - name: Run focused evolution
+      - name: Prepare plan scratch dir
+        run: mkdir -p plan-scratch
+
+      - name: Run wrapper --planOnly
         env:
+          # Beta mode env vars are irrelevant to plan-phase (no games are played) but set for
+          # symmetry with the shard job and to guard against any code path that reads them.
           OPPONENT_TURN_CROSSINGS: ${{ inputs.betaMode == 'true' && '1' || '0' }}
           MND_BOT_BETA_MODE: ${{ inputs.betaMode == 'true' && '1' || '0' }}
         run: |
@@ -114,7 +156,7 @@ jobs:
           node engine/scripts/evolve-underneath-focused.mjs \
             --region "${{ inputs.region }}" \
             --deckPath "${{ inputs.deckPath }}" \
-            --generations ${{ inputs.generations }} \
+            --generations 1 \
             --populationSize ${{ inputs.populationSize }} \
             --gamesPerPair ${{ inputs.gamesPerPair }} \
             --workers ${{ inputs.workers }} \
@@ -122,9 +164,223 @@ jobs:
             --gameTimeoutSec ${{ inputs.timeoutSec }} \
             --seed ${{ inputs.seed }} \
             --methodology "${{ inputs.methodology }}" \
-            --out "${{ github.workspace }}/results" \
+            --out "${{ github.workspace }}/plan-scratch" \
+            --planOnly "${{ github.workspace }}/plan-scratch/plan.json" \
             $START_GEN_FLAG \
             $SIGMA_FLAG
+
+      - name: Extract gen number from plan
+        id: plan-gen
+        run: |
+          GEN=$(jq -r '.gen' plan-scratch/plan.json)
+          if [ -z "$GEN" ] || [ "$GEN" = "null" ]; then
+            echo "plan.json missing .gen field"
+            exit 1
+          fi
+          echo "gen=$GEN" >> $GITHUB_OUTPUT
+          echo "Planned generation: $GEN"
+
+      - name: Show plan scratch contents
+        if: always()
+        run: |
+          echo '--- plan-scratch/ ---'
+          ls -lh plan-scratch/ 2>/dev/null || echo '(empty)'
+          echo '--- focused-evo-scratch/ (field files) ---'
+          ls -lh plan-scratch/focused-evo-scratch/ 2>/dev/null || echo '(empty)'
+
+      - name: Upload plan artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: focused-evo-plan-${{ github.run_id }}
+          path: plan-scratch/
+          retention-days: 30
+          if-no-files-found: warn
+
+  shard:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: focused-evo-plan-${{ github.run_id }}
+          path: plan-scratch
+
+      - name: Prepare output directory
+        run: mkdir -p results
+
+      - name: Run round-robin shard ${{ matrix.shardIndex }}
+        env:
+          OPPONENT_TURN_CROSSINGS: ${{ inputs.betaMode == 'true' && '1' || '0' }}
+          MND_BOT_BETA_MODE: ${{ inputs.betaMode == 'true' && '1' || '0' }}
+        run: |
+          GEN="${{ needs.plan.outputs.gen }}"
+          FOCUS_JSONL="plan-scratch/focused-evo-scratch/gen-${GEN}-focus-jsonl.jsonl"
+          EXTRAS="plan-scratch/focused-evo-scratch/gen-${GEN}-extras.json"
+          if [ ! -f "$FOCUS_JSONL" ]; then
+            echo "Missing focus JSONL: $FOCUS_JSONL"
+            ls -la plan-scratch/focused-evo-scratch/ || true
+            exit 1
+          fi
+          if [ ! -f "$EXTRAS" ]; then
+            echo "Missing extras JSON: $EXTRAS"
+            ls -la plan-scratch/focused-evo-scratch/ || true
+            exit 1
+          fi
+
+          node engine/scripts/roundrobin.mjs \
+            --jsonl "$FOCUS_JSONL" \
+            --extraEntrantsFile "$EXTRAS" \
+            --focusRegion "${{ inputs.region }}" \
+            --shardIndex ${{ matrix.shardIndex }} \
+            --shardCount ${{ needs.plan.outputs.shard-count }} \
+            --skipBaseline \
+            --workers ${{ inputs.workers }} \
+            --gamesPerPair ${{ inputs.gamesPerPair }} \
+            --maxTurns ${{ inputs.maxTurns }} \
+            --gameTimeoutSec ${{ inputs.timeoutSec }} \
+            --out "${{ github.workspace }}/results"
+
+      - name: Show shard tail
+        if: always()
+        run: |
+          echo '--- shard ${{ matrix.shardIndex }} JSONL line count ---'
+          wc -l results/roundrobin-matches-shard-*.jsonl 2>/dev/null || echo '(no jsonl)'
+          echo '--- errors (head) ---'
+          head -20 results/roundrobin-errors-shard-*.jsonl 2>/dev/null || echo '(no errors)'
+          ls -lh results/ || true
+
+      - name: Upload shard results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: focused-evo-shard-${{ matrix.shardIndex }}-${{ github.run_id }}
+          path: results/
+          retention-days: 30
+          if-no-files-found: warn
+
+  aggregate:
+    needs: [plan, shard]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: focused-evo-plan-${{ github.run_id }}
+          path: plan-scratch
+
+      - name: Download shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: focused-evo-shard-*-${{ github.run_id }}
+          path: shard-downloads
+
+      - name: List downloaded artifacts
+        run: |
+          echo '--- plan-scratch/ ---'
+          find plan-scratch -type f | sort || true
+          echo '--- shard-downloads/ ---'
+          find shard-downloads -type f | sort || true
+
+      - name: Detect failed shards
+        id: failed-shards
+        run: |
+          SHARD_COUNT="${{ needs.plan.outputs.shard-count }}"
+          FAILED=""
+          FAILED_COUNT=0
+          for i in $(seq 0 $((SHARD_COUNT - 1))); do
+            SHARD_DIR="shard-downloads/focused-evo-shard-${i}-${{ github.run_id }}"
+            if [ ! -d "$SHARD_DIR" ] || [ -z "$(ls -A "$SHARD_DIR" 2>/dev/null)" ]; then
+              FAILED="${FAILED:+$FAILED,}$i"
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+              echo "Shard $i: MISSING or empty"
+            else
+              echo "Shard $i: present"
+            fi
+          done
+          echo "failed=$FAILED" >> $GITHUB_OUTPUT
+          echo "count=$FAILED_COUNT" >> $GITHUB_OUTPUT
+          echo "total=$SHARD_COUNT" >> $GITHUB_OUTPUT
+          if [ "$FAILED_COUNT" = "$SHARD_COUNT" ]; then
+            echo "All shards failed -- cannot aggregate"
+            exit 1
+          fi
+          if [ -n "$FAILED" ]; then
+            echo "::warning::Partial-shard run: ${FAILED_COUNT}/${SHARD_COUNT} shards failed (indices: $FAILED). Genlog row will carry partialShards field."
+          fi
+
+      - name: Merge shard results
+        run: |
+          GEN="${{ needs.plan.outputs.gen }}"
+          mkdir -p "results/focused-evo-gen-${GEN}"
+          node engine/scripts/roundrobin.mjs \
+            --aggregateShards shard-downloads \
+            --out "${{ github.workspace }}/results/focused-evo-gen-${GEN}"
+
+      - name: Show merged leaderboard
+        if: always()
+        run: |
+          GEN="${{ needs.plan.outputs.gen }}"
+          cat "results/focused-evo-gen-${GEN}/roundrobin-results.txt" 2>/dev/null || echo '(no results file)'
+
+      - name: Run wrapper --aggregateOnly
+        env:
+          OPPONENT_TURN_CROSSINGS: ${{ inputs.betaMode == 'true' && '1' || '0' }}
+          MND_BOT_BETA_MODE: ${{ inputs.betaMode == 'true' && '1' || '0' }}
+        run: |
+          GEN="${{ needs.plan.outputs.gen }}"
+          FAILED="${{ steps.failed-shards.outputs.failed }}"
+          TOTAL="${{ steps.failed-shards.outputs.total }}"
+          FAIL_FLAGS=""
+          if [ -n "$FAILED" ]; then
+            FAIL_FLAGS="--failedShards $FAILED --totalShards $TOTAL"
+          fi
+
+          node engine/scripts/evolve-underneath-focused.mjs \
+            --region "${{ inputs.region }}" \
+            --deckPath "${{ inputs.deckPath }}" \
+            --generations 1 \
+            --populationSize ${{ inputs.populationSize }} \
+            --gamesPerPair ${{ inputs.gamesPerPair }} \
+            --workers ${{ inputs.workers }} \
+            --maxTurns ${{ inputs.maxTurns }} \
+            --gameTimeoutSec ${{ inputs.timeoutSec }} \
+            --seed ${{ inputs.seed }} \
+            --methodology "${{ inputs.methodology }}" \
+            --startGeneration "$GEN" \
+            --out "${{ github.workspace }}/results" \
+            --aggregateOnly "${{ github.workspace }}/plan-scratch/plan.json" \
+            --resultsDir "${{ github.workspace }}/results/focused-evo-gen-${GEN}" \
+            $FAIL_FLAGS
+
+      - name: Copy plan.json into per-gen results for archival
+        run: |
+          GEN="${{ needs.plan.outputs.gen }}"
+          cp plan-scratch/plan.json "results/focused-evo-gen-${GEN}/plan.json" || true
+          cp -r plan-scratch/focused-evo-scratch "results/focused-evo-gen-${GEN}/field-files" 2>/dev/null || true
 
       - name: Show updated genlog tail
         if: always()

@@ -32,6 +32,32 @@
 //   also gives us a "never regress" guarantee -- a bad generation doesn't dethrone a good
 //   champion just because the mutations happened to draw well.
 //
+// Sharded execution modes (2026-09-05, added to unblock Cald v1 gen 4 hitting the GH 6h cap):
+//   Default invocation (no --planOnly / --aggregateOnly) runs the full sequential pipeline
+//   generation-by-generation, exactly as before -- backward-compat for local runs and the
+//   single-runner fallback if sharding is ever unavailable.
+//
+//   Sharded workflow splits each gen into three jobs:
+//     plan   : `--planOnly <planPath>`                        -- reads genlog, computes
+//                                                                best-so-far, generates mutations,
+//                                                                writes field files + plan JSON.
+//                                                                No roundrobin, no genlog append.
+//     shard  : `roundrobin.mjs --shardIndex N --shardCount M` -- invoked directly, in parallel.
+//     aggregate: `--aggregateOnly <planPath> --resultsDir <d>` -- reads plan + merged leaderboard
+//                                                                (already produced by
+//                                                                `roundrobin.mjs --aggregateShards`),
+//                                                                runs champion selection, appends
+//                                                                genlog row.
+//
+//   plan.json persists the mutation vectors + best-so-far snapshot across the plan->aggregate
+//   process boundary. Regenerating mutations in aggregate (rather than reading plan.json) would
+//   be deterministic today but fragile -- a mutateWeights or seed-derivation change would
+//   silently desync the fields.
+//
+//   generations>1 is REJECTED in --planOnly / --aggregateOnly modes: each gen depends on the
+//   previous gen's genlog row, so a matrix-sharded workflow can only do one gen per invocation.
+//   Full sequential mode still supports >1 gens for local batches.
+//
 // Usage from engine/ :
 //   npm run build && node scripts/evolve-underneath-focused.mjs [OPTIONS]
 //
@@ -40,6 +66,7 @@
 //   --deckPath PATH           REQUIRED. Deck file for the region (e.g. engine/decks-experimental/
 //                             underneath-test-v2.json).
 //   --generations N           How many generations to run in this invocation. Default 1.
+//                             MUST be 1 when --planOnly or --aggregateOnly is set.
 //   --startGeneration N       Generation number to start at. Default = max(existing gen)+1 or 1.
 //   --populationSize N        Mutations per generation (in addition to baseline + best-so-far).
 //                             Default 4.
@@ -54,6 +81,23 @@
 //   --out DIR                 Output directory. Default engine/.
 //   --methodology TAG         Tag stored in genLog rows so this run's champions are distinguishable
 //                             from Shape-C rows. Default focused-underneath-v2.
+//
+// Sharded-mode options:
+//   --planOnly PATH           Write plan JSON to PATH, generate field files, then exit. Skips
+//                             roundrobin invocation and genlog append. See "Sharded execution
+//                             modes" above.
+//   --aggregateOnly PATH      Read plan JSON from PATH plus --resultsDir's merged leaderboard,
+//                             run champion selection, append genlog row, then exit.
+//   --resultsDir DIR          For --aggregateOnly: directory containing roundrobin-results.txt
+//                             (produced by `roundrobin.mjs --aggregateShards`). Required with
+//                             --aggregateOnly.
+//   --failedShards CSV        For --aggregateOnly: comma-separated shard indices that failed
+//                             (e.g. "1,3"). Empty = all shards succeeded. When non-empty, the
+//                             appended genlog row carries a `partialShards` field so downstream
+//                             analysis can caveat conclusions drawn from partial-data gens.
+//   --totalShards N           For --aggregateOnly: total shard count for the run (used with
+//                             --failedShards to record partialShards.totalShards). Required
+//                             when --failedShards is non-empty.
 //
 // Methodology tag: rows appended to evolution-generations.jsonl carry methodology =
 // "focused-underneath-v2" by default so a future run's best-so-far lookup can filter to only
@@ -103,6 +147,38 @@ const WEIGHTS_PATH = resolve(arg('weights', join(REPO_ROOT, 'engine', 'data', 'b
 const GEN_LOG_PATH = resolve(arg('genLog', join(REPO_ROOT, 'engine', 'evolution-generations.jsonl')));
 const OUT_DIR = resolve(arg('out', join(here, '..')));
 const METHODOLOGY = arg('methodology', 'focused-underneath-v2');
+
+// Sharded-mode flags. All three modes are mutually exclusive; enforcement below.
+const PLAN_ONLY_PATH = arg('planOnly', null);
+const AGGREGATE_ONLY_PATH = arg('aggregateOnly', null);
+const RESULTS_DIR = arg('resultsDir', null);
+const FAILED_SHARDS_RAW = arg('failedShards', '');
+const TOTAL_SHARDS_RAW = arg('totalShards', null);
+
+if (PLAN_ONLY_PATH && AGGREGATE_ONLY_PATH) {
+  console.error('--planOnly and --aggregateOnly are mutually exclusive');
+  process.exit(1);
+}
+const MODE = PLAN_ONLY_PATH ? 'planOnly' : (AGGREGATE_ONLY_PATH ? 'aggregateOnly' : 'full');
+if (MODE !== 'full' && GENERATIONS_TO_RUN !== 1) {
+  console.error(
+    `--generations must be 1 when --${MODE} is set (workflow enforces one gen per invocation; ` +
+    'see docs/plans/per-region-training-methodology.md §1 for the session-driven per-gen pattern).'
+  );
+  process.exit(1);
+}
+if (MODE === 'aggregateOnly' && !RESULTS_DIR) {
+  console.error('--aggregateOnly requires --resultsDir DIR (containing roundrobin-results.txt from the merged shards)');
+  process.exit(1);
+}
+const FAILED_SHARD_INDICES = FAILED_SHARDS_RAW
+  ? FAILED_SHARDS_RAW.split(',').map((s) => Number(s.trim())).filter((n) => Number.isInteger(n))
+  : [];
+if (FAILED_SHARD_INDICES.length > 0 && !TOTAL_SHARDS_RAW) {
+  console.error('--failedShards requires --totalShards N (so the genlog row records the denominator)');
+  process.exit(1);
+}
+const TOTAL_SHARDS = TOTAL_SHARDS_RAW ? Number(TOTAL_SHARDS_RAW) : null;
 
 if (!EVOLVING_REGIONS.includes(REGION)) {
   console.error(`Region "${REGION}" is not in EVOLVING_REGIONS. Valid: ${EVOLVING_REGIONS.join(', ')}`);
@@ -351,7 +427,9 @@ function invokeRoundRobin(gen, focusJsonlPath, extrasPath, genOutDir) {
   }
 }
 
-/** Parse the leaderboard txt into an array of { rank, label, seriesW, seriesL, seriesD, points }. */
+/** Parse the leaderboard txt into an array of { rank, label, seriesW, seriesL, seriesD, points }.
+ *  Works for BOTH the non-aggregator writer (roundrobin.mjs main flow) and the aggregator writer
+ *  (`--aggregateShards`) -- both emit the same "Rank Label W L D Points Games(W-L-D)" columns. */
 function parseLeaderboard(resultsPath) {
   const text = readFileSync(resultsPath, 'utf-8');
   const lines = text.split(/\r?\n/);
@@ -372,57 +450,51 @@ function parseLeaderboard(resultsPath) {
 }
 
 // ---------------------------------------------------------------------------
-// Main loop
+// Phase helpers -- structured so plan-only, aggregate-only, and full modes all
+// go through the same code paths.
 // ---------------------------------------------------------------------------
 
-const weightsFile = existsSync(WEIGHTS_PATH) ? loadWeightsFile(WEIGHTS_PATH) : null;
-const scratchDir = join(OUT_DIR, 'focused-evo-scratch');
-if (!existsSync(scratchDir)) mkdirSync(scratchDir, { recursive: true });
-
-const startingRows = readMethodologyRows();
-const startingBest = bestSoFarFrom(startingRows);
-const inferredStartGen = startingRows.length > 0 ? startingRows[startingRows.length - 1].gen + 1 : 1;
-const START_GEN = START_GENERATION_OVERRIDE ? Number(START_GENERATION_OVERRIDE) : inferredStartGen;
-
-console.log('=== Focused per-region evolution ===');
-console.log(`Region:                ${REGION}`);
-console.log(`Deck:                  ${DECK_PATH_RAW}`);
-console.log(`Methodology tag:       ${METHODOLOGY}`);
-console.log(`Existing genlog rows:  ${startingRows.length}`);
-console.log(`Best-so-far seed:      ${startingBest ? `gen ${startingBest.gen} (${startingBest.points?.toFixed(1) ?? '?'} pts)` : 'BASELINE (first run)'}`);
-console.log(`Starting at gen:       ${START_GEN}`);
-console.log(`Running:               ${GENERATIONS_TO_RUN} generation(s)`);
-console.log(`Population per gen:    ${POPULATION_SIZE} mutations + baseline + best-so-far = ${POPULATION_SIZE + 2} target entrants`);
-console.log(`Opponents:             ${OPPONENT_REGIONS.length} (${OPPONENT_REGIONS.join(', ')})`);
-console.log(`Games per pair:        ${GAMES_PER_PAIR}`);
-console.log(`Workers:               ${WORKERS}`);
-console.log(`Mutation sigma:        ${MUTATION_SIGMA ?? 'engine default (0.15)'}`);
-console.log('');
-
-let bestSoFar = startingBest;
-
-for (let g = 0; g < GENERATIONS_TO_RUN; g += 1) {
-  const gen = START_GEN + g;
-  console.log(`\n========== Generation ${gen} (${g + 1} of ${GENERATIONS_TO_RUN}) ==========`);
-
-  // Mutate: parent = best-so-far weights (or baseline if no best-so-far yet)
-  const parent = bestSoFar?.weights ?? { ...BASELINE_WEIGHTS };
+/** PLAN PHASE. Generate mutations, write field files, return the plan object.
+ *  Pure -- no roundrobin invocation, no genlog append. Same code called in full and planOnly
+ *  modes so the sharded pipeline produces bit-identical field files to the sequential one. */
+function runPlan(gen, prevBestSoFar, scratchDir, weightsFile) {
+  // Mutate: parent = best-so-far weights (or baseline if no best-so-far yet).
+  const parent = prevBestSoFar?.weights ?? { ...BASELINE_WEIGHTS };
   const rng = createSeededRng((BASE_SEED ^ (gen * 2654435761)) >>> 0);
   const mutOpts = MUTATION_SIGMA != null ? { sigmaRelative: Number(MUTATION_SIGMA) } : undefined;
   const mutations = [];
   for (let i = 0; i < POPULATION_SIZE; i += 1) mutations.push(mutateWeights(parent, rng, mutOpts));
 
-  // Build field files
-  const { focusJsonlPath, extrasPath } = writeFieldFiles(gen, bestSoFar, mutations, scratchDir, weightsFile);
+  const { focusJsonlPath, extrasPath } = writeFieldFiles(gen, prevBestSoFar, mutations, scratchDir, weightsFile);
   console.log(`[gen ${gen}] Wrote focus JSONL: ${focusJsonlPath}`);
   console.log(`[gen ${gen}] Wrote extras:      ${extrasPath}`);
 
-  // Run round-robin
-  const genOutDir = join(OUT_DIR, `focused-evo-gen-${gen}`);
-  invokeRoundRobin(gen, focusJsonlPath, extrasPath, genOutDir);
+  return {
+    gen,
+    region: REGION,
+    deckPath: DECK_PATH_RAW,
+    methodology: METHODOLOGY,
+    populationSize: POPULATION_SIZE,
+    baseSeed: BASE_SEED,
+    mutationSigma: MUTATION_SIGMA != null ? Number(MUTATION_SIGMA) : null,
+    bestSoFar: prevBestSoFar,
+    mutations,
+    focusJsonlPath,
+    extrasPath,
+    generatedAt: new Date().toISOString(),
+  };
+}
 
-  // Parse leaderboard, find best target-region entrant this generation
-  const resultsPath = join(genOutDir, 'roundrobin-results.txt');
+/** AGGREGATE PHASE. Read the merged leaderboard from `resultsDir`, run champion selection using
+ *  the mutations + bestSoFar from `plan`, append a genlog row. Returns { genRow, newBestSoFar }.
+ *
+ *  `failedShardIndices` / `totalShards` are only meaningful in sharded mode; when non-empty they
+ *  cause a `partialShards` field to appear on the genlog row so downstream analysis can flag
+ *  gens that ran on partial data. Full-mode callers pass [] and null respectively. */
+function runAggregate(plan, resultsDir, failedShardIndices, totalShards) {
+  const { gen, mutations, bestSoFar } = plan;
+
+  const resultsPath = join(resultsDir, 'roundrobin-results.txt');
   if (!existsSync(resultsPath)) {
     console.error(`[gen ${gen}] Expected results file not found: ${resultsPath}`);
     process.exit(1);
@@ -490,6 +562,10 @@ for (let g = 0; g < GENERATIONS_TO_RUN; g += 1) {
   //   focusPoints:     top-target's points this gen (canonical fitness for best-so-far logic)
   //   bestSoFarUpdated: bool (did the anchor change?)
   //   allTargetPoints: full target-entries leaderboard, for later analysis
+  //   partialShards:   OPTIONAL. Only present when the workflow reported failed shards; carries
+  //                    { failedShardIndices, totalShards } so downstream analysis can caveat any
+  //                    conclusions drawn from partial-data gens. Absent = all shards succeeded
+  //                    (or the run wasn't sharded).
   const genRow = {
     gen, region: REGION,
     championWeights: winningWeights,
@@ -506,13 +582,94 @@ for (let g = 0; g < GENERATIONS_TO_RUN; g += 1) {
     methodology: METHODOLOGY,
     appendedAt: new Date().toISOString(),
   };
+  if (failedShardIndices && failedShardIndices.length > 0) {
+    genRow.partialShards = {
+      failedShardIndices: [...failedShardIndices].sort((a, b) => a - b),
+      totalShards,
+    };
+    console.log(`[gen ${gen}]   PARTIAL-SHARD run: ${failedShardIndices.length}/${totalShards} shards failed (indices: ${genRow.partialShards.failedShardIndices.join(', ')})`);
+  }
   appendFileSync(GEN_LOG_PATH, JSON.stringify(genRow) + '\n', 'utf-8');
   console.log(`[gen ${gen}] Appended row to ${GEN_LOG_PATH}`);
 
-  // Update in-memory best-so-far for the next iteration
-  if (shouldUpdateBestSoFar) {
-    bestSoFar = { gen, weights: winningWeights, points: topTarget.points };
+  const newBestSoFar = shouldUpdateBestSoFar
+    ? { gen, weights: winningWeights, points: topTarget.points, origin: winningNote }
+    : bestSoFar;
+  return { genRow, newBestSoFar };
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+const weightsFile = existsSync(WEIGHTS_PATH) ? loadWeightsFile(WEIGHTS_PATH) : null;
+const scratchDir = join(OUT_DIR, 'focused-evo-scratch');
+if (!existsSync(scratchDir)) mkdirSync(scratchDir, { recursive: true });
+
+const startingRows = readMethodologyRows();
+const startingBest = bestSoFarFrom(startingRows);
+const inferredStartGen = startingRows.length > 0 ? startingRows[startingRows.length - 1].gen + 1 : 1;
+const START_GEN = START_GENERATION_OVERRIDE ? Number(START_GENERATION_OVERRIDE) : inferredStartGen;
+
+console.log('=== Focused per-region evolution ===');
+console.log(`Mode:                  ${MODE}`);
+console.log(`Region:                ${REGION}`);
+console.log(`Deck:                  ${DECK_PATH_RAW}`);
+console.log(`Methodology tag:       ${METHODOLOGY}`);
+console.log(`Existing genlog rows:  ${startingRows.length}`);
+console.log(`Best-so-far seed:      ${startingBest ? `gen ${startingBest.gen} (${startingBest.points?.toFixed(1) ?? '?'} pts)` : 'BASELINE (first run)'}`);
+console.log(`Starting at gen:       ${START_GEN}`);
+console.log(`Running:               ${GENERATIONS_TO_RUN} generation(s)`);
+console.log(`Population per gen:    ${POPULATION_SIZE} mutations + baseline + best-so-far = ${POPULATION_SIZE + 2} target entrants`);
+console.log(`Opponents:             ${OPPONENT_REGIONS.length} (${OPPONENT_REGIONS.join(', ')})`);
+console.log(`Games per pair:        ${GAMES_PER_PAIR}`);
+console.log(`Workers:               ${WORKERS}`);
+console.log(`Mutation sigma:        ${MUTATION_SIGMA ?? 'engine default (0.15)'}`);
+console.log('');
+
+if (MODE === 'planOnly') {
+  // Plan-only: one gen, write plan JSON + field files, exit. No roundrobin, no genlog append.
+  const gen = START_GEN;
+  console.log(`\n========== Plan for generation ${gen} ==========`);
+  const plan = runPlan(gen, startingBest, scratchDir, weightsFile);
+  const planPathResolved = resolve(PLAN_ONLY_PATH);
+  const planDir = dirname(planPathResolved);
+  if (!existsSync(planDir)) mkdirSync(planDir, { recursive: true });
+  writeFileSync(planPathResolved, JSON.stringify(plan, null, 2) + '\n', 'utf-8');
+  console.log(`\n[gen ${gen}] Wrote plan JSON: ${planPathResolved}`);
+  console.log('=== Plan phase complete ===');
+  process.exit(0);
+}
+
+if (MODE === 'aggregateOnly') {
+  // Aggregate-only: read plan + merged leaderboard, run champion selection, append genlog row.
+  const planPathResolved = resolve(AGGREGATE_ONLY_PATH);
+  if (!existsSync(planPathResolved)) {
+    console.error(`--aggregateOnly plan file not found: ${planPathResolved}`);
+    process.exit(1);
   }
+  const plan = JSON.parse(readFileSync(planPathResolved, 'utf-8'));
+  console.log(`\n========== Aggregate for generation ${plan.gen} ==========`);
+  const resultsDirResolved = resolve(RESULTS_DIR);
+  runAggregate(plan, resultsDirResolved, FAILED_SHARD_INDICES, TOTAL_SHARDS);
+  console.log('\n=== Aggregate phase complete ===');
+  process.exit(0);
+}
+
+// Full sequential mode -- unchanged behavior. Runs plan -> roundrobin -> aggregate in-process for
+// each gen, threading best-so-far forward across the loop iterations.
+let bestSoFar = startingBest;
+for (let g = 0; g < GENERATIONS_TO_RUN; g += 1) {
+  const gen = START_GEN + g;
+  console.log(`\n========== Generation ${gen} (${g + 1} of ${GENERATIONS_TO_RUN}) ==========`);
+
+  const plan = runPlan(gen, bestSoFar, scratchDir, weightsFile);
+
+  const genOutDir = join(OUT_DIR, `focused-evo-gen-${gen}`);
+  invokeRoundRobin(gen, plan.focusJsonlPath, plan.extrasPath, genOutDir);
+
+  const { newBestSoFar } = runAggregate(plan, genOutDir, [], null);
+  bestSoFar = newBestSoFar;
 }
 
 console.log('\n=== Focused-evo run complete ===');
