@@ -18,10 +18,17 @@
 //   exactly the same shape as the successful round-robin. Opponent-vs-opponent pairs are skipped
 //   via roundrobin.mjs's --focusRegion flag (they'd be compute waste).
 //
-//   After the generation completes, the leaderboard's top Underneath entrant is compared to
-//   best-so-far: if the mutation cleanly outperformed best-so-far in series points, it becomes
-//   the new best-so-far. Otherwise best-so-far persists to next generation. Baseline being the
-//   winner is a "no mutation improved; hold" outcome that also keeps best-so-far.
+//   After the generation completes, the target-region leaderboard's top entrant is compared to
+//   the previous anchor's in-gen score. Any entrant (mutation, baseline, or the anchor itself)
+//   can become the new best-so-far -- update happens IFF the winner is NOT the anchor AND the
+//   winner's points STRICTLY beat the anchor's in-gen score. Ties hold the current anchor.
+//   Baseline strictly beating the mutation-anchor is a legitimate "baseline is genuinely the
+//   strongest weight vector on this deck right now, so gen N+1 should mutate from baseline"
+//   signal -- the wrapper honors it, and the design intent is "the seed for next gen's
+//   mutations is always the strongest thing we've found so far, regardless of origin."
+//   Header note updated 2026-09-05 after Arderial gen 4 exposed that the prior header text
+//   ("baseline being the winner is a 'no mutation improved; hold' outcome") was inconsistent
+//   with the code -- the code is correct per the design intent above; the header was stale.
 //
 // Why this exists alongside evolve-generation.mjs:
 //   evolve-generation.mjs uses a wider population (~8-30) with only 3 rotating cross-region
