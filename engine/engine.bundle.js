@@ -43031,6 +43031,135 @@ function pickBestReactiveAnswer(state, cardDb, botPlayerId, obligation, policyRn
   if (bestOptions.length === 0) return void 0;
   return pick(bestOptions, policyRng);
 }
+function pickBestAttackPreCombatChoices(state, cardDb, botPlayerId, attackerInstanceId, defenderInstanceId, policyRng, weights) {
+  const weavePrompts = previewWeaveChoices(state, cardDb, botPlayerId, attackerInstanceId, defenderInstanceId);
+  const targetPrompts = previewPreCombatTargetChoices(state, cardDb, botPlayerId, attackerInstanceId, defenderInstanceId);
+  if (weavePrompts.length === 0 && targetPrompts.length === 0) return {};
+  const originalHandIds = new Set(state.players.get(botPlayerId)?.hand.map((c2) => c2.instanceId) ?? []);
+  const chosen = {};
+  const scoreCandidate = (extras) => {
+    const simRng = createSeededRng(1);
+    const clone = structuredClone(state);
+    const declaration = {
+      attackerInstanceId,
+      defenderInstanceId,
+      ...extras.weaveChoices ? { weaveChoices: extras.weaveChoices } : {},
+      ...extras.preCombatTargetChoices ? { preCombatTargetChoices: extras.preCombatTargetChoices } : {}
+    };
+    catchResumeIllegal(clone, () => attemptDeclareAttack(clone, cardDb, botPlayerId, declaration, simRng, () => {
+    }));
+    const budget = { remaining: DEFAULT_NODE_BUDGET_PER_CANDIDATE };
+    const crossingBudget = { remaining: OPPONENT_TURN_CROSSINGS };
+    return scoreWithLookahead(clone, cardDb, botPlayerId, simRng, budget, originalHandIds, crossingBudget, weights);
+  };
+  for (const prompt of weavePrompts) {
+    const candidates = [{ skip: true }];
+    for (const opt of prompt.options) {
+      if (opt.canGiveToSelf) candidates.push({ partnerInstanceId: opt.partnerInstanceId, direction: "toSelf" });
+      if (opt.canTakeFromSelf) candidates.push({ partnerInstanceId: opt.partnerInstanceId, direction: "fromSelf" });
+    }
+    let bestScore = -Infinity;
+    let bestOptions = [];
+    for (const candidate of candidates) {
+      const trial = {
+        weaveChoices: { ...chosen.weaveChoices ?? {}, [prompt.selfInstanceId]: candidate },
+        ...chosen.preCombatTargetChoices ? { preCombatTargetChoices: chosen.preCombatTargetChoices } : {}
+      };
+      const score = scoreCandidate(trial);
+      if (score > bestScore) {
+        bestScore = score;
+        bestOptions = [candidate];
+      } else if (score === bestScore) bestOptions.push(candidate);
+    }
+    if (bestOptions.length > 0) {
+      chosen.weaveChoices = { ...chosen.weaveChoices ?? {}, [prompt.selfInstanceId]: pick(bestOptions, policyRng) };
+    }
+  }
+  for (const prompt of targetPrompts) {
+    const key = preCombatChoiceKey(prompt.selfInstanceId, prompt.clauseName);
+    const candidates = [{ skip: true }];
+    for (const target of prompt.pool) candidates.push({ chosenInstanceId: target.instanceId });
+    let bestScore = -Infinity;
+    let bestOptions = [];
+    for (const candidate of candidates) {
+      const trial = {
+        ...chosen.weaveChoices ? { weaveChoices: chosen.weaveChoices } : {},
+        preCombatTargetChoices: { ...chosen.preCombatTargetChoices ?? {}, [key]: candidate }
+      };
+      const score = scoreCandidate(trial);
+      if (score > bestScore) {
+        bestScore = score;
+        bestOptions = [candidate];
+      } else if (score === bestScore) bestOptions.push(candidate);
+    }
+    if (bestOptions.length > 0) {
+      chosen.preCombatTargetChoices = { ...chosen.preCombatTargetChoices ?? {}, [key]: pick(bestOptions, policyRng) };
+    }
+  }
+  return chosen;
+}
+function pickBestOpponentHandChoice(state, cardDb, botPlayerId, obligation, policyRng, weights) {
+  if (obligation.pool.length === 0) return [];
+  const originalHandIds = new Set(state.players.get(botPlayerId)?.hand.map((c2) => c2.instanceId) ?? []);
+  const minCount = Math.max(0, Math.min(obligation.min, obligation.pool.length));
+  const maxCount = Math.min(obligation.max, obligation.pool.length);
+  const scoreSubset = (subset) => {
+    const simRng = createSeededRng(1);
+    const clone = structuredClone(state);
+    catchResumeIllegal(clone, () => resolveOpponentHandChoice(clone, cardDb, subset, simRng, () => {
+    }));
+    const budget = { remaining: DEFAULT_NODE_BUDGET_PER_CANDIDATE };
+    const crossingBudget = { remaining: OPPONENT_TURN_CROSSINGS };
+    return scoreWithLookahead(clone, cardDb, botPlayerId, simRng, budget, originalHandIds, crossingBudget, weights);
+  };
+  if (obligation.pool.length <= 6) {
+    let bestScore = -Infinity;
+    let bestOptions = [];
+    const n = obligation.pool.length;
+    for (let mask = 0; mask < 1 << n; mask += 1) {
+      const subset = [];
+      for (let i = 0; i < n; i += 1) if (mask & 1 << i) subset.push(obligation.pool[i]);
+      if (subset.length < minCount || subset.length > maxCount) continue;
+      const score = scoreSubset(subset);
+      if (score > bestScore) {
+        bestScore = score;
+        bestOptions = [subset];
+      } else if (score === bestScore) bestOptions.push(subset);
+    }
+    if (bestOptions.length === 0) return [];
+    return pick(bestOptions, policyRng);
+  }
+  const remaining = new Set(obligation.pool);
+  const chosen = [];
+  if (minCount > 0) {
+    const shuffled = [...obligation.pool];
+    shuffle(shuffled, policyRng);
+    const seed = shuffled.slice(0, minCount);
+    chosen.push(...seed);
+    for (const id of seed) remaining.delete(id);
+  }
+  let currentScore = scoreSubset(chosen);
+  let evaluations = 1;
+  while (chosen.length < maxCount && remaining.size > 0 && evaluations < 128) {
+    let bestAdd;
+    let bestAddScore = currentScore;
+    for (const candidate of remaining) {
+      if (evaluations >= 128) break;
+      const trial = [...chosen, candidate];
+      const score = scoreSubset(trial);
+      evaluations += 1;
+      if (score > bestAddScore) {
+        bestAddScore = score;
+        bestAdd = candidate;
+      }
+    }
+    if (bestAdd === void 0) break;
+    chosen.push(bestAdd);
+    remaining.delete(bestAdd);
+    currentScore = bestAddScore;
+  }
+  return chosen;
+}
 function capRootCandidates(moves) {
   if (moves.length <= MAX_ROOT_CANDIDATES) return moves;
   const passMove = moves.find((m) => m.type === "advancePhase");
@@ -43062,26 +43191,29 @@ function pickBestMove(state, cardDb, botPlayerId, moves, policyRng, weights) {
   for (const { move, flatScore } of flatResults) {
     let score;
     let preferredChoices;
+    let attackExtras;
     if (deepEligible.has(move)) {
       const simRng = createSeededRng(1);
       const budget = { remaining: DEFAULT_NODE_BUDGET_PER_CANDIDATE };
       const crossingBudget = { remaining: OPPONENT_TURN_CROSSINGS };
       preferredChoices = discoverPreferredSubChoicesDiagnosed(state, cardDb, botPlayerId, move, simRng, originalHandIds, baselineScore, weights);
+      attackExtras = move.type === "attack" ? pickBestAttackPreCombatChoices(state, cardDb, botPlayerId, move.attackerInstanceId, move.defenderInstanceId, policyRng, weights) : {};
       const clone = structuredClone(state);
       const applied = applyMove(clone, cardDb, botPlayerId, move, simRng, simRng, [], () => {
-      }, preferredChoices);
+      }, preferredChoices, attackExtras);
       if (applied === "unsupported") continue;
       resolveScoringPauses(clone, cardDb, simRng);
       score = scoreWithLookahead(clone, cardDb, botPlayerId, simRng, budget, originalHandIds, crossingBudget, weights);
     } else {
       preferredChoices = {};
+      attackExtras = {};
       score = flatScore;
     }
     if (score > bestScore) {
       bestScore = score;
-      bestPicks = [{ move, preferredChoices }];
+      bestPicks = [{ move, preferredChoices, attackExtras }];
     } else if (score === bestScore) {
-      bestPicks.push({ move, preferredChoices });
+      bestPicks.push({ move, preferredChoices, attackExtras });
     }
   }
   if (bestPicks.length === 0) return void 0;
@@ -43527,7 +43659,7 @@ function resolveScoringPauses(state, cardDb, simRng) {
     })) return;
   }
 }
-function applyMove(state, cardDb, playerId, move, rng, policyRng, refusals, record, preferredChoices = {}) {
+function applyMove(state, cardDb, playerId, move, rng, policyRng, refusals, record, preferredChoices = {}, attackDeclarationExtras = {}) {
   const chosen = {};
   const slotAnswers = [];
   for (let guard = 0; guard < 32; guard += 1) {
@@ -43623,7 +43755,17 @@ function applyMove(state, cardDb, playerId, move, rng, policyRng, refusals, reco
       return "applied";
     }
     case "attack": {
-      const declaration = { attackerInstanceId: move.attackerInstanceId, defenderInstanceId: move.defenderInstanceId };
+      const declaration = {
+        attackerInstanceId: move.attackerInstanceId,
+        defenderInstanceId: move.defenderInstanceId,
+        // Bot pre-combat scoring, phase 2 (2026-09-06): fold in smart pre-collected answers
+        // when the caller supplied them. Absent (the lookahead-internal common case), the
+        // declaration stays a bare {attacker, defender} pair, matching pre-phase-2 behavior
+        // exactly -- each card's own pendingPreCombatTargetChoice / applyWeave falls back to
+        // its documented no-resolution default. See pickBestAttackPreCombatChoices.
+        ...attackDeclarationExtras.weaveChoices ? { weaveChoices: attackDeclarationExtras.weaveChoices } : {},
+        ...attackDeclarationExtras.preCombatTargetChoices ? { preCombatTargetChoices: attackDeclarationExtras.preCombatTargetChoices } : {}
+      };
       attemptDeclareAttack(state, cardDb, playerId, declaration, rng, record);
       return "applied";
     }
@@ -43720,6 +43862,11 @@ function takeBotAction(state, cardDb, botPlayerId, rng, policyRng, record, resol
       catchResumeIllegal(state, () => resolveReactiveOffer(state, cardDb, chosen, rng, record));
       return true;
     }
+    if (ownObligation.kind === "opponentHandChoice") {
+      const chosen = pickBestOpponentHandChoice(state, cardDb, botPlayerId, ownObligation, policyRng, weights);
+      catchResumeIllegal(state, () => resolveOpponentHandChoice(state, cardDb, chosen, rng, record));
+      return true;
+    }
     return dischargeObligation(state, cardDb, botPlayerId, ownObligation, rng, policyRng, record);
   }
   if (state.turnHandoffPending) {
@@ -43741,7 +43888,8 @@ function takeBotAction(state, cardDb, botPlayerId, rng, policyRng, record, resol
     const move = picked?.move ?? pickMoveExhaustingPhase(remaining, policyRng);
     if (!move) return false;
     const preferredChoices = picked?.move === move ? picked.preferredChoices : {};
-    const result = applyMove(state, cardDb, botPlayerId, move, rng, policyRng, [], record, preferredChoices);
+    const attackExtras = picked?.move === move ? picked.attackExtras : {};
+    const result = applyMove(state, cardDb, botPlayerId, move, rng, policyRng, [], record, preferredChoices, attackExtras);
     if (result === "applied") return true;
     remaining = remaining.filter((m) => m !== move);
   }
