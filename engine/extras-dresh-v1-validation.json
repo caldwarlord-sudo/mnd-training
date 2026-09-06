@@ -1,0 +1,98 @@
+[
+  {
+    "label": "d'Resh-Validation-Baseline",
+    "region": "d'Resh",
+    "deckPath": "app/resources/default-decks/default-dresh.json",
+    "weightsMode": "jsonl:d'Resh-Validation:1"
+  },
+  {
+    "label": "d'Resh-Validation-Gen1-Mut1",
+    "region": "d'Resh",
+    "deckPath": "app/resources/default-decks/default-dresh.json",
+    "weightsMode": "jsonl:d'Resh-Validation:2"
+  },
+  {
+    "label": "d'Resh-Validation-Gen1-Mut2",
+    "region": "d'Resh",
+    "deckPath": "app/resources/default-decks/default-dresh.json",
+    "weightsMode": "jsonl:d'Resh-Validation:3"
+  },
+  {
+    "label": "d'Resh-Validation-Gen4-Mut2",
+    "region": "d'Resh",
+    "deckPath": "app/resources/default-decks/default-dresh.json",
+    "weightsMode": "jsonl:d'Resh-Validation:4"
+  },
+  {
+    "label": "Arderial-shipped",
+    "region": "Arderial",
+    "deckPath": "app/resources/default-decks/default-arderial.json",
+    "weightsMode": "botweights:Arderial:Jaela"
+  },
+  {
+    "label": "Bograth-shipped",
+    "region": "Bograth",
+    "deckPath": "app/resources/default-decks/default-bograth.json",
+    "weightsMode": "botweights:Bograth:King Korg"
+  },
+  {
+    "label": "Cald-shipped",
+    "region": "Cald",
+    "deckPath": "app/resources/default-decks/default-cald.json",
+    "weightsMode": "botweights:Cald:Ashgar"
+  },
+  {
+    "label": "Core-shipped",
+    "region": "Core",
+    "deckPath": "app/resources/default-decks/default-core.json",
+    "weightsMode": "botweights:Core:Morag"
+  },
+  {
+    "label": "Kybar's Teeth-shipped",
+    "region": "Kybar's Teeth",
+    "deckPath": "app/resources/default-decks/default-kybars-teeth.json",
+    "weightsMode": "botweights:Kybar's Teeth:Emec"
+  },
+  {
+    "label": "Nar-shipped",
+    "region": "Nar",
+    "deckPath": "app/resources/default-decks/default-nar.json",
+    "weightsMode": "botweights:Nar:Aurorea"
+  },
+  {
+    "label": "Naroom-shipped",
+    "region": "Naroom",
+    "deckPath": "app/resources/default-decks/default-naroom.json",
+    "weightsMode": "botweights:Naroom:Eidon"
+  },
+  {
+    "label": "Orothe-shipped",
+    "region": "Orothe",
+    "deckPath": "app/resources/default-decks/default-orothe.json",
+    "weightsMode": "botweights:Orothe:Arosa"
+  },
+  {
+    "label": "Paradwyn-shipped",
+    "region": "Paradwyn",
+    "deckPath": "app/resources/default-decks/default-paradwyn.json",
+    "weightsMode": "botweights:Paradwyn:Boria"
+  },
+  {
+    "label": "Underneath-shipped",
+    "region": "Underneath",
+    "deckPath": "app/resources/default-decks/default-underneath.json",
+    "weightsMode": "botweights:Underneath:Motash"
+  },
+  {
+    "label": "Universal-shipped",
+    "region": "Universal",
+    "deckPath": "app/resources/default-decks/default-universal.json",
+    "weightsMode": "botweights:Universal:Rayje"
+  },
+  {
+    "label": "Weave-shipped",
+    "region": "Weave",
+    "deckPath": "app/resources/default-decks/default-weave.json",
+    "weightsMode": "botweights:Weave:Gia"
+  }
+]
