@@ -42650,6 +42650,8 @@ var DEFAULT_MAX_ACTIONS = 2e4;
 var DEFAULT_NODE_BUDGET_PER_CANDIDATE = 60;
 var MAX_ROOT_CANDIDATES = 40;
 var ROOT_DEEP_EVAL_CAP = 12;
+var ROOT_ATTACK_PRECOMBAT_TOPK = 3;
+var attackPrecombatCallCount = 0;
 var TRIAL_LOOKAHEAD_STEPS = 3;
 var SUB_CHOICE_DISCOVERY_BUDGET = 20;
 var OPPONENT_TURN_CROSSINGS = 0;
@@ -43032,6 +43034,7 @@ function pickBestReactiveAnswer(state, cardDb, botPlayerId, obligation, policyRn
   return pick(bestOptions, policyRng);
 }
 function pickBestAttackPreCombatChoices(state, cardDb, botPlayerId, attackerInstanceId, defenderInstanceId, policyRng, weights) {
+  attackPrecombatCallCount += 1;
   const weavePrompts = previewWeaveChoices(state, cardDb, botPlayerId, attackerInstanceId, defenderInstanceId);
   const targetPrompts = previewPreCombatTargetChoices(state, cardDb, botPlayerId, attackerInstanceId, defenderInstanceId);
   if (weavePrompts.length === 0 && targetPrompts.length === 0) return {};
@@ -43186,6 +43189,11 @@ function pickBestMove(state, cardDb, botPlayerId, moves, policyRng, weights) {
   const deepEligible = new Set(
     [...flatResults].sort((a, b) => b.flatScore - a.flatScore).slice(0, ROOT_DEEP_EVAL_CAP).map((r) => r.move)
   );
+  const attacksByFlatScore = flatResults.filter((r) => r.move.type === "attack").sort((a, b) => b.flatScore - a.flatScore);
+  const cutoffScore = attacksByFlatScore[ROOT_ATTACK_PRECOMBAT_TOPK - 1]?.flatScore ?? Number.NEGATIVE_INFINITY;
+  const attackPrecombatEligible = new Set(
+    attacksByFlatScore.filter((r) => r.flatScore >= cutoffScore).map((r) => r.move)
+  );
   let bestScore = -Infinity;
   let bestPicks = [];
   for (const { move, flatScore } of flatResults) {
@@ -43197,7 +43205,7 @@ function pickBestMove(state, cardDb, botPlayerId, moves, policyRng, weights) {
       const budget = { remaining: DEFAULT_NODE_BUDGET_PER_CANDIDATE };
       const crossingBudget = { remaining: OPPONENT_TURN_CROSSINGS };
       preferredChoices = discoverPreferredSubChoicesDiagnosed(state, cardDb, botPlayerId, move, simRng, originalHandIds, baselineScore, weights);
-      attackExtras = move.type === "attack" ? pickBestAttackPreCombatChoices(state, cardDb, botPlayerId, move.attackerInstanceId, move.defenderInstanceId, policyRng, weights) : {};
+      attackExtras = move.type === "attack" && attackPrecombatEligible.has(move) ? pickBestAttackPreCombatChoices(state, cardDb, botPlayerId, move.attackerInstanceId, move.defenderInstanceId, policyRng, weights) : {};
       const clone = structuredClone(state);
       const applied = applyMove(clone, cardDb, botPlayerId, move, simRng, simRng, [], () => {
       }, preferredChoices, attackExtras);
