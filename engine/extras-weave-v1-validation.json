@@ -24,6 +24,12 @@
     "weightsMode": "jsonl:Weave-Validation:4"
   },
   {
+    "label": "Weave-Validation-Gen5-Mut3",
+    "region": "Weave",
+    "deckPath": "app/resources/default-decks/default-weave.json",
+    "weightsMode": "jsonl:Weave-Validation:5"
+  },
+  {
     "label": "Arderial-shipped",
     "region": "Arderial",
     "deckPath": "app/resources/default-decks/default-arderial.json",
