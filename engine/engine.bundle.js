@@ -1305,6 +1305,8 @@ var PROMPT_META = {
   // Undream: "you may choose a Creature"
   "Baldar Amulet": { optional: true, intent: "harmful" },
   // Hammer: "you may discard a card"
+  "Black Stuff": { optional: true, intent: "beneficial" },
+  // Regenerate: "you may play one copy of Black Stuff from your discard pile"
   "Caboodle Kit": { optional: true, intent: "beneficial" },
   "Cloud Orshaa": { optional: true },
   // "discard UP TO four Arderial Spells"
@@ -1319,6 +1321,8 @@ var PROMPT_META = {
   // Scorch: "you may discard Ember Vard from play"
   "Everburning Wick": { optional: true, intent: "harmful" },
   // Really Short Fuse: "you may discard Everburning Wick from play to choose a Creature" (2026-08-31 retrofit)
+  "Fiend of Furoks": { optional: true, intent: "beneficial" },
+  // Reconstruct: "you can play a Furok from your discard pile"
   "Flame Control": { optional: true },
   // "Rearrange the energy on your Creatures AS YOU WISH"
   "Flame Spurt": { optional: true, intent: "harmful" },
@@ -1338,10 +1342,14 @@ var PROMPT_META = {
   // Imbue Spell: "you may place a d'Resh Spell"
   "Quor Pup": { optional: true, intent: "beneficial" },
   // Charge: "move UP TO two energy"
+  "Pruitt's Robe": { optional: true, intent: "beneficial" },
+  // Glimmer: "you may choose any one of your Creatures in play"
   Quirle: { optional: true, intent: "beneficial" },
   // Gift of Life: "you may choose any one Weave Creature"
   Rayalon: { optional: true, intent: "beneficial" },
   // Study: "you may place any one... Spell... into your hand"
+  Ruid: { optional: true, intent: "beneficial" },
+  // Mutate: "you may choose to have it be a Core Creature instead"
   "Sand Cape": { optional: true, intent: "beneficial" },
   // Memory: "you may play one d'Resh Creature"
   "Scout Bungaloo": { optional: true, intent: "beneficial" },
@@ -1356,6 +1364,8 @@ var PROMPT_META = {
   Thrybe: { optional: true, intent: "beneficial" },
   // Infuse: "you may discard Thrybe from play"
   "Toasted Yajo": { optional: true },
+  "Tomorrow's Jewel": { optional: true },
+  // Lore: "you may discard one card from your hand. If you do, draw one card"
   "Trulbble!": { optional: true },
   // "Discard UP TO four Trulbs you control"
   Trygar: { optional: true, intent: "beneficial" },
@@ -11776,6 +11786,8 @@ var TOTAL_ENERGY = 5;
 registerCardEffect("Heal", {
   spellMultiTargets: (state, cardDb) => allCreaturesInPlay(state, cardDb),
   spellMultiTargetAllocatesEnergy: true,
+  spellMultiTargetEnergyBudget: () => TOTAL_ENERGY,
+  // printed "a total of five energy"
   resolveSpell: (ctx) => {
     const pool3 = allCreaturesInPlay(ctx.state, ctx.cardDb);
     let remaining = TOTAL_ENERGY;
@@ -20611,11 +20623,11 @@ registerCardEffect("Phlouk", {
 });
 
 // src/cardEffects/regionLockedRelic.ts
-function applyRegionLockedRelic(state, cardDb, self, isEligible, rng) {
+function applyRegionLockedRelic(state, cardDb, self, region, rng) {
   const owner = state.players.get(self.controllerId);
   const magi = owner?.activeMagi;
   const magiDef = magi ? cardDb.get(magi.definitionKey) : void 0;
-  if (magiDef && isEligible(magiDef)) return;
+  if (magiDef && (magiDef.regions.includes(region) || magiDef.original_region === region)) return;
   if (owner) discardFromPlay(state, cardDb, owner, self.instanceId, void 0, void 0, rng);
 }
 
@@ -20646,7 +20658,7 @@ registerCardEffect("Tomes of the Great Library", {
   // standing-condition cadence Kybar's Fang etc. use). `regions.includes('Naroom')` catches
   // Naroom Shadow Magi too since Shadow conversion is a runtime state that does not mutate the
   // Magi's printed regions list.
-  onOwnTurnStart: (state, cardDb, self, rng) => applyRegionLockedRelic(state, cardDb, self, (magiDef) => magiDef.regions.includes("Naroom"), rng),
+  onOwnTurnStart: (state, cardDb, self, rng) => applyRegionLockedRelic(state, cardDb, self, "Naroom", rng),
   deckSearch: {
     count: 1,
     // Only Spells the Magi can actually pay for. Without this the player could pick a Spell they
@@ -20872,7 +20884,7 @@ registerCardEffect(GATE_TO_OMBOR_NAME, {
     Talisman: ["selfCostOverride", "offersPlayFromDeck", "addsToOwnDieRolls"]
   },
   canBeDiscardedFromPlay: () => false,
-  onOwnTurnStart: (state, cardDb, self, rng) => applyRegionLockedRelic(state, cardDb, self, (magiDef) => magiDef.regions.includes("Underneath"), rng),
+  onOwnTurnStart: (state, cardDb, self, rng) => applyRegionLockedRelic(state, cardDb, self, "Underneath", rng),
   // Talisman clause 1 (cost side): a TRUE zero when Amulet of Ombor is in play on `self`'s
   // controller side. `selfCostOverride` is the right hook -- `selfCostAdjustment`/`costModifier`
   // would floor at 1 (play.ts's `Math.max(1, ...)`), which doesn't express "ignoring all costs"
@@ -28817,7 +28829,7 @@ registerCardEffect("Koil", {
 // src/cardEffects/kybarsFang.ts
 registerCardEffect("Kybar's Fang", {
   canBeDiscardedFromPlay: () => false,
-  onOwnTurnStart: (state, cardDb, self, rng) => applyRegionLockedRelic(state, cardDb, self, (magiDef) => magiDef.regions.includes("Kybar's Teeth"), rng),
+  onOwnTurnStart: (state, cardDb, self, rng) => applyRegionLockedRelic(state, cardDb, self, "Kybar's Teeth", rng),
   resolvePower: (ctx) => {
     if (ctx.powerName !== "Ancient Protector") return;
     if (effectiveCardType(ctx.cardDb, ctx.source) !== "Relic") return;
@@ -28852,7 +28864,7 @@ registerCardEffect("Vault of Knowledge Key", {
   },
   canBeDiscardedFromPlay: () => false,
   preventsOwnHostileHandDiscard: () => true,
-  onOwnTurnStart: (state, cardDb, self, rng) => applyRegionLockedRelic(state, cardDb, self, (magiDef) => magiDef.regions.includes("Orothe"), rng),
+  onOwnTurnStart: (state, cardDb, self, rng) => applyRegionLockedRelic(state, cardDb, self, "Orothe", rng),
   // Animite Infusion clause 1: +1 use to every own-controller Relic's Powers.
   grantsExtraPowerUsePerTurn: (state, cardDb, self, target) => {
     if (target.controllerId !== self.controllerId) return 0;
@@ -28885,13 +28897,7 @@ registerCardEffect("Vault of Knowledge Key", {
 // src/cardEffects/giftOfTheWeave.ts
 registerCardEffect("Gift of the Weave", {
   canBeDiscardedFromPlay: () => false,
-  onOwnTurnStart: (state, cardDb, self, rng) => applyRegionLockedRelic(
-    state,
-    cardDb,
-    self,
-    (magiDef) => magiDef.regions.includes("Weave") || magiDef.original_region === "Weave",
-    rng
-  )
+  onOwnTurnStart: (state, cardDb, self, rng) => applyRegionLockedRelic(state, cardDb, self, "Weave", rng)
 });
 
 // src/cardEffects/ghazran.ts
@@ -36865,6 +36871,11 @@ registerCardEffect("Ripcurl", {
   spellTargets: (state, cardDb, playerId) => opposingCreatures(state, cardDb, playerId),
   spellMultiTargets: (state, cardDb, playerId, sourceInstanceId, firstChosenId) => opposingCreatures(state, cardDb, playerId).filter((c2) => c2.instanceId !== firstChosenId),
   spellMultiTargetAllocatesEnergy: true,
+  spellMultiTargetEnergyBudget: (state, cardDb, playerId, _sourceId, chosenTargetId) => {
+    if (!chosenTargetId) return 0;
+    const from = opposingCreatures(state, cardDb, playerId).find((c2) => c2.instanceId === chosenTargetId);
+    return Math.min(4, from?.currentEnergy ?? 0);
+  },
   resolveSpell: (ctx) => {
     if (ctx.chosenTargetId === void 0) return;
     const pool3 = opposingCreatures(ctx.state, ctx.cardDb, ctx.controllingPlayer.playerId);
@@ -37519,6 +37530,8 @@ registerCardEffect("Thunderquake", {
   maxXValue: 10,
   spellMultiTargets: (state, cardDb) => allCreaturesInPlay(state, cardDb),
   spellMultiTargetAllocatesEnergy: true,
+  spellMultiTargetEnergyBudget: (_state, _cardDb, _playerId, _sourceId, _chosenTargetId, chosenXValue) => Math.min(chosenXValue, 10),
+  // printed "X cannot be more than 10"
   resolveSpell: (ctx) => {
     let remaining = Math.min(getCounter(ctx.source, "startingX"), 10);
     if (remaining <= 0) return;
@@ -41081,6 +41094,11 @@ registerCardEffect("Topple", {
   ),
   spellMultiTargets: (state, cardDb, playerId) => allCreaturesInPlay(state, cardDb).filter((c2) => c2.controllerId !== playerId),
   spellMultiTargetAllocatesEnergy: true,
+  spellMultiTargetEnergyBudget: (state, cardDb, playerId, _sourceId, chosenTargetId) => {
+    if (!chosenTargetId) return 0;
+    const source = creaturesControlledBy(state, cardDb, playerId).find((c2) => c2.instanceId === chosenTargetId);
+    return source?.currentEnergy ?? 0;
+  },
   resolveSpell: (ctx) => {
     const source = creaturesControlledBy(ctx.state, ctx.cardDb, ctx.controllingPlayer.playerId).find(
       (c2) => c2.instanceId === ctx.chosenTargetId
