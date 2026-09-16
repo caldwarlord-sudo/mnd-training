@@ -2342,16 +2342,19 @@ function discardEnergy(state, cardDb, instance, amount, cause = "power", causedB
           }
         }
       }
-      if ((cause === "power" || cause === "spell") && owner) {
-        const contributors = owner.activeMagi ? [owner.activeMagi, ...owner.inPlay] : [...owner.inPlay];
-        for (const contributor of contributors) {
-          for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
-            const floor = contributorEffect.grantsEnergyFloorTo?.(state, cardDb, contributor, instance);
-            if (floor !== void 0) {
-              const resultingEnergy = (instance.currentEnergy ?? 0) - actualAmount;
-              if (resultingEnergy < floor) {
-                actualAmount = Math.max(0, (instance.currentEnergy ?? 0) - floor);
-              }
+    }
+  }
+  if (cause === "power" || cause === "spell") {
+    const floorOwner = state.players.get(instance.controllerId);
+    if (floorOwner) {
+      const contributors = floorOwner.activeMagi ? [floorOwner.activeMagi, ...floorOwner.inPlay] : [...floorOwner.inPlay];
+      for (const contributor of contributors) {
+        for (const contributorEffect of effectsFor(state, cardDb, contributor)) {
+          const floor = contributorEffect.grantsEnergyFloorTo?.(state, cardDb, contributor, instance);
+          if (floor !== void 0) {
+            const resultingEnergy = (instance.currentEnergy ?? 0) - actualAmount;
+            if (resultingEnergy < floor) {
+              actualAmount = Math.max(0, (instance.currentEnergy ?? 0) - floor);
             }
           }
         }
@@ -4998,6 +5001,7 @@ function handDiscardCostWithRegionSwap(state, cardDb, playerId, sourceInstanceId
   const effect = getCardEffectByName(dispatchDef.name);
   const resolved = effect?.handDiscardCost ? resolvePerPowerField(effect.handDiscardCost, powerName) : void 0;
   if (!resolved) return void 0;
+  if (resolved.condition && !resolved.condition(state, cardDb, playerId)) return void 0;
   const previous = state.activeRegionSwap;
   state.activeRegionSwap = swap ?? null;
   try {
@@ -18692,15 +18696,20 @@ registerCardEffect("Zaya", {
 });
 
 // src/cardEffects/fogHyren.ts
+function magiIsBograth(state, cardDb, playerId) {
+  const magi = state.players.get(playerId)?.activeMagi;
+  if (!magi) return false;
+  return cardDb.get(magi.definitionKey)?.regions.includes("Bograth") ?? false;
+}
 registerCardEffect("Fog Hyren", {
-  handDiscardCost: { count: "any" },
+  handDiscardCost: {
+    count: "any",
+    condition: (state, cardDb, playerId) => !magiIsBograth(state, cardDb, playerId)
+  },
   resolvePower: (ctx) => {
     if (ctx.powerName !== "Obscure Knowledge") return;
     drawCards(ctx.state, ctx.cardDb, ctx.controllingPlayer, 2);
-    const magi = ctx.controllingPlayer.activeMagi;
-    const magiDef = magi ? ctx.cardDb.get(magi.definitionKey) : void 0;
-    const isBograth = magiDef?.regions.includes("Bograth") ?? false;
-    if (isBograth) return;
+    if (magiIsBograth(ctx.state, ctx.cardDb, ctx.controllingPlayer.playerId)) return;
     const id = (ctx.chosenHandCardIds ?? []).find((cid) => ctx.controllingPlayer.hand.some((c2) => c2.instanceId === cid));
     if (id) discardFromHand(ctx.state, ctx.cardDb, ctx.controllingPlayer, [id], void 0, ctx.rng);
   },
@@ -22297,7 +22306,13 @@ registerCardEffect("Heart of Paradise", {
     }
     if (anyDefeated) checkMagiDefeats(state, cardDb);
   },
-  survivesOwnMagiDefeat: () => true,
+  // Grant survival to HoP ITSELF only, so it stays in play long enough for `onOwnMagiDefeated`
+  // below to transfer it via `gainControl`. Every other in-play card must go through the normal
+  // Magi-defeat wipe. The zero-arg `() => true` this used to be was a pre-Hubdra's-Chest-widening
+  // shape (survivesOwnMagiDefeat had no `self` param before 2026-07-27) that made this card grant
+  // survival to EVERY sibling under the widened broadcast at `energy.ts#defeatMagi`, silently
+  // protecting the whole board on Magi defeat (playtest 2026-09-15).
+  survivesOwnMagiDefeat: (state, cardDb, magi, card, self) => card.instanceId === self.instanceId,
   onOwnMagiDefeated: (state, cardDb, self, magi) => {
     if (magi.controllerId !== self.controllerId) return;
     const opponent = getOpponents(state, self.controllerId)[0];
