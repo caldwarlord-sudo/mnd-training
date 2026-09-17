@@ -20164,24 +20164,26 @@ registerCardEffect("Chelon", {
 
 // src/cardEffects/geoh.ts
 registerCardEffect("Geoh", {
-  deckTopReveal: { count: 3 },
+  deckTopReveal: { count: 3, maxPerType: { Creature: 1, Relic: 1, Spell: 1 } },
   resolvePower: (ctx) => {
     if (ctx.powerName !== "Excavate") return;
     const player = ctx.controllingPlayer;
     const top = player.deck.slice(0, 3);
     const topIds = top.map((c2) => c2.instanceId);
     const chosenIds = (ctx.chosenDeckTopIds ?? []).filter((id) => topIds.includes(id));
-    const byType = /* @__PURE__ */ new Map();
+    const keptIds = /* @__PURE__ */ new Set();
+    const seenTypes = /* @__PURE__ */ new Set();
     for (const id of chosenIds) {
       const card = top.find((c2) => c2.instanceId === id);
       const type = ctx.cardDb.get(card.definitionKey)?.card_type ?? "";
-      const count = byType.get(type) ?? 0;
-      if ((type === "Creature" || type === "Relic" || type === "Spell") && count >= 1) return;
-      byType.set(type, count + 1);
+      if (type !== "Creature" && type !== "Relic" && type !== "Spell") continue;
+      if (seenTypes.has(type)) continue;
+      seenTypes.add(type);
+      keptIds.add(id);
     }
     for (const id of topIds) {
       const card = removeFromZone(player, "deck", id);
-      if (chosenIds.includes(id)) {
+      if (keptIds.has(id)) {
         player.hand.push(card);
       } else {
         moveToDiscardPile(ctx.state, player, card);
