@@ -886,6 +886,23 @@ function magiStackForbiddenRegions(card) {
 function copyLimitName(card) {
   return card.alternate ?? card.name;
 }
+function copyLimit(card) {
+  const match = card.text?.match(/deck may contain up to (\w+) copies of/i);
+  if (!match) return MAX_COPIES_PER_NAME;
+  const NUMBER_WORDS = {
+    one: 1,
+    two: 2,
+    three: 3,
+    four: 4,
+    five: 5,
+    six: 6,
+    seven: 7,
+    eight: 8,
+    nine: 9,
+    ten: 10
+  };
+  return NUMBER_WORDS[match[1].toLowerCase()] ?? MAX_COPIES_PER_NAME;
+}
 function magiIdentityNames(def) {
   const names = [def.name];
   if (def.alternate) {
@@ -977,7 +994,8 @@ function validateDeck(cardDb, deck) {
     }
     mainDeckSize += count;
     const limitName = copyLimitName(def);
-    countsByLimitName.set(limitName, (countsByLimitName.get(limitName) ?? 0) + count);
+    const existing = countsByLimitName.get(limitName);
+    countsByLimitName.set(limitName, { count: (existing?.count ?? 0) + count, rep: existing?.rep ?? def });
   }
   if (mainDeckSize < MIN_MAIN_DECK_SIZE) {
     issues.push({
@@ -985,11 +1003,12 @@ function validateDeck(cardDb, deck) {
       message: `Main deck has ${mainDeckSize} cards, needs at least ${MIN_MAIN_DECK_SIZE}`
     });
   }
-  for (const [name, count] of countsByLimitName) {
-    if (count > MAX_COPIES_PER_NAME) {
+  for (const [name, { count, rep }] of countsByLimitName) {
+    const limit = copyLimit(rep);
+    if (count > limit) {
       issues.push({
         code: "too_many_copies",
-        message: `${name}: ${count} copies (max ${MAX_COPIES_PER_NAME}, including Alternates)`
+        message: `${name}: ${count} copies (max ${limit}, including Alternates)`
       });
     }
   }
@@ -44875,6 +44894,7 @@ export {
   confirmRegionSwapForPower,
   confirmRegionSwapForSpell,
   controlsOnlyOwnRegionCards,
+  copyLimit,
   copyLimitName,
   countProvenance,
   coverageReport,
