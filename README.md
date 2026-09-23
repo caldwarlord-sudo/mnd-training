@@ -37,6 +37,13 @@ function of `(engine bundle, cardsets, weights, seeds, config)`.
 **Zero.** The engine bundle inlines everything. GitHub Actions runners only need Node
 20 (already installed on `ubuntu-latest`) — no `npm install` step required.
 
-## License
+## License and attribution
 
-MIT (see `LICENSE`). Use, modify, redistribute freely.
+This project's code is MIT-licensed (see `LICENSE`).
+
+The Magi-Nation card game content it operates on -- card names, text, rules, and the card
+database -- is **not** covered by that license. It belongs to the game's rights holders
+and is included for non-commercial fan-project use only. See `NOTICE` for details and
+sources.
+
+This is an unofficial fan project, not affiliated with or endorsed by the rights holders.

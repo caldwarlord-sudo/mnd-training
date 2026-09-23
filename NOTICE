@@ -1,0 +1,34 @@
+mnd-training -- third-party notices
+===================================
+
+WHAT THE MIT LICENSE COVERS
+
+The MIT License in LICENSE covers this project's own code: the training scripts, the
+GitHub Actions workflows, and the Magi-Nation Duel game engine (compiled into
+engine/engine.bundle.js).
+
+WHAT IT DOES NOT COVER
+
+It does not cover the Magi-Nation card game or its content. Magi-Nation, Magi-Nation
+Duel, and all card names, card text, rules, and related game content are the property
+of their respective rights holders. This project claims no rights in them and does not
+represent who currently holds those rights.
+
+For reference, the printed cards carry copyright notices from Interactive Imagination
+Corp. (Base Set through Voice of the Storms, and the original promos) and from 2i LLC
+(Traitor's Reach and later sets).
+
+That content appears in this repository only as data -- chiefly
+data-pipeline/output/cards_final.json and the cards listed in
+app/resources/default-decks/ -- so the training harness can simulate games. It is
+included for non-commercial fan-project use and is NOT offered under the MIT License
+or any other license from this project.
+
+SOURCES
+
+Card text and rulings/errata data are sourced from mndworkbench.com.
+
+No card artwork is included in this repository.
+
+This is an unofficial fan project and is not affiliated with or endorsed by the
+game's rights holders.
