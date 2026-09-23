@@ -1,4 +1,11 @@
 // src/types/card.ts
+function canonicalPrimaryRegion(def, cardDb) {
+  if (def.default_printing || def.printing_group === void 0) return def.regions[0];
+  for (const other of cardDb.values()) {
+    if (other.default_printing && other.printing_group === def.printing_group) return other.regions[0];
+  }
+  return def.regions[0];
+}
 function buildCardDatabase(cards) {
   const map = /* @__PURE__ */ new Map();
   for (const card of cards) {
@@ -40136,7 +40143,7 @@ registerCardEffect("Nagsis", {
     addPermanentTag(state, cardDb, self, NAGSIS_POSSESSION_CONSUMED);
     const nextDef = cardDb.get(nextMagi.definitionKey);
     if (!nextDef || isCoreRegion(nextDef.regions)) return;
-    nextMagi.magiIdentityOverride = { asShadowOfOriginalRegion: nextDef.regions[0] };
+    nextMagi.magiIdentityOverride = { asShadowOfOriginalRegion: canonicalPrimaryRegion(nextDef, cardDb) };
   }
 });
 
@@ -40158,7 +40165,8 @@ registerCardEffect("Hrada", {
     if (!targetDef || isCoreRegion(targetDef.regions)) return;
     const isNaroom = targetDef.regions.includes("Naroom");
     target.magiIdentityOverride = {
-      asShadowOfOriginalRegion: targetDef.regions[0],
+      // Default printing's first region, so a dual-region Magi's printing can't change the result.
+      asShadowOfOriginalRegion: canonicalPrimaryRegion(targetDef, ctx.cardDb),
       expiresAfterTurnNumber: beginningOfNextOwnTurnNumber(ctx.state),
       originalRegionPlayPenalty: isNaroom ? 2 : 1
     };
@@ -40178,7 +40186,7 @@ registerCardEffect("Possession", {
     if (newMagi) {
       const newDef = ctx.cardDb.get(newMagi.definitionKey);
       if (newDef && !isCoreRegion(newDef.regions)) {
-        newMagi.magiIdentityOverride = { asShadowOfOriginalRegion: newDef.regions[0] };
+        newMagi.magiIdentityOverride = { asShadowOfOriginalRegion: canonicalPrimaryRegion(newDef, ctx.cardDb) };
       }
     }
     checkMagiDefeats(ctx.state, ctx.cardDb, ctx.rng);
@@ -44724,7 +44732,7 @@ function resolveStartingEntry(entry, cardDb, pool3, rng) {
 function generateDeck(cardDb, allCards, rng, options = {}) {
   const deckSize = options.deckSize ?? 40;
   const magiCount = options.magiCount ?? 3;
-  const legal = allCards.filter((c2) => c2.legality.constructed === "legal");
+  const legal = allCards.filter((c2) => c2.legality.constructed === "legal" && c2.default_printing !== false);
   const magiPool = legal.filter((c2) => c2.card_type === "Magi");
   const nonMagiPool = legal.filter((c2) => c2.card_type !== "Magi");
   const magi = [];
@@ -44881,6 +44889,7 @@ export {
   burrowCappedLoss,
   canAdvancePhase,
   canOfferDefeatInterrupt,
+  canonicalPrimaryRegion,
   checkCreatureDefeats,
   checkForDefeats,
   checkMagiDefeats,
